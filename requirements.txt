@@ -3,3 +3,4 @@ flask-cors
 pyotp
 smartapi-python
 logzero
+websocket-client
