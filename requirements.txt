@@ -2,3 +2,4 @@ Flask
 flask-cors
 pyotp
 smartapi-python
+logzero
