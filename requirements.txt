@@ -1,6 +1,5 @@
-Flask
-flask-cors
-pyotp
-smartapi-python
-logzero
-websocket-client
+fastapi
+uvicorn
+ccxt
+requests
+pydantic
