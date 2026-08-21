@@ -201,42 +201,145 @@ class TradeRequest(BaseModel):
     secret_key: str
     is_futures: bool
 
-# ==========================================
-# 6. API ROUTES
-# ==========================================
-@app.get("/")
-def root(): 
-    return {"status": "Hitech Crypto Bot PRO is Live! 🚀"}
+// ---------------------------------------------------
+// 6. API SETTINGS SCREEN (Saare Exchanges Ke Sath)
+// ---------------------------------------------------
+class ApiSettingsScreen extends StatefulWidget {
+  const ApiSettingsScreen({Key? key}) : super(key: key);
 
-@app.get("/api/market-sentiment")
-def get_sentiment(symbol: str = "BTC/USDT"):
-    sentiment = ai_bot.get_market_sentiment(symbol)
-    return {"status": "success", "symbol": symbol, "sentiment": sentiment}
+  @override
+  _ApiSettingsScreenState createState() => _ApiSettingsScreenState();
+}
 
-@app.get("/api/bot-history")
-def get_bot_history():
-    return {
-        "status": "success",
-        "trades_today": f"{bot_state['trades_today']}/5",
-        "total_pnl": f"{bot_state['total_pnl']:.2f}%",
-        "active_trade": bot_state["active_position"],
-        "history": bot_state["history"][::-1]
+class _ApiSettingsScreenState extends State<ApiSettingsScreen> {
+  final TextEditingController _apiKeyController = TextEditingController();
+  final TextEditingController _secretKeyController = TextEditingController();
+  String _selectedExchange = 'CoinDCX';
+
+  // Saari exchanges aur unke official logo URLs ki mapping
+  final Map<String, String> _exchangeMap = {
+    'CoinDCX': 'https://assets.coingecko.com/markets/images/459/large/coindcx.png',
+    'Binance': 'https://assets.coingecko.com/markets/images/52/large/binance.jpg',
+    'CoinMarketCap': 'https://assets.coingecko.com/markets/images/829/large/coinmarketcap.png',
+    'Bybit': 'https://assets.coingecko.com/markets/images/698/large/bybit_spot.png',
+    'OKX': 'https://assets.coingecko.com/markets/images/98/large/okx.png',
+    'Crypto.com': 'https://assets.coingecko.com/markets/images/395/large/crypto_.com_exchange_logo.png',
+    'Gate.io': 'https://assets.coingecko.com/markets/images/60/large/gate_io_logo1.jpg',
+    'Robinhood': 'https://assets.coingecko.com/markets/images/1117/large/robinhood.png',
+    'HTX': 'https://assets.coingecko.com/markets/images/251/large/huobi.png',
+    'Gemini': 'https://assets.coingecko.com/markets/images/50/large/gemini.png',
+    'BingX': 'https://assets.coingecko.com/markets/images/841/large/bingx.png',
+    'BitMEX': 'https://assets.coingecko.com/markets/images/27/large/bitmex.png',
+    'Nexo': 'https://assets.coingecko.com/markets/images/474/large/nexo.png',
+    'BitMart': 'https://assets.coingecko.com/markets/images/297/large/bitmart.jpg',
+    'Delta Exchange': 'https://assets.coingecko.com/markets/images/621/large/delta.png',
+    'HashKey Exchange': 'https://assets.coingecko.com/markets/images/1128/large/hashkey.png',
+    'Deribit': 'https://assets.coingecko.com/markets/images/130/large/deribit.png',
+    'LBank': 'https://assets.coingecko.com/markets/images/145/large/lbank.png',
+    'Bitstamp': 'https://assets.coingecko.com/markets/images/9/large/bitstamp.png',
+    'Poloniex': 'https://assets.coingecko.com/markets/images/37/large/poloniex.png',
+    'Bitget': 'https://assets.coingecko.com/markets/images/540/large/bitget.png',
+    'Luno': 'https://assets.coingecko.com/markets/images/81/large/luno.png',
+    'CoinSwitch': 'https://assets.coingecko.com/markets/images/635/large/coinswitch.png',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedKeys();
+  }
+
+  Future<void> _loadSavedKeys() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      _apiKeyController.text = prefs.getString('api_key') ?? '';
+      _secretKeyController.text = prefs.getString('secret_key') ?? '';
+      String savedExchange = prefs.getString('exchange') ?? 'CoinDCX';
+      // Agar saved exchange map mein hai toh wahi set karo, warna default CoinDCX
+      if (_exchangeMap.containsKey(savedExchange)) {
+        _selectedExchange = savedExchange;
+      } else {
+        _selectedExchange = 'CoinDCX';
+      }
+    });
+  }
+
+  Future<void> _saveKeys() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('api_key', _apiKeyController.text);
+    await prefs.setString('secret_key', _secretKeyController.text);
+    await prefs.setString('exchange', _selectedExchange);
+    
+    // Server ko bhi bata do naye keys
+    http.post(
+      Uri.parse("https://hitech-crypto-bot.onrender.com/api/save-keys"),
+      headers: {"Content-Type": "application/json"},
+      body: json.encode({
+        "exchange_name": _selectedExchange.toLowerCase(),
+        "api_key": _apiKeyController.text,
+        "secret_key": _secretKeyController.text
+      })
+    );
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('API Keys Saved Successfully! 🔒'), backgroundColor: Colors.green),
+      );
+      Navigator.pop(context);
     }
+  }
 
-@app.get("/api/pattern-detector")
-def get_pattern(symbol: str = "BTC/USDT"):
-    return ai_bot.detect_live_pattern(symbol, "15m")
-
-@app.post("/api/save-keys")
-def save_user_keys(config: UserConfigRequest):
-    try:
-        bot_state["active_broker"] = config.exchange_name.lower()
-        bot_state["api_key"] = config.api_key
-        bot_state["secret_key"] = config.secret_key
-        return {"status": "Success", "message": f"Connected to {config.exchange_name.upper()}! AI Engine activated."}
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
-
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("Setup API Keys"), backgroundColor: const Color(0xFF161B22)),
+      body: Padding(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          children: [
+            DropdownButtonFormField<String>(
+              value: _selectedExchange,
+              dropdownColor: const Color(0xFF161B22),
+              style: const TextStyle(color: Colors.white, fontSize: 16),
+              items: _exchangeMap.keys.map((String exchangeName) {
+                return DropdownMenuItem<String>(
+                  value: exchangeName,
+                  child: Row(
+                    children: [
+                      Image.network(
+                        _exchangeMap[exchangeName]!, 
+                        width: 24, 
+                        height: 24, 
+                        errorBuilder: (c,e,s) => const Icon(Icons.currency_bitcoin, color: Colors.amber)
+                      ),
+                      const SizedBox(width: 12),
+                      Text(exchangeName, style: const TextStyle(color: Colors.white)),
+                    ],
+                  ),
+                );
+              }).toList(),
+              onChanged: (val) => setState(() => _selectedExchange = val!),
+              decoration: const InputDecoration(labelText: "Select Exchange Platform", border: OutlineInputBorder()),
+            ),
+            const SizedBox(height: 20),
+            TextField(controller: _apiKeyController, decoration: const InputDecoration(labelText: "API Key", border: OutlineInputBorder())),
+            const SizedBox(height: 20),
+            TextField(controller: _secretKeyController, decoration: const InputDecoration(labelText: "Secret Key", border: OutlineInputBorder()), obscureText: true),
+            const Spacer(),
+            SizedBox(
+              width: double.infinity, height: 50,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                onPressed: _saveKeys, 
+                child: const Text("SAVE KEYS SECURELY", style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
 # ---------------------------------------------------------
 # 🎯 REAL ENTRY TRADE API
 # ---------------------------------------------------------
