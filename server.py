@@ -1,99 +1,196 @@
-from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi import FastAPI, Query
+import os
+from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import requests
-from algo_bot import HitechAIBot  
+import ccxt
+import time
+import hmac
+import hashlib
+import json
+import uvicorn
+import asyncio
+from datetime import datetime
 
-app = FastAPI(title="Hitech Crypto Trading Engine")
+# ==========================================
+# 1. BOT MEMORY & STATE (For Limits, PnL & TP/SL)
+# ==========================================
+bot_state = {
+    "active_broker": None,
+    "api_key": None,
+    "secret_key": None,
+    "trades_today": 0,
+    "total_pnl": 0.0,
+    "last_trade_date": datetime.now().date().isoformat(),
+    "active_position": None,
+    "history": []
+}
+
+# ==========================================
+# 2. HITECH AI BOT CLASS (Brain 🧠)
+# ==========================================
+class HitechAIBot:
+    def __init__(self):
+        self.exchange = ccxt.binance({'enableRateLimit': True})
+
+    def get_exchange(self, exchange_name, api_key, secret_key):
+        try:
+            exchange_class = getattr(ccxt, exchange_name.lower())
+            return exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+        except Exception:
+            return ccxt.binance({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+
+    def get_market_sentiment(self, symbol='BTC/USDT'):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='1d', limit=5)
+            if not ohlcv: 
+                return "Neutral"
+            close_today = ohlcv[-1][4]
+            close_yesterday = ohlcv[-2][4]
+            if close_today > close_yesterday * 1.02: 
+                return "Highly Bullish 🚀"
+            elif close_today > close_yesterday: 
+                return "Bullish 🟢"
+            elif close_today < close_yesterday * 0.98: 
+                return "Highly Bearish 🩸"
+            else: 
+                return "Bearish 🔴"
+        except Exception:
+            return "Neutral ⚖️"
+
+    def detect_live_pattern(self, symbol='BTC/USDT', timeframe='15m'):
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=3)
+            if not ohlcv or len(ohlcv) < 2:
+                return {"status": "error", "message": "Market data unavailable"}
+
+            latest = ohlcv[-1]
+            prev = ohlcv[-2]
+            opn, high, low, close = latest[1], latest[2], latest[3], latest[4]
+            body = abs(close - opn)
+            rng = high - low
+            
+            pattern_name = "Normal Candle"
+            signal = "HOLD"
+            
+            if body <= (rng * 0.1):
+                pattern_name = "Doji (Neutral) ⚖️"
+            elif (min(opn, close) - low) >= (2 * body) and (high - max(opn, close)) <= (0.2 * body):
+                pattern_name = "Hammer (Bullish Reversal) 🔨"
+                signal = "BUY"
+            elif opn < prev[4] and close > prev[1] and close > opn and prev[4] < prev[1]:
+                pattern_name = "Bullish Engulfing 🚀"
+                signal = "BUY"
+            elif opn > prev[4] and close < prev[1] and close < opn and prev[4] > prev[1]:
+                pattern_name = "Bearish Engulfing 📉"
+                signal = "SELL"
+            
+            return {
+                "status": "success", 
+                "symbol": symbol, 
+                "pattern": pattern_name, 
+                "signal": signal, 
+                "current_price": close
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e), "signal": "HOLD"}
+
+# ==========================================
+# 3. FASTAPI SERVER INITIALIZATION
+# ==========================================
+app = FastAPI(title="Hitech Crypto Trading Engine PRO")
 ai_bot = HitechAIBot()  
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_credentials=True, 
+    allow_methods=["*"], 
     allow_headers=["*"],
 )
 
-@app.get("/")
-def root():
-    return {"status": "Hitech Crypto Bot Backend Running Online!"}
+# ==========================================
+# 4. BACKGROUND AUTO-TRADING LOOP (With Smart TP/SL)
+# ==========================================
+async def auto_trade_loop():
+    print("🚀 Pro Auto-Trading Engine Started...")
+    while True:
+        try:
+            current_date = datetime.now().date().isoformat()
+            if bot_state["last_trade_date"] != current_date:
+                bot_state["trades_today"] = 0
+                bot_state["last_trade_date"] = current_date
+                
+            if bot_state["api_key"] and bot_state["secret_key"] and bot_state["active_broker"]:
+                target_symbol = "BTC/USDT"
+                analysis = ai_bot.detect_live_pattern(target_symbol, "15m")
+                current_price = analysis.get("current_price", 0)
 
-@app.get("/api/live-prices")
-def get_live_prices():
-    try:
-        resp = requests.get("https://api.coindcx.com/exchange/ticker")
-        data = resp.json()
-        target_markets = [
-            'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 
-            'BNBUSDT', 'ADAUSDT', 'DOGEUSDT', 'MATICUSDT',
-            'DOTUSDT', 'LINKUSDT', 'AVAXUSDT', 'TRXUSDT'
-        ]
-        result = []
-        for item in data:
-            if item.get('market') in target_markets:
-                symbol = item['market'].replace('USDT', '/USDT')
-                last_price = float(item.get('last_price', 0))
-                change_24h = float(item.get('change_24_hour', 0))
-                result.append({
-                    "symbol": symbol,
-                    "price": f"${last_price:.2f}",
-                    "change": f"{change_24h:.2f}%",
-                    "isUp": change_24h >= 0
-                })
-        result.sort(key=lambda x: target_markets.index(x['symbol'].replace('/', '')))
-        return {"markets": result}
-    except Exception as e:
-        return {"markets": [], "error": str(e)}
+                # 🛡️ SMART EXIT (Take Profit / Stop Loss Check)
+                if bot_state["active_position"] and current_price > 0:
+                    pos = bot_state["active_position"]
+                    entry_price = pos["entry_price"]
+                    
+                    if pos["side"] == "BUY":
+                        pnl_percent = ((current_price - entry_price) / entry_price) * 100
+                    else:
+                        pnl_percent = ((entry_price - current_price) / entry_price) * 100
+                    
+                    if pnl_percent >= 3.0 or pnl_percent <= -1.5:
+                        exit_req = {
+                            "broker": bot_state["active_broker"], 
+                            "symbol": target_symbol, 
+                            "api_key": bot_state["api_key"], 
+                            "secret_key": bot_state["secret_key"]
+                        }
+                        exit_trade(exit_req)
+                        bot_state["total_pnl"] += pnl_percent
+                        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        bot_state["history"].append({"time": time_str, "action": f"Auto-Closed ({pnl_percent:.2f}%)"})
+                        bot_state["active_position"] = None
+                        print(f"🛡️ Smart Exit Triggered! PnL: {pnl_percent:.2f}%")
+                        await asyncio.sleep(300)
+                        continue
 
-@app.get("/api/bot-signal")
-def get_bot_signal(symbol: str = "BTC/USDT", t: str = ""):
-    signal_data = ai_bot.analyze_market(symbol)
-    return signal_data
+                # 🎯 SMART ENTRY
+                signal = analysis.get("signal", "HOLD")
+                if signal in ["BUY", "SELL"] and bot_state["trades_today"] < 5 and not bot_state["active_position"]:
+                    trade_req = TradeRequest(
+                        user_id="auto_bot", 
+                        broker=bot_state["active_broker"], 
+                        symbol=target_symbol, 
+                        side=signal.lower(),
+                        amount=0.001, 
+                        api_key=bot_state["api_key"], 
+                        secret_key=bot_state["secret_key"], 
+                        is_futures=(signal == "SELL")
+                    )
+                    res = execute_real_trade(trade_req)
+                    
+                    if res.get("status") == "success":
+                        bot_state["trades_today"] += 1
+                        bot_state["active_position"] = {"symbol": target_symbol, "side": signal, "entry_price": current_price}
+                        time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+                        bot_state["history"].append({"time": time_str, "action": f"{signal} Entry at {current_price}"})
+                        print(f"🤖 Auto-Trade Entered: {signal} {target_symbol}")
+                        
+        except Exception as e:
+            print(f"Loop Error: {str(e)}")
+            
+        await asyncio.sleep(300) 
 
-@app.get("/api/chart-data")
-def get_chart_data(symbol: str = "BTC/USDT", timeframe: str = "1h", t: str = ""):
-    try:
-        # 🔥 YAHAN FIX KIYA HAI: limit 40 se badhakar 200 kar di taaki SMA 99 chal sake!
-        ohlcv = ai_bot.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
-        chart_data = [{"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5]} for c in ohlcv]
-        return {"status": "Success", "data": chart_data}
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(auto_trade_loop())
 
-@app.get("/api/place-order")
-def place_order(symbol: str = "BTC/USDT", side: str = "buy"):
-    order_result = ai_bot.execute_trade(symbol, side, 0.001) 
-    return order_result
-# User ki keys ko accept karne ke liye model
-# User ki keys ko accept karne ke liye model
+# ==========================================
+# 5. PYDANTIC MODELS
+# ==========================================
 class UserConfigRequest(BaseModel):
     exchange_name: str
     api_key: str
     secret_key: str
 
-@app.post("/api/save-keys")
-def save_user_keys(config: UserConfigRequest):
-    try:
-        ai_bot.exchange = ai_bot.get_exchange(
-            config.exchange_name, 
-            config.api_key, 
-            config.secret_key
-        )
-        return {"status": "Success", "message": f"Successfully connected to {config.exchange_name}!"}
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
-import os
-
-
-  # Purana code...
-@app.post("/api/save-keys")
-def save_keys(config: UserConfigRequest):
-    ...
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
-# Yahan se naya code shuru
 class TradeRequest(BaseModel):
     user_id: str
     broker: str
@@ -104,71 +201,223 @@ class TradeRequest(BaseModel):
     secret_key: str
     is_futures: bool
 
+# ==========================================
+# 6. API ROUTES
+# ==========================================
+@app.get("/")
+def root(): 
+    return {"status": "Hitech Crypto Bot PRO is Live! 🚀"}
+
+@app.get("/api/market-sentiment")
+def get_sentiment(symbol: str = "BTC/USDT"):
+    sentiment = ai_bot.get_market_sentiment(symbol)
+    return {"status": "success", "symbol": symbol, "sentiment": sentiment}
+
+@app.get("/api/bot-history")
+def get_bot_history():
+    return {
+        "status": "success",
+        "trades_today": f"{bot_state['trades_today']}/5",
+        "total_pnl": f"{bot_state['total_pnl']:.2f}%",
+        "active_trade": bot_state["active_position"],
+        "history": bot_state["history"][::-1]
+    }
+
+@app.get("/api/pattern-detector")
+def get_pattern(symbol: str = "BTC/USDT"):
+    return ai_bot.detect_live_pattern(symbol, "15m")
+
+@app.post("/api/save-keys")
+def save_user_keys(config: UserConfigRequest):
+    try:
+        bot_state["active_broker"] = config.exchange_name.lower()
+        bot_state["api_key"] = config.api_key
+        bot_state["secret_key"] = config.secret_key
+        return {"status": "Success", "message": f"Connected to {config.exchange_name.upper()}! AI Engine activated."}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+
+# ---------------------------------------------------------
+# 🎯 REAL ENTRY TRADE API
+# ---------------------------------------------------------
 @app.post("/api/trade/execute")
 def execute_real_trade(trade: TradeRequest):
+    broker = trade.broker.lower()
+    api_key = trade.api_key
+    secret_key = trade.secret_key
+    symbol = trade.symbol
+    side = trade.side.lower()
+    amount = trade.amount
+    is_futures = trade.is_futures
+    
+    if not api_key or not secret_key: 
+        return {"status": "error", "message": "API keys required."}
+    
     try:
-        # Pata lagate hain ki order success hoga ya nahi
-        return {
-            "status": "success", 
-            "message": f"Successfully executed {trade.side} order for {trade.amount} {trade.symbol} on {trade.broker.upper()}!"
-        }
+        if broker == 'coindcx':
+            base_cur = symbol.split('/')[0] if '/' in symbol else symbol
+            market_pair = f"{base_cur}USDT"
+            ts = int(round(time.time() * 1000))
+            sec_bytes = bytes(secret_key, encoding='utf-8')
+            
+            markets_data = requests.get('https://api.coindcx.com/exchange/v1/markets_details').json()
+            step_size = next((float(m.get("step", 1.0)) for m in markets_data if m.get("coindcx_name") == market_pair), 1.0)
+            
+            trade_qty = round(int(amount / step_size) * step_size, 8)
+            if trade_qty <= 0: 
+                return {"status": "error", "message": "Trade qty too small."}
+            
+            order_body = {
+                "timestamp": ts, 
+                "order": {
+                    "side": side, 
+                    "order_type": "market_order", 
+                    "market": market_pair, 
+                    "total_quantity": trade_qty
+                }
+            }
+            order_json = json.dumps(order_body)
+            order_sig = hmac.new(sec_bytes, order_json.encode(), hashlib.sha256).hexdigest()
+            headers = {
+                'Content-Type': 'application/json', 
+                'X-AUTH-APIKEY': api_key, 
+                'X-AUTH-SIGNATURE': order_sig
+            }
+            
+            resp = requests.post('https://api.coindcx.com/exchange/v1/orders/create', data=order_json, headers=headers).json()
+            if 'message' in resp: 
+                return {"status": "error", "message": resp.get('message')}
+            return {"status": "success", "message": f"Executed {side.upper()} for {trade_qty} {base_cur}!"}
+        else:
+            opts = {'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True}
+            if is_futures: 
+                opts['options'] = {'defaultType': 'future'}
+            exchange = getattr(ccxt, broker)(opts)
+            if side == 'buy': 
+                exchange.create_market_buy_order(symbol, amount)
+            elif side == 'sell': 
+                exchange.create_market_sell_order(symbol, amount)
+            return {"status": "success", "message": f"Executed {side.upper()} for {amount} {symbol}!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-@app.get("/api/trade/history/{user_id}")
-def get_trade_history(user_id: str):
-    # Dummy history list beta testing ke liye
-    history = [
-        {"symbol": "BTC/USDT", "side": "BUY", "price": 64200.50, "stop_loss": 57780.45},
-        {"symbol": "ETH/USDT", "side": "SELL", "price": 3450.20, "stop_loss": 3795.22}
-    ]
-    return {"status": "success", "history": history}
+# ---------------------------------------------------------
+# 💰 REAL PORTFOLIO 
+# ---------------------------------------------------------
+@app.post("/api/portfolio/balance")
+def get_real_portfolio(data: dict):
+    try:
+        broker = data.get("broker", "binance").lower()
+        api_key = data.get("api_key")
+        secret_key = data.get("secret_key")
+        
+        if not api_key: 
+            return {"status": "success", "balance": "$0.00", "history": []}
 
-@app.post("/api/bot/toggle")
-def toggle_bot(data: dict):
-    return {"status": "success", "message": "Bot status updated"}
-# Naya code yahan khatam
-# ==========================================
-# YAHAN BEECH MEIN ADMIN PANEL KA CODE PASTE KARO 👇
-# ==========================================
+        if broker == 'coindcx':
+            ts = int(round(time.time() * 1000))
+            json_body = json.dumps({"timestamp": ts})
+            sig = hmac.new(bytes(secret_key, encoding='utf-8'), json_body.encode(), hashlib.sha256).hexdigest()
+            headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': sig}
+            
+            resp = requests.post('https://api.coindcx.com/exchange/v1/users/balances', data=json_body, headers=headers)
+            if resp.status_code != 200: 
+                return {"status": "error", "message": "Exchange API down", "balance": "$0.00", "history": []}
+            balances = resp.json()
+            
+            tickers = requests.get('https://api.coindcx.com/exchange/ticker').json()
+            price_map = {t.get('market', ''): float(t.get('last_price', 0)) for t in tickers}
+            
+            tot_inr = 0.0
+            assets = []
+            for b in balances:
+                qty = float(b.get('balance', 0.0)) + float(b.get('locked', 0.0))
+                cur = b.get('currency', '')
+                if qty > 0:
+                    if cur == 'INR': 
+                        tot_inr += qty
+                        assets.append({"symbol": "INR", "side": "HOLD", "price": f"₹{qty:,.2f}"})
+                    else:
+                        c_inr = price_map.get(f"{cur}INR", price_map.get(f"{cur}USDT", 0) * price_map.get('USDTINR', 83))
+                        val = qty * c_inr
+                        tot_inr += val
+                        if val > 1: 
+                            assets.append({"symbol": f"{cur}/USDT", "side": f"Qty: {qty:.4f}", "price": f"₹{val:,.2f}"})
+            
+            return {"status": "success", "balance": f"${tot_inr/83.0:,.2f} (₹{tot_inr:,.2f})", "history": assets}
+        else:
+            bal = getattr(ccxt, broker)({'apiKey': api_key, 'secret': secret_key}).fetch_balance()
+            return {"status": "success", "balance": f"${bal.get('total', {}).get('USDT', 0.0):,.2f}", "history": []}
+    except Exception as e:
+        return {"status": "error", "balance": "$0.00", "history": []}
 
-pending_activations = []
+# ---------------------------------------------------------
+# 🛑 MANUAL & AUTO EXIT TRADE API
+# ---------------------------------------------------------
+@app.post("/api/trade/exit")
+def exit_trade(data: dict):
+    broker = data.get("broker", "coindcx").lower()
+    symbol = data.get("symbol")
+    api_key = data.get("api_key")
+    secret_key = data.get("secret_key")
+    
+    if not api_key: 
+        return {"status": "error", "message": "API keys required"}
+    try:
+        if broker == 'coindcx':
+            base_cur = symbol.split('/')[0] if '/' in symbol else symbol
+            market_pair = f"{base_cur}USDT"
+            ts, sec_bytes = int(round(time.time() * 1000)), bytes(secret_key, encoding='utf-8')
+            json_body = json.dumps({"timestamp": ts})
+            sig = hmac.new(sec_bytes, json_body.encode(), hashlib.sha256).hexdigest()
+            headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': sig}
+            
+            bals = requests.post('https://api.coindcx.com/exchange/v1/users/balances', data=json_body, headers=headers).json()
+            raw_qty = next((float(b.get('balance', 0)) for b in bals if b.get('currency') == base_cur), 0.0)
+            if raw_qty <= 0: 
+                return {"status": "error", "message": f"No balance"}
+            
+            m_data = requests.get('https://api.coindcx.com/exchange/v1/markets_details').json()
+            step = next((float(m.get("step", 1.0)) for m in m_data if m.get("coindcx_name") == market_pair), 1.0)
+            
+            sell_qty = round(int(raw_qty / step) * step, 8)
+            if sell_qty <= 0: 
+                return {"status": "error", "message": "Qty too small"}
+            
+            order_json = json.dumps({
+                "timestamp": ts, 
+                "order": {
+                    "side": "sell", 
+                    "order_type": "market_order", 
+                    "market": market_pair, 
+                    "total_quantity": sell_qty
+                }
+            })
+            order_sig = hmac.new(sec_bytes, order_json.encode(), hashlib.sha256).hexdigest()
+            headers['X-AUTH-SIGNATURE'] = order_sig
+            
+            resp = requests.post('https://api.coindcx.com/exchange/v1/orders/create', data=order_json, headers=headers).json()
+            if 'message' in resp: 
+                return {"status": "error", "message": resp.get('message')}
+            return {"status": "success", "message": f"Manual Exit: Sold {sell_qty} {base_cur}!"}
+        else:
+            ex = getattr(ccxt, broker)({'apiKey': api_key, 'secret': secret_key})
+            base_cur = symbol.split('/')[0] if '/' in symbol else symbol
+            amt = float(ex.fetch_balance()['total'].get(base_cur, 0))
+            if amt <= 0: 
+                return {"status": "error", "message": "No balance"}
+            ex.create_market_sell_order(symbol, amt)
+            return {"status": "success", "message": f"Manual Exit: Sold {amt} {base_cur}!"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-@app.post("/api/payment/submit")
-def submit_payment(user_id: str, utr: str):
-    pending_activations.append({"user_id": user_id, "utr": utr, "status": "Pending"})
-    return {"status": "Success", "message": "Payment submitted successfully!"}
+# 🛡️ SAFETY ENDPOINTS
+@app.post("/api/verify-key")
+def verify_key(data: dict):
+    if data.get("key") in {"HITECH-123", "PRO-JAMEEL-99"}: 
+        return {"status": "success", "message": "Bot Activated!"}
+    return {"status": "error", "message": "Invalid Key"}
 
-@app.get("/admin/panel", response_class=HTMLResponse)
-def admin_panel():
-    rows = ""
-    for idx, p in enumerate(pending_activations):
-        status_color = "orange" style if p["status"] == "Pending" else "green"
-        rows += f"""
-        <tr>
-            <td>{p['user_id']}</td>
-            <td><b>{p['utr']}</b></td>
-            <td>{p['status']}</td>
-            <td>
-                <form action="/admin/activate/{idx}" method="post" style="display:inline;">
-                    <button type="submit">Approve & Activate</button>
-                </form>
-            </td>
-        </tr>
-        """
-    return HTMLResponse(content=f"<html><body><h2>Admin Panel</h2><table>{rows}</table></body></html>")
-
-@app.post("/admin/activate/{index}")
-def activate_user(index: int):
-    if 0 <= index < len(pending_activations):
-        pending_activations[index]["status"] = "Active"
-    return RedirectResponse(url="/admin/panel", status_code=303)
-
-# ==========================================
-# YAHAN SE AAPKA PURANA MAIN BLOCK SHURU HOGA 👇
-# ==========================================
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 5000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-  
