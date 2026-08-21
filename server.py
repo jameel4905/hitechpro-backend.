@@ -27,7 +27,7 @@ bot_state = {
 }
 
 # ==========================================
-# 2. HITECH AI BOT CLASS (Brain 🧠)
+# 2. HITECH AI BOT CLASS (Brain 🧠 with Sentiment + Volume)
 # ==========================================
 class HitechAIBot:
     def __init__(self):
@@ -58,42 +58,40 @@ class HitechAIBot:
         except Exception:
             return "Neutral ⚖️"
 
-    def detect_live_pattern(self, symbol='BTC/USDT', timeframe='15m'):
+    # 🚀 ADVANCED SENTIMENT + VOLUME ANALYSIS FILTER
+    def analyze_market_conditions(self, symbol='BTC/USDT'):
         try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=3)
+            sentiment = self.get_market_sentiment(symbol)
+            
+            # Fetch 15m candles to check Volume & Price Action
+            ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe='15m', limit=3)
             if not ohlcv or len(ohlcv) < 2:
-                return {"status": "error", "message": "Market data unavailable"}
+                return {"signal": "HOLD", "sentiment": sentiment, "current_price": 0}
 
-            latest = ohlcv[-1]
+            current = ohlcv[-1]
             prev = ohlcv[-2]
-            opn, high, low, close = latest[1], latest[2], latest[3], latest[4]
-            body = abs(close - opn)
-            rng = high - low
             
-            pattern_name = "Normal Candle"
+            curr_open, curr_close, curr_vol = current[1], current[4], current[5]
+            prev_vol = prev[5]
+            
             signal = "HOLD"
-            
-            if body <= (rng * 0.1):
-                pattern_name = "Doji (Neutral) ⚖️"
-            elif (min(opn, close) - low) >= (2 * body) and (high - max(opn, close)) <= (0.2 * body):
-                pattern_name = "Hammer (Bullish Reversal) 🔨"
+            # Volume Spike Confirmation: Current volume must be higher than previous volume
+            is_volume_high = curr_vol > prev_vol
+
+            if "Bullish" in sentiment and curr_close > curr_open and is_volume_high:
                 signal = "BUY"
-            elif opn < prev[4] and close > prev[1] and close > opn and prev[4] < prev[1]:
-                pattern_name = "Bullish Engulfing 🚀"
-                signal = "BUY"
-            elif opn > prev[4] and close < prev[1] and close < opn and prev[4] > prev[1]:
-                pattern_name = "Bearish Engulfing 📉"
+            elif "Bearish" in sentiment and curr_close < curr_open and is_volume_high:
                 signal = "SELL"
-            
+                
             return {
-                "status": "success", 
-                "symbol": symbol, 
-                "pattern": pattern_name, 
-                "signal": signal, 
-                "current_price": close
+                "status": "success",
+                "symbol": symbol,
+                "sentiment": sentiment,
+                "signal": signal,
+                "current_price": curr_close
             }
         except Exception as e:
-            return {"status": "error", "message": str(e), "signal": "HOLD"}
+            return {"status": "error", "message": str(e), "signal": "HOLD", "sentiment": "Neutral", "current_price": 0}
 
 # ==========================================
 # 3. FASTAPI SERVER INITIALIZATION
@@ -110,10 +108,10 @@ app.add_middleware(
 )
 
 # ==========================================
-# 4. BACKGROUND AUTO-TRADING LOOP (With Smart TP/SL)
+# 4. BACKGROUND AUTO-TRADING LOOP (Fast & Smart)
 # ==========================================
 async def auto_trade_loop():
-    print("🚀 Pro Auto-Trading Engine Started...")
+    print("🚀 Pro Auto-Trading Engine Started (Sentiment + Volume Mode)...")
     while True:
         try:
             current_date = datetime.now().date().isoformat()
@@ -123,7 +121,7 @@ async def auto_trade_loop():
                 
             if bot_state["api_key"] and bot_state["secret_key"] and bot_state["active_broker"]:
                 target_symbol = "BTC/USDT"
-                analysis = ai_bot.detect_live_pattern(target_symbol, "15m")
+                analysis = ai_bot.analyze_market_conditions(target_symbol)
                 current_price = analysis.get("current_price", 0)
 
                 # 🛡️ SMART EXIT (Take Profit / Stop Loss Check)
@@ -149,10 +147,10 @@ async def auto_trade_loop():
                         bot_state["history"].append({"time": time_str, "action": f"Auto-Closed ({pnl_percent:.2f}%)"})
                         bot_state["active_position"] = None
                         print(f"🛡️ Smart Exit Triggered! PnL: {pnl_percent:.2f}%")
-                        await asyncio.sleep(300)
+                        await asyncio.sleep(30)
                         continue
 
-                # 🎯 SMART ENTRY
+                # 🎯 MOOD + VOLUME CONFIRMED ENTRY
                 signal = analysis.get("signal", "HOLD")
                 if signal in ["BUY", "SELL"] and bot_state["trades_today"] < 5 and not bot_state["active_position"]:
                     trade_req = TradeRequest(
@@ -171,13 +169,14 @@ async def auto_trade_loop():
                         bot_state["trades_today"] += 1
                         bot_state["active_position"] = {"symbol": target_symbol, "side": signal, "entry_price": current_price}
                         time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-                        bot_state["history"].append({"time": time_str, "action": f"{signal} Entry at {current_price}"})
-                        print(f"🤖 Auto-Trade Entered: {signal} {target_symbol}")
+                        bot_state["history"].append({"time": time_str, "action": f"Volume-Mood {signal} at {current_price}"})
+                        print(f"🤖 Volume-Sentiment Trade Entered: {signal} {target_symbol}")
                         
         except Exception as e:
             print(f"Loop Error: {str(e)}")
             
-        await asyncio.sleep(300) 
+        # ⚡ Fast Speed Loop: Checks every 30 seconds instead of 5 minutes
+        await asyncio.sleep(30) 
 
 @app.on_event("startup")
 async def startup_event():
@@ -206,7 +205,7 @@ class TradeRequest(BaseModel):
 # ==========================================
 @app.get("/")
 def root(): 
-    return {"status": "Hitech Crypto Bot PRO is Live! 🚀"}
+    return {"status": "Hitech Crypto Bot PRO Running Online!"}
 
 @app.get("/api/market-sentiment")
 def get_sentiment(symbol: str = "BTC/USDT"):
@@ -225,7 +224,14 @@ def get_bot_history():
 
 @app.get("/api/pattern-detector")
 def get_pattern(symbol: str = "BTC/USDT"):
-    return ai_bot.detect_live_pattern(symbol, "15m")
+    res = ai_bot.analyze_market_conditions(symbol)
+    return {
+        "status": res["status"],
+        "symbol": res["symbol"],
+        "pattern": f"Sentiment: {res['sentiment']}",
+        "signal": res["signal"],
+        "current_price": res["current_price"]
+    }
 
 @app.post("/api/save-keys")
 def save_user_keys(config: UserConfigRequest):
@@ -411,11 +417,12 @@ def exit_trade(data: dict):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# 🛡️ SAFETY ENDPOINTS
+# 🛡️ SAFETY ENDPOINTS (Flexible Keys)
 @app.post("/api/verify-key")
 def verify_key(data: dict):
-    if data.get("key") in {"HITECH-123", "PRO-JAMEEL-99"}: 
-        return {"status": "success", "message": "Bot Activated!"}
+    user_key = data.get("key", "").strip()
+    if len(user_key) >= 5: 
+        return {"status": "success", "message": "Bot Activated Successfully!"}
     return {"status": "error", "message": "Invalid Key"}
 
 if __name__ == "__main__":
