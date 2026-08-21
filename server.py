@@ -27,7 +27,7 @@ bot_state = {
 }
 
 # ==========================================
-# 2. HITECH AI BOT CLASS (Brain)
+# 2. HITECH AI BOT CLASS (Brain 🧠)
 # ==========================================
 class HitechAIBot:
     def __init__(self):
@@ -48,15 +48,15 @@ class HitechAIBot:
             close_today = ohlcv[-1][4]
             close_yesterday = ohlcv[-2][4]
             if close_today > close_yesterday * 1.02: 
-                return "Highly Bullish"
+                return "Highly Bullish 🚀"
             elif close_today > close_yesterday: 
-                return "Bullish"
+                return "Bullish 🟢"
             elif close_today < close_yesterday * 0.98: 
-                return "Highly Bearish"
+                return "Highly Bearish 🩸"
             else: 
-                return "Bearish"
+                return "Bearish 🔴"
         except Exception:
-            return "Neutral"
+            return "Neutral ⚖️"
 
     def detect_live_pattern(self, symbol='BTC/USDT', timeframe='15m'):
         try:
@@ -74,15 +74,15 @@ class HitechAIBot:
             signal = "HOLD"
             
             if body <= (rng * 0.1):
-                pattern_name = "Doji (Neutral)"
+                pattern_name = "Doji (Neutral) ⚖️"
             elif (min(opn, close) - low) >= (2 * body) and (high - max(opn, close)) <= (0.2 * body):
-                pattern_name = "Hammer (Bullish Reversal)"
+                pattern_name = "Hammer (Bullish Reversal) 🔨"
                 signal = "BUY"
             elif opn < prev[4] and close > prev[1] and close > opn and prev[4] < prev[1]:
-                pattern_name = "Bullish Engulfing"
+                pattern_name = "Bullish Engulfing 🚀"
                 signal = "BUY"
             elif opn > prev[4] and close < prev[1] and close < opn and prev[4] > prev[1]:
-                pattern_name = "Bearish Engulfing"
+                pattern_name = "Bearish Engulfing 📉"
                 signal = "SELL"
             
             return {
@@ -110,10 +110,10 @@ app.add_middleware(
 )
 
 # ==========================================
-# 4. BACKGROUND AUTO-TRADING LOOP 
+# 4. BACKGROUND AUTO-TRADING LOOP (With Smart TP/SL)
 # ==========================================
 async def auto_trade_loop():
-    print("Pro Auto-Trading Engine Started...")
+    print("🚀 Pro Auto-Trading Engine Started...")
     while True:
         try:
             current_date = datetime.now().date().isoformat()
@@ -126,7 +126,7 @@ async def auto_trade_loop():
                 analysis = ai_bot.detect_live_pattern(target_symbol, "15m")
                 current_price = analysis.get("current_price", 0)
 
-                # SMART EXIT (Take Profit / Stop Loss Check)
+                # 🛡️ SMART EXIT (Take Profit / Stop Loss Check)
                 if bot_state["active_position"] and current_price > 0:
                     pos = bot_state["active_position"]
                     entry_price = pos["entry_price"]
@@ -148,11 +148,11 @@ async def auto_trade_loop():
                         time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
                         bot_state["history"].append({"time": time_str, "action": f"Auto-Closed ({pnl_percent:.2f}%)"})
                         bot_state["active_position"] = None
-                        print(f"Smart Exit Triggered! PnL: {pnl_percent:.2f}%")
+                        print(f"🛡️ Smart Exit Triggered! PnL: {pnl_percent:.2f}%")
                         await asyncio.sleep(300)
                         continue
 
-                # SMART ENTRY
+                # 🎯 SMART ENTRY
                 signal = analysis.get("signal", "HOLD")
                 if signal in ["BUY", "SELL"] and bot_state["trades_today"] < 5 and not bot_state["active_position"]:
                     trade_req = TradeRequest(
@@ -172,7 +172,7 @@ async def auto_trade_loop():
                         bot_state["active_position"] = {"symbol": target_symbol, "side": signal, "entry_price": current_price}
                         time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
                         bot_state["history"].append({"time": time_str, "action": f"{signal} Entry at {current_price}"})
-                        print(f"Auto-Trade Entered: {signal} {target_symbol}")
+                        print(f"🤖 Auto-Trade Entered: {signal} {target_symbol}")
                         
         except Exception as e:
             print(f"Loop Error: {str(e)}")
@@ -206,7 +206,7 @@ class TradeRequest(BaseModel):
 # ==========================================
 @app.get("/")
 def root(): 
-    return {"status": "Hitech Crypto Bot PRO is Live!"}
+    return {"status": "Hitech Crypto Bot PRO is Live! 🚀"}
 
 @app.get("/api/market-sentiment")
 def get_sentiment(symbol: str = "BTC/USDT"):
@@ -238,7 +238,7 @@ def save_user_keys(config: UserConfigRequest):
         return {"status": "Error", "message": str(e)}
 
 # ---------------------------------------------------------
-# REAL ENTRY TRADE API
+# 🎯 REAL ENTRY TRADE API
 # ---------------------------------------------------------
 @app.post("/api/trade/execute")
 def execute_real_trade(trade: TradeRequest):
@@ -302,7 +302,7 @@ def execute_real_trade(trade: TradeRequest):
         return {"status": "error", "message": str(e)}
 
 # ---------------------------------------------------------
-# REAL PORTFOLIO 
+# 💰 REAL PORTFOLIO 
 # ---------------------------------------------------------
 @app.post("/api/portfolio/balance")
 def get_real_portfolio(data: dict):
@@ -352,7 +352,7 @@ def get_real_portfolio(data: dict):
         return {"status": "error", "balance": "$0.00", "history": []}
 
 # ---------------------------------------------------------
-# MANUAL & AUTO EXIT TRADE API
+# 🛑 MANUAL & AUTO EXIT TRADE API
 # ---------------------------------------------------------
 @app.post("/api/trade/exit")
 def exit_trade(data: dict):
@@ -411,7 +411,7 @@ def exit_trade(data: dict):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# SAFETY ENDPOINTS
+# 🛡️ SAFETY ENDPOINTS
 @app.post("/api/verify-key")
 def verify_key(data: dict):
     if data.get("key") in {"HITECH-123", "PRO-JAMEEL-99"}: 
@@ -420,4 +420,4 @@ def verify_key(data: dict):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
