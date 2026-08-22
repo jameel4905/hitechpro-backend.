@@ -97,10 +97,32 @@ async def startup(): asyncio.create_task(auto_trade_loop())
 def get_bot_history():
     return {"status": "success", "trades_today": bot_state['trades_today'], "history": bot_state["history"]}
 
-@app.post("/api/save-keys")
-def save_keys(data: dict):
-    # RADAR SYSTEM: Ye check karega ki App server se baat kar raha hai ya nahi
-    print(f"📥 BINGO! App se naye user ki keys aayi hain: {data}")
+# Ab ye GET aur POST dono requests ko accept karega (App ki problem khatam!)
+@app.api_route("/api/save-keys", methods=["GET", "POST"])
+async def save_keys(request: Request):
+    try:
+        # Check if data is coming via POST or GET URL parameters
+        if request.method == "POST":
+            data = await request.json()
+        else:
+            data = dict(request.query_params)
+            
+        print(f"📥 BINGO! App se keys aagayi hain ({request.method}): {data}")
+        
+        api_key = data.get("api_key") or data.get("apiKey")
+        secret_key = data.get("secret_key") or data.get("secretKey")
+        
+        if api_key and secret_key:
+            bot_state.update({
+                "api_key": api_key, 
+                "secret_key": secret_key, 
+                "active_broker": "coindcx"
+            })
+            return {"status": "success", "message": "Keys activated successfully!"}
+        else:
+            return {"status": "error", "message": "Keys are missing in request!"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
     
     bot_state.update({
         "api_key": data.get("api_key"), 
