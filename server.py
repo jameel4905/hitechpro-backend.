@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-bot_state = {"active_broker": None, "api_key": None, "secret_key": None, "active_position": None, "trades_today": 0}
+bot_state = {"active_broker": None, "api_key": None, "secret_key": None, "active_position": None, "trades_today": 0, "history": []}
 SCAN_COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'NEAR/USDT', 'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT']
 
 app = FastAPI()
@@ -19,35 +19,49 @@ def get_price(symbol: str):
     except: return {"price": 0.0}
 
 async def auto_trade_loop():
-    print("🚀 Force-Execute Engine Started...")
+    print("🚀 Error-Tracking Trade Engine Started...")
     while True:
         try:
             if bot_state["api_key"] and not bot_state["active_position"]:
                 ex = ccxt.binance({'apiKey': bot_state["api_key"], 'secret': bot_state["secret_key"], 'enableRateLimit': True})
                 
-                # Pick a random coin and force-buy instantly to test connection & execution
                 sym = random.choice(SCAN_COINS)
                 ticker = ex.fetch_ticker(sym)
                 price = ticker['last']
-                
-                # Minimum viable amount
                 amount = 6.0 / price
                 
-                print(f"🔥 Force executing test trade on {sym} at {price}...")
-                order = ex.create_market_buy_order(sym, amount)
+                time_str = datetime.now().strftime("%H:%M:%S")
                 
-                if order:
-                    bot_state["active_position"] = {"symbol": sym, "entry": price}
-                    bot_state["trades_today"] += 1
-                    print(f"✅ Trade Successfully Taken on {sym}!")
+                try:
+                    print(f"🔥 Attempting trade on {sym}...")
+                    order = ex.create_market_buy_order(sym, amount)
+                    if order:
+                        bot_state["active_position"] = {"symbol": sym, "entry": price}
+                        bot_state["trades_today"] += 1
+                        bot_state["history"].insert(0, {"time": time_str, "action": f"✅ SUCCESS: Bought {sym} at {price}"})
+                        print(f"✅ Trade Successfully Taken on {sym}!")
+                except Exception as trade_err:
+                    # Yahan reject hua hua trade error ke sath history mein save ho jayega!
+                    err_msg = str(trade_err)
+                    print(f"❌ Trade Rejected on {sym}: {err_msg}")
+                    bot_state["history"].insert(0, {"time": time_str, "action": f"❌ REJECTED ({sym}): {err_msg[:40]}..."})
                     
         except Exception as e:
-            print(f"❌ Execution Error: {str(e)}")
+            print(f"Loop Error: {str(e)}")
             
         await asyncio.sleep(30)
 
 @app.on_event("startup")
 async def startup(): asyncio.create_task(auto_trade_loop())
+
+@app.get("/api/bot-history")
+def get_bot_history():
+    return {
+        "status": "success",
+        "trades_today": f"{bot_state['trades_today']}/5",
+        "active_trade": bot_state["active_position"],
+        "history": bot_state["history"]
+    }
 
 @app.post("/api/save-keys")
 def save_keys(data: dict):
