@@ -4,10 +4,11 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
+# Commercial Setup: Keys yahan blank rahengi aur App se aayengi
 bot_state = {
     "active_broker": "coindcx", 
-    "api_key": "a58c1838e1e7b0d1ac2d1ccffa3b59d958d35ce2815a363b", 
-    "secret_key": "8cbe2d40a0a2b078585aa2e337d78968d28cba1fb2cc713655f696f5ed426ec8", 
+    "api_key": None, 
+    "secret_key": None, 
     "active_position": None, 
     "trades_today": 0, 
     "history": []
@@ -18,15 +19,15 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 async def auto_trade_loop():
-    print("🚀 CoinDCX Engine Started...")
+    print("🚀 CoinDCX Commercial Engine Started... Waiting for user keys from App.")
     while True:
         try:
+            # Bot tab tak wait karega jab tak App se keys nahi mil jati
             if bot_state["api_key"] and bot_state["secret_key"] and not bot_state["active_position"]:
                 sym = random.choice(SCAN_COINS)
                 base_cur = sym.split('/')[0]
                 market_pair = f"{base_cur}USDT"
                 
-                # Fetch price from CoinDCX
                 try:
                     tickers = requests.get('https://api.coindcx.com/exchange/ticker').json()
                     price = next((float(t['last_price']) for t in tickers if t['market'] == market_pair), 0)
@@ -34,7 +35,6 @@ async def auto_trade_loop():
                     price = 0
                 
                 if price > 0:
-                    # Approx $2 worth of coin (safe for small balance)
                     amount = 2.0 / price 
                     time_str = datetime.now().strftime("%H:%M:%S")
                     
@@ -48,24 +48,40 @@ async def auto_trade_loop():
                         trade_qty = round(int(amount / step_size) * step_size, 8)
                         
                         if trade_qty > 0:
+                            # Perfect flat format for CoinDCX
                             order_body = {
-                                "timestamp": ts, 
-                                "order": {"side": "buy", "order_type": "market_order", "market": market_pair, "total_quantity": trade_qty}
+                                "side": "buy", 
+                                "order_type": "market_order", 
+                                "market": market_pair, 
+                                "total_quantity": trade_qty,
+                                "timestamp": ts
                             }
-                            order_json = json.dumps(order_body)
-                            order_sig = hmac.new(sec_bytes, order_json.encode(), hashlib.sha256).hexdigest()
-                            headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': bot_state["api_key"], 'X-AUTH-SIGNATURE': order_sig}
                             
-                            resp = requests.post('https://api.coindcx.com/exchange/v1/orders/create', data=order_json, headers=headers).json()
+                            order_json = json.dumps(order_body, separators=(',', ':'))
+                            order_sig = hmac.new(sec_bytes, order_json.encode('utf-8'), hashlib.sha256).hexdigest()
                             
-                            if 'message' in resp:
-                                # Rejection aayega toh history mein likhega
-                                bot_state["history"].insert(0, {"time": time_str, "action": f"❌ REJECTED ({sym}): {resp['message']}"})
-                            else:
+                            headers = {
+                                'Content-Type': 'application/json', 
+                                'X-AUTH-APIKEY': bot_state["api_key"], 
+                                'X-AUTH-SIGNATURE': order_sig
+                            }
+                            
+                            resp = requests.post('https://api.coindcx.com/exchange/v1/orders/create', data=order_json, headers=headers)
+                            
+                            try:
+                                resp_data = resp.json()
+                            except:
+                                resp_data = {"message": f"HTTP Error: {resp.status_code}"}
+                            
+                            if 'message' in resp_data:
+                                bot_state["history"].insert(0, {"time": time_str, "action": f"❌ REJECTED ({sym}): {resp_data['message']}"})
+                            elif 'orders' in resp_data or 'id' in resp_data:
                                 bot_state["active_position"] = {"symbol": sym, "entry": price}
                                 bot_state["trades_today"] += 1
                                 bot_state["history"].insert(0, {"time": time_str, "action": f"✅ SUCCESS: Bought {sym} at {price}"})
-                        
+                            else:
+                                bot_state["history"].insert(0, {"time": time_str, "action": f"⚠️ UNKNOWN ({sym}): Check App!"})
+                                
                     except Exception as trade_err:
                         bot_state["history"].insert(0, {"time": time_str, "action": f"❌ ERROR ({sym}): {str(trade_err)[:40]}"})
                         
@@ -83,11 +99,18 @@ def get_bot_history():
 
 @app.post("/api/save-keys")
 def save_keys(data: dict):
-    bot_state.update({"api_key": data.get("api_key"), "secret_key": data.get("secret_key"), "active_broker": "coindcx"})
-    return {"status": "success"}
+    # RADAR SYSTEM: Ye check karega ki App server se baat kar raha hai ya nahi
+    print(f"📥 BINGO! App se naye user ki keys aayi hain: {data}")
+    
+    bot_state.update({
+        "api_key": data.get("api_key"), 
+        "secret_key": data.get("secret_key"), 
+        "active_broker": "coindcx"
+    })
+    return {"status": "success", "message": "Keys activated for trading!"}
 
 @app.get("/")
-def root(): return {"status": "HiTech CoinDCX Bot Running! 🚀"}
+def root(): return {"status": "HiTech CoinDCX Commercial Bot API Running! 🚀"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
