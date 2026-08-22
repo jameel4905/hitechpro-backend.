@@ -4,7 +4,14 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-bot_state = {"active_broker": "coindcx", "api_key": None, "secret_key": None, "active_position": None, "trades_today": 0, "history": []}
+bot_state = {
+    "active_broker": "coindcx", 
+    "api_key": "YAHAN_APNI_API_KEY_DAALO", 
+    "secret_key": "YAHAN_APNI_SECRET_KEY_DAALO", 
+    "active_position": None, 
+    "trades_today": 0, 
+    "history": []
+}
 SCAN_COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT']
 
 app = FastAPI()
