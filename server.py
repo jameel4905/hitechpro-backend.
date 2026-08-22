@@ -6,8 +6,8 @@ from datetime import datetime
 
 bot_state = {
     "active_broker": "coindcx", 
-    "api_key": "YAHAN_APNI_API_KEY_DAALO", 
-    "secret_key": "YAHAN_APNI_SECRET_KEY_DAALO", 
+    "api_key": "a58c1838e1e7b0d1ac2d1ccffa3b59d958d35ce2815a363b", 
+    "secret_key": "8cbe2d40a0a2b078585aa2e337d78968d28cba1fb2cc713655f696f5ed426ec8", 
     "active_position": None, 
     "trades_today": 0, 
     "history": []
