@@ -1,10 +1,9 @@
 import os, time, hmac, hashlib, json, requests, uvicorn, asyncio, random
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-# Commercial Setup: Keys yahan blank rahengi aur App se aayengi
+# 🏢 COMMERCIAL MULTI-USER SETUP: Sabhi users ke liye blank state
 bot_state = {
     "active_broker": "coindcx", 
     "api_key": None, 
@@ -13,16 +12,17 @@ bot_state = {
     "trades_today": 0, 
     "history": []
 }
+
 SCAN_COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT']
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 async def auto_trade_loop():
-    print("🚀 CoinDCX Commercial Engine Started... Waiting for user keys from App.")
+    print("🚀 Commercial Multi-User Engine Started... Waiting for user keys via App.")
     while True:
         try:
-            # Bot tab tak wait karega jab tak App se keys nahi mil jati
+            # Jab tak user app se key nahi dalega, bot secure mode mein wait karega
             if bot_state["api_key"] and bot_state["secret_key"] and not bot_state["active_position"]:
                 sym = random.choice(SCAN_COINS)
                 base_cur = sym.split('/')[0]
@@ -35,7 +35,7 @@ async def auto_trade_loop():
                     price = 0
                 
                 if price > 0:
-                    amount = 2.0 / price 
+                    amount = 2.0 / price  # Safe $2 trade amount
                     time_str = datetime.now().strftime("%H:%M:%S")
                     
                     try:
@@ -48,7 +48,6 @@ async def auto_trade_loop():
                         trade_qty = round(int(amount / step_size) * step_size, 8)
                         
                         if trade_qty > 0:
-                            # Perfect flat format for CoinDCX
                             order_body = {
                                 "side": "buy", 
                                 "order_type": "market_order", 
@@ -80,10 +79,10 @@ async def auto_trade_loop():
                                 bot_state["trades_today"] += 1
                                 bot_state["history"].insert(0, {"time": time_str, "action": f"✅ SUCCESS: Bought {sym} at {price}"})
                             else:
-                                bot_state["history"].insert(0, {"time": time_str, "action": f"⚠️ UNKNOWN ({sym}): Check App!"})
+                                bot_state["history"].insert(0, {"time": time_str, "action": f"⚠️ UNKNOWN ({sym})"})
                                 
                     except Exception as trade_err:
-                        bot_state["history"].insert(0, {"time": time_str, "action": f"❌ ERROR ({sym}): {str(trade_err)[:40]}"})
+                        bot_state["history"].insert(0, {"time": time_str, "action": f"❌ ERROR: {str(trade_err)[:40]}"})
                         
         except Exception as e:
             print(f"Loop Error: {str(e)}")
@@ -97,17 +96,16 @@ async def startup(): asyncio.create_task(auto_trade_loop())
 def get_bot_history():
     return {"status": "success", "trades_today": bot_state['trades_today'], "history": bot_state["history"]}
 
-# Ab ye GET aur POST dono requests ko accept karega (App ki problem khatam!)
+# Dynamic endpoint jo GET aur POST dono requests handle karega taaki app connection fail na ho
 @app.api_route("/api/save-keys", methods=["GET", "POST"])
 async def save_keys(request: Request):
     try:
-        # Check if data is coming via POST or GET URL parameters
         if request.method == "POST":
             data = await request.json()
         else:
             data = dict(request.query_params)
             
-        print(f"📥 BINGO! App se keys aagayi hain ({request.method}): {data}")
+        print(f"📥 BINGO! Commercial App se keys aagayi hain ({request.method}): {data}")
         
         api_key = data.get("api_key") or data.get("apiKey")
         secret_key = data.get("secret_key") or data.get("secretKey")
@@ -118,21 +116,14 @@ async def save_keys(request: Request):
                 "secret_key": secret_key, 
                 "active_broker": "coindcx"
             })
-            return {"status": "success", "message": "Keys activated successfully!"}
+            return {"status": "success", "message": "Commercial keys activated successfully!"}
         else:
-            return {"status": "error", "message": "Keys are missing in request!"}
+            return {"status": "error", "message": "Keys missing!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-    
-    bot_state.update({
-        "api_key": data.get("api_key"), 
-        "secret_key": data.get("secret_key"), 
-        "active_broker": "coindcx"
-    })
-    return {"status": "success", "message": "Keys activated for trading!"}
 
 @app.get("/")
-def root(): return {"status": "HiTech CoinDCX Commercial Bot API Running! 🚀"}
+def root(): return {"status": "HiTech CoinDCX Commercial Platform is Live! 🚀"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
