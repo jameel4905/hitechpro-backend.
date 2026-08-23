@@ -5,15 +5,13 @@ from datetime import datetime
 
 # 🏢 MULTI-USER & 23+ EXCHANGES COMMERCIAL STATE
 bot_state = {
-    "active_broker": "binance",  # Default, app se jo user dega wo set ho jayega
+    "active_broker": "binance",  
     "api_key": None, 
     "secret_key": None, 
     "active_position": None, 
     "trades_today": 0, 
     "history": []
 }
-
-SCAN_COINS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT']
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -24,19 +22,12 @@ async def auto_trade_loop():
         try:
             if bot_state["api_key"] and bot_state["secret_key"] and not bot_state["active_position"]:
                 broker_name = bot_state["active_broker"].lower().strip()
-time_str = datetime.now().strftime("%H:%M:%S")
-
-# Exchange se saare active USDT coins automatic load honge
-markets = ex.load_markets()
-usdt_coins = [s for s in markets if s.endswith('/USDT') and markets[s]['active']]
-sym = random.choice(usdt_coins)
+                time_str = datetime.now().strftime("%H:%M:%S")
                 
                 try:
-                    # 🔄 Check if exchange exists in CCXT's 23+ supported exchanges list
                     if broker_name not in ccxt.exchanges:
                         raise Exception(f"Exchange '{broker_name}' is not supported by CCXT!")
                     
-                    # Dynamically initialize ANY exchange safely
                     exchange_class = getattr(ccxt, broker_name)
                     ex = exchange_class({
                         'apiKey': bot_state["api_key"],
@@ -44,16 +35,18 @@ sym = random.choice(usdt_coins)
                         'enableRateLimit': True
                     })
                     
-                    # Fetch market ticker price
+                    # Exchange se saare active USDT coins automatic load honge
+                    markets = ex.load_markets()
+                    usdt_coins = [s for s in markets if s.endswith('/USDT') and markets[s]['active']]
+                    sym = random.choice(usdt_coins)
+                    
                     ticker = ex.fetch_ticker(sym)
                     price = ticker['last']
                     
-                    # Safe ~$2 amount calculation
                     amount = 2.0 / price
                     
                     print(f"🔥 Placing trade on {broker_name.upper()} for {sym} at {price}...")
                     
-                    # Universal Market Buy Order for all exchanges
                     order = ex.create_market_buy_order(sym, amount)
                     
                     if order:
@@ -84,7 +77,6 @@ def get_bot_history():
         "history": bot_state["history"]
     }
 
-# 📥 Universal Endpoint for ALL 23+ Exchanges
 @app.api_route("/api/save-keys", methods=["GET", "POST"])
 async def save_keys(request: Request):
     try:
@@ -105,7 +97,7 @@ async def save_keys(request: Request):
                 "secret_key": secret_key, 
                 "active_broker": broker.lower().strip()
             })
-            return {"status": "success", "message": f"Successfully connected to {broker.upper()}! (Multi-Exchange Ready)"}
+            return {"status": "success", "message": f"Successfully connected to {broker.upper()}!"}
         else:
             return {"status": "error", "message": "API Key or Secret Key missing!"}
     except Exception as e:
