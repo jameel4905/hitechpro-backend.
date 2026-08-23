@@ -3,9 +3,9 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-# 🏢 MULTI-USER & MULTI-BROKER COMMERCIAL STATE
+# 🏢 MULTI-USER & 23+ EXCHANGES COMMERCIAL STATE
 bot_state = {
-    "active_broker": "coindcx",  # Default broker, app se change ho jayega
+    "active_broker": "binance",  # Default, app se jo user dega wo set ho jayega
     "api_key": None, 
     "secret_key": None, 
     "active_position": None, 
@@ -19,16 +19,20 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 async def auto_trade_loop():
-    print("🚀 Multi-Broker Commercial Engine Started...")
+    print("🚀 Universal Multi-Exchange Commercial Engine Started...")
     while True:
         try:
             if bot_state["api_key"] and bot_state["secret_key"] and not bot_state["active_position"]:
-                broker_name = bot_state["active_broker"].lower()
+                broker_name = bot_state["active_broker"].lower().strip()
                 sym = random.choice(SCAN_COINS)
                 time_str = datetime.now().strftime("%H:%M:%S")
                 
                 try:
-                    # 🔄 Dynamically connect to ANY exchange using CCXT!
+                    # 🔄 Check if exchange exists in CCXT's 23+ supported exchanges list
+                    if broker_name not in ccxt.exchanges:
+                        raise Exception(f"Exchange '{broker_name}' is not supported by CCXT!")
+                    
+                    # Dynamically initialize ANY exchange safely
                     exchange_class = getattr(ccxt, broker_name)
                     ex = exchange_class({
                         'apiKey': bot_state["api_key"],
@@ -36,28 +40,28 @@ async def auto_trade_loop():
                         'enableRateLimit': True
                     })
                     
-                    # Fetch market price
+                    # Fetch market ticker price
                     ticker = ex.fetch_ticker(sym)
                     price = ticker['last']
                     
-                    # Calculate safe ~$2 amount
+                    # Safe ~$2 amount calculation
                     amount = 2.0 / price
                     
-                    print(f"🔥 Attempting trade on {broker_name.upper()} for {sym} at {price}...")
+                    print(f"🔥 Placing trade on {broker_name.upper()} for {sym} at {price}...")
                     
-                    # Place Market Buy Order
+                    # Universal Market Buy Order for all exchanges
                     order = ex.create_market_buy_order(sym, amount)
                     
                     if order:
                         bot_state["active_position"] = {"symbol": sym, "entry": price}
                         bot_state["trades_today"] += 1
-                        bot_state["history"].insert(0, {"time": time_str, "action": f"✅ SUCCESS ({broker_name.upper()}) Bought {sym} at {price}"})
+                        bot_state["history"].insert(0, {"time": time_str, "action": f"✅ SUCCESS ({broker_name.upper()}): Bought {sym} at {price}"})
                         print(f"✅ Trade Successful on {broker_name.upper()}!")
                         
                 except Exception as trade_err:
-                    err_msg = str(trade_err)
-                    print(f"❌ Trade Rejected on {broker_name.upper()}: {err_msg}")
-                    bot_state["history"].insert(0, {"time": time_str, "action": f"❌ REJECTED ({broker_name.upper()}): {err_msg[:40]}"})
+                    err_msg = str(trade_err)[:50]
+                    print(f"❌ Trade Error on {broker_name.upper()}: {err_msg}")
+                    bot_state["history"].insert(0, {"time": time_str, "action": f"❌ REJECTED ({broker_name.upper()}): {err_msg}"})
                     
         except Exception as e:
             print(f"Loop Error: {str(e)}")
@@ -76,7 +80,7 @@ def get_bot_history():
         "history": bot_state["history"]
     }
 
-# 📥 Universal Save Keys Endpoint (Handles any Broker: Binance, CoinDCX, etc.)
+# 📥 Universal Endpoint for ALL 23+ Exchanges
 @app.api_route("/api/save-keys", methods=["GET", "POST"])
 async def save_keys(request: Request):
     try:
@@ -85,26 +89,26 @@ async def save_keys(request: Request):
         else:
             data = dict(request.query_params)
             
-        print(f"📥 Commercial App Request ({request.method}): {data}")
+        print(f"📥 Commercial Multi-Broker Request ({request.method}): {data}")
         
         api_key = data.get("api_key") or data.get("apiKey")
         secret_key = data.get("secret_key") or data.get("secretKey")
-        broker = data.get("broker") or data.get("active_broker") or "coindcx"
+        broker = data.get("broker") or data.get("active_broker") or "binance"
         
         if api_key and secret_key:
             bot_state.update({
                 "api_key": api_key, 
                 "secret_key": secret_key, 
-                "active_broker": broker.lower()
+                "active_broker": broker.lower().strip()
             })
-            return {"status": "success", "message": f"Connected successfully to {broker.upper()}!"}
+            return {"status": "success", "message": f"Successfully connected to {broker.upper()}! (Multi-Exchange Ready)"}
         else:
-            return {"status": "error", "message": "API Key or Secret Key is missing!"}
+            return {"status": "error", "message": "API Key or Secret Key missing!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @app.get("/")
-def root(): return {"status": "HiTech Multi-Broker Commercial Platform is Live! 🚀"}
+def root(): return {"status": "HiTech Multi-Exchange SaaS Platform is Live! 🚀"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
