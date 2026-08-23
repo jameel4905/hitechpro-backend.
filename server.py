@@ -34,7 +34,7 @@ async def auto_trade_loop():
                         price = next((float(t['last_price']) for t in tickers if t['market'] == market_pair), 0)
                         
                         if price > 0:
-                            amount = 2.0 / price
+                            amount = 6.0 / price
                             ts = int(round(time.time() * 1000))
                             sec_bytes = bytes(bot_state["secret_key"], encoding='utf-8')
                             
