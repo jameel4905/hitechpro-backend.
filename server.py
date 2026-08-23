@@ -24,8 +24,12 @@ async def auto_trade_loop():
         try:
             if bot_state["api_key"] and bot_state["secret_key"] and not bot_state["active_position"]:
                 broker_name = bot_state["active_broker"].lower().strip()
-                sym = random.choice(SCAN_COINS)
-                time_str = datetime.now().strftime("%H:%M:%S")
+time_str = datetime.now().strftime("%H:%M:%S")
+
+# Exchange se saare active USDT coins automatic load honge
+markets = ex.load_markets()
+usdt_coins = [s for s in markets if s.endswith('/USDT') and markets[s]['active']]
+sym = random.choice(usdt_coins)
                 
                 try:
                     # 🔄 Check if exchange exists in CCXT's 23+ supported exchanges list
