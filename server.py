@@ -31,42 +31,76 @@ bot_state = {
     ]
 }
 
-# --- NAYA FEATURE: Asli Exchange Connection & Balance Fetch ---
+# --- NAYA FEATURE: Asli Exchange Connection (CoinDCX FIX INCLUDED) ---
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
     exchange_id = data.get("exchange", "binance").lower()
-    api_key = data.get("api_key", "")
-    secret_key = data.get("secret_key", "")
+    api_key = data.get("api_key", "").strip()
+    secret_key = data.get("secret_key", "").strip()
 
     bot_state["active_broker"] = exchange_id
     bot_state["api_key"] = api_key
     bot_state["secret_key"] = secret_key
 
     try:
-        # CCXT Exchange Setup
-        exchange_class = getattr(ccxt, exchange_id)
-        exchange = exchange_class({
-            'apiKey': api_key,
-            'secret': secret_key,
-            'enableRateLimit': True,
-        })
-        
-        # Asli Balance Fetch
-        balance = exchange.fetch_balance()
-        usdt_bal = balance.get('USDT', {}).get('free', 0.0)
-        btc_bal = balance.get('BTC', {}).get('free', 0.0)
-        sol_bal = balance.get('SOL', {}).get('free', 0.0)
-
-        return {
-            "status": "success",
-            "message": f"Connected to {exchange_id.upper()} successfully!",
-            "balances": {
-                "USDT": round(usdt_bal, 2),
-                "BTC": round(round(btc_bal, 5), 5),
-                "SOL": round(sol_bal, 2)
+        # 1. SPECIAL CASE: CoinDCX (Direct API)
+        if exchange_id == "coindcx":
+            timeStamp = int(round(time.time() * 1000))
+            body = {"timestamp": timeStamp}
+            json_body = json.dumps(body, separators=(',', ':'))
+            signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+            
+            headers = {
+                'Content-Type': 'application/json',
+                'X-AUTH-APIKEY': api_key,
+                'X-AUTH-SIGNATURE': signature
             }
-        }
+            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=10)
+            res_data = res.json()
+            
+            if isinstance(res_data, list):
+                usdt_bal, btc_bal, sol_bal = 0.0, 0.0, 0.0
+                for item in res_data:
+                    if item.get("currency") == "USDT": usdt_bal = float(item.get("balance", 0.0))
+                    elif item.get("currency") == "BTC": btc_bal = float(item.get("balance", 0.0))
+                    elif item.get("currency") == "SOL": sol_bal = float(item.get("balance", 0.0))
+                
+                return {
+                    "status": "success",
+                    "message": "Connected to CoinDCX successfully!",
+                    "balances": {"USDT": round(usdt_bal, 2), "BTC": round(btc_bal, 5), "SOL": round(sol_bal, 2)}
+                }
+            else:
+                return {"status": "error", "message": "CoinDCX Key Invalid or Permission Denied!"}
+
+        # 2. GLOBAL EXCHANGES (Binance, Bybit, OKX via CCXT)
+        else:
+            if not hasattr(ccxt, exchange_id):
+                return {"status": "error", "message": f"{exchange_id.upper()} is not supported by CCXT engine."}
+                
+            exchange_class = getattr(ccxt, exchange_id)
+            exchange = exchange_class({
+                'apiKey': api_key,
+                'secret': secret_key,
+                'enableRateLimit': True,
+            })
+            
+            # Asli Balance Fetch
+            balance = exchange.fetch_balance()
+            usdt_bal = balance.get('USDT', {}).get('free', 0.0)
+            btc_bal = balance.get('BTC', {}).get('free', 0.0)
+            sol_bal = balance.get('SOL', {}).get('free', 0.0)
+
+            return {
+                "status": "success",
+                "message": f"Connected to {exchange_id.upper()} successfully!",
+                "balances": {
+                    "USDT": round(usdt_bal, 2),
+                    "BTC": round(round(btc_bal, 5), 5),
+                    "SOL": round(sol_bal, 2)
+                }
+            }
     except Exception as e:
         return {"status": "error", "message": f"API Error: Invalid Keys! ({str(e)})"}
 
