@@ -3,19 +3,16 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-# FastAPI App Initialize
 app = FastAPI()
 
-# CORS Fix (Taaki frontend aasaani se connect ho sake)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Sabhi jagah se allow karega
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global Bot State
 bot_state = {
     "active_broker": "binance",
     "api_key": "",
@@ -31,7 +28,7 @@ bot_state = {
     ]
 }
 
-# --- NAYA FEATURE: Asli Exchange Connection (CoinDCX FIX INCLUDED) ---
+# --- DYNAMIC PORTFOLIO UPDATE ---
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
@@ -60,16 +57,17 @@ async def connect_exchange(request: Request):
             res_data = res.json()
             
             if isinstance(res_data, list):
-                usdt_bal, btc_bal, sol_bal = 0.0, 0.0, 0.0
+                dynamic_balances = {}
                 for item in res_data:
-                    if item.get("currency") == "USDT": usdt_bal = float(item.get("balance", 0.0))
-                    elif item.get("currency") == "BTC": btc_bal = float(item.get("balance", 0.0))
-                    elif item.get("currency") == "SOL": sol_bal = float(item.get("balance", 0.0))
+                    bal = float(item.get("balance", 0.0))
+                    # Sirf wahi coin bhejo jisme balance 0 se zyada ho
+                    if bal > 0.00001:
+                        dynamic_balances[item.get("currency")] = round(bal, 5)
                 
                 return {
                     "status": "success",
                     "message": "Connected to CoinDCX successfully!",
-                    "balances": {"USDT": round(usdt_bal, 2), "BTC": round(btc_bal, 5), "SOL": round(sol_bal, 2)}
+                    "balances": dynamic_balances
                 }
             else:
                 return {"status": "error", "message": "CoinDCX Key Invalid or Permission Denied!"}
@@ -86,29 +84,25 @@ async def connect_exchange(request: Request):
                 'enableRateLimit': True,
             })
             
-            # Asli Balance Fetch
             balance = exchange.fetch_balance()
-            usdt_bal = balance.get('USDT', {}).get('free', 0.0)
-            btc_bal = balance.get('BTC', {}).get('free', 0.0)
-            sol_bal = balance.get('SOL', {}).get('free', 0.0)
+            dynamic_balances = {}
+            
+            if 'total' in balance:
+                for coin, amt in balance['total'].items():
+                    if isinstance(amt, (int, float)) and amt > 0.00001:
+                        dynamic_balances[coin] = round(amt, 5)
 
             return {
                 "status": "success",
                 "message": f"Connected to {exchange_id.upper()} successfully!",
-                "balances": {
-                    "USDT": round(usdt_bal, 2),
-                    "BTC": round(round(btc_bal, 5), 5),
-                    "SOL": round(sol_bal, 2)
-                }
+                "balances": dynamic_balances
             }
     except Exception as e:
         return {"status": "error", "message": f"API Error: Invalid Keys! ({str(e)})"}
 
-# Auto Trading Loop (CCXT Logic)
 async def auto_trade_loop():
     while True:
         try:
-            # Yahan aage chalkar tumhara asli CCXT order logic chalega
             pass 
         except Exception as e:
             print(f"Loop Error: {str(e)}")
@@ -118,7 +112,6 @@ async def auto_trade_loop():
 async def startup(): 
     asyncio.create_task(auto_trade_loop())
 
-# 1. API - Frontend ko history dene ke liye
 @app.get("/api/bot-history")
 def get_bot_history():
     return {
@@ -128,7 +121,6 @@ def get_bot_history():
         "history": bot_state["history"]
     }
 
-# 2. API - App se Settings save karne ke liye
 @app.post("/api/save-settings")
 async def save_settings(request: Request):
     try:
@@ -141,7 +133,6 @@ async def save_settings(request: Request):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# 3. API - Manual Buy/Sell Order
 @app.post("/api/manual-trade")
 async def manual_trade(request: Request):
     data = await request.json()
@@ -159,7 +150,6 @@ async def manual_trade(request: Request):
     
     return {"status": "success", "message": f"{action} Order signal received for {pair}!"}
 
-# Root Check
 @app.get("/")
 def root(): 
     return {"status": "HiTech Hybrid Multi-Exchange Platform is Live! 🚀"}
