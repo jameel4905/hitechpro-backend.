@@ -15,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global Bot State (Database ki tarah)
+# Global Bot State
 bot_state = {
     "active_broker": "binance",
     "api_key": "",
@@ -31,19 +31,55 @@ bot_state = {
     ]
 }
 
+# --- NAYA FEATURE: Asli Exchange Connection & Balance Fetch ---
+@app.post("/api/connect-exchange")
+async def connect_exchange(request: Request):
+    data = await request.json()
+    exchange_id = data.get("exchange", "binance").lower()
+    api_key = data.get("api_key", "")
+    secret_key = data.get("secret_key", "")
+
+    bot_state["active_broker"] = exchange_id
+    bot_state["api_key"] = api_key
+    bot_state["secret_key"] = secret_key
+
+    try:
+        # CCXT Exchange Setup
+        exchange_class = getattr(ccxt, exchange_id)
+        exchange = exchange_class({
+            'apiKey': api_key,
+            'secret': secret_key,
+            'enableRateLimit': True,
+        })
+        
+        # Asli Balance Fetch
+        balance = exchange.fetch_balance()
+        usdt_bal = balance.get('USDT', {}).get('free', 0.0)
+        btc_bal = balance.get('BTC', {}).get('free', 0.0)
+        sol_bal = balance.get('SOL', {}).get('free', 0.0)
+
+        return {
+            "status": "success",
+            "message": f"Connected to {exchange_id.upper()} successfully!",
+            "balances": {
+                "USDT": round(usdt_bal, 2),
+                "BTC": round(round(btc_bal, 5), 5),
+                "SOL": round(sol_bal, 2)
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": f"API Error: Invalid Keys! ({str(e)})"}
+
 # Auto Trading Loop (CCXT Logic)
 async def auto_trade_loop():
     while True:
         try:
             # Yahan aage chalkar tumhara asli CCXT order logic chalega
-            # Jaise: order = ex.create_market_buy_order(sym, amount)
             pass 
         except Exception as e:
             print(f"Loop Error: {str(e)}")
-            
-        await asyncio.sleep(30) # Har 30 second mein market check karega
+        await asyncio.sleep(30)
 
-# Jab server start ho tab auto loop chalu kar do
 @app.on_event("startup")
 async def startup(): 
     asyncio.create_task(auto_trade_loop())
@@ -58,36 +94,32 @@ def get_bot_history():
         "history": bot_state["history"]
     }
 
-# 2. API - App se API keys aur Settings save karne ke liye
+# 2. API - App se Settings save karne ke liye
 @app.post("/api/save-settings")
 async def save_settings(request: Request):
     try:
         data = await request.json()
-        # Settings Update
         bot_state["max_trades"] = data.get("maxTrades", 5)
         bot_state["target_profit"] = data.get("target", 20)
         bot_state["stop_loss"] = data.get("stoploss", 10)
         bot_state["paper_trading"] = data.get("paperTrading", False)
-        
-        return {"status": "success", "message": "Settings & Keys saved successfully!"}
+        return {"status": "success", "message": "Settings saved successfully!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# 3. API - Manual Buy/Sell Order ke liye
+# 3. API - Manual Buy/Sell Order
 @app.post("/api/manual-trade")
 async def manual_trade(request: Request):
     data = await request.json()
-    action = data.get("action") # BUY or SELL
+    action = data.get("action") 
     pair = data.get("pair")
     
-    # Trade Limit Check
     if bot_state["trades_today"] >= int(bot_state["max_trades"]):
         return {"status": "error", "message": "Daily trade limit reached!"}
         
     time_str = datetime.now().strftime("%Y-%m-%d %I:%M %p")
     trade_msg = f"✅ SUCCESS: Manual {action} order executed for {pair}"
     
-    # History aur limit update
     bot_state["history"].insert(0, {"time": time_str, "action": trade_msg})
     bot_state["trades_today"] += 1
     
@@ -98,6 +130,5 @@ async def manual_trade(request: Request):
 def root(): 
     return {"status": "HiTech Hybrid Multi-Exchange Platform is Live! 🚀"}
 
-# Server Start Command (Typo fixed)
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
