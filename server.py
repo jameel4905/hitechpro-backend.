@@ -21,7 +21,9 @@ bot_state = {
     "trade_amount_usdt": 10,
     "trade_type": "intraday",
     "strategy": "volume",
-    "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."]
+    "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
+    "active_trades": [],   # NEW: Active Trades List
+    "trade_history": []    # NEW: Trade History List
 }
 
 def add_log(msg):
@@ -36,20 +38,13 @@ async def connect_exchange(request: Request):
     exchange_id = data.get("exchange", "binance").lower()
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
-    
     bot_state["active_broker"] = exchange_id
     bot_state["api_key"] = api_key
     bot_state["secret_key"] = secret_key
 
     try:
-        # --- FIXED: $10,000 PAPER TRADING BALANCE ---
         if exchange_id == "paper":
-            return {
-                "status": "success", 
-                "message": "🟢 Paper Trading Activated! $10,000 Added.", 
-                "balances": {"USDT": 10000.00}
-            }
-            
+            return {"status": "success", "message": "🟢 Paper Trading Activated! $10,000 Added.", "balances": {"USDT": 10000.00}}
         elif exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
             body = {"timestamp": timeStamp}
@@ -62,7 +57,7 @@ async def connect_exchange(request: Request):
                 dynamic_balances = {item.get("currency"): round(float(item.get("balance", 0.0)), 5) for item in res_data if float(item.get("balance", 0.0)) > 0.00001}
                 return {"status": "success", "message": "Connected to CoinDCX successfully!", "balances": dynamic_balances}
             else:
-                return {"status": "error", "message": "CoinDCX Key Invalid or Denied!"}
+                return {"status": "error", "message": "CoinDCX Key Invalid!"}
         else:
             if not hasattr(ccxt, exchange_id): return {"status": "error", "message": "Exchange not supported."}
             exchange = getattr(ccxt, exchange_id)({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
@@ -70,7 +65,7 @@ async def connect_exchange(request: Request):
             dynamic_balances = {coin: round(amt, 5) for coin, amt in balance.get('total', {}).items() if isinstance(amt, (int, float)) and amt > 0.00001}
             return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
     except Exception as e:
-        return {"status": "error", "message": f"API Error: Invalid Keys!"}
+        return {"status": "error", "message": "API Error: Invalid Keys!"}
 
 @app.post("/api/bot-control")
 async def bot_control(request: Request):
@@ -94,6 +89,11 @@ async def bot_control(request: Request):
 def get_bot_logs():
     return {"status": "success", "is_running": bot_state["is_running"], "logs": bot_state["logs"]}
 
+# NEW ENDPOINT: Dashboard & History Data Fetcher
+@app.get("/api/get-trades")
+def get_trades():
+    return {"status": "success", "active": bot_state["active_trades"], "history": bot_state["trade_history"]}
+
 async def market_scanner_loop():
     while True:
         if bot_state["is_running"]:
@@ -106,36 +106,50 @@ async def market_scanner_loop():
                 target_coin = random.choice(usdt_pairs[:100])
                 coin_symbol = target_coin['symbol']
                 price_change = float(target_coin['priceChangePercent'])
+                current_price = float(target_coin['lastPrice'])
                 
                 strategy = bot_state["strategy"]
                 trade_type = bot_state["trade_type"]
                 
-                add_log(f"🔎 [{trade_type.upper()}] Scanning {coin_symbol} using {strategy.upper()} strategy...")
+                add_log(f"🔎 [{trade_type.upper()}] Scanning {coin_symbol}...")
                 await asyncio.sleep(2)
                 
                 trade_executed = False
-                if strategy == "rsi" and random.randint(1, 10) > 7:
-                    add_log(f"🟢 {coin_symbol}: RSI is at 28 (Oversold)! Perfect Reversal Setup.")
-                    trade_executed = True
-                elif strategy == "macd" and random.randint(1, 10) > 7:
-                    add_log(f"🟢 {coin_symbol}: MACD Bullish Crossover confirmed.")
-                    trade_executed = True
-                elif strategy == "volume" and float(target_coin['quoteVolume']) > 200000000 and price_change > 3:
-                    add_log(f"🟢 {coin_symbol}: Massive Volume Breakout Detected!")
-                    trade_executed = True
-                elif strategy == "ema_cross" and random.randint(1, 10) > 7:
-                    add_log(f"🟢 {coin_symbol}: EMA 9 crossed above EMA 21. Strong Trend.")
-                    trade_executed = True
-                else:
-                    add_log(f"📊 {coin_symbol}: No valid {strategy.upper()} signal. Searching next...")
+                if strategy == "rsi" and random.randint(1, 10) > 7: trade_executed = True
+                elif strategy == "macd" and random.randint(1, 10) > 7: trade_executed = True
+                elif strategy == "volume" and float(target_coin['quoteVolume']) > 200000000 and price_change > 3: trade_executed = True
+                elif strategy == "ema_cross" and random.randint(1, 10) > 7: trade_executed = True
+                elif strategy not in ["rsi", "macd", "volume", "ema_cross"] and random.randint(1, 10) > 8: trade_executed = True # Catch all
 
-                if trade_executed:
-                    broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
-                    add_log(f"⚡ BUY ORDER: {bot_state['trade_amount_usdt']} USDT on {broker_name}...")
-                    await asyncio.sleep(1)
-                    add_log(f"✅ SUCCESS: {coin_symbol} Bought. Auto SL & TP Set.")
-                    await asyncio.sleep(10) 
+                # If Trade condition met, add to Active Dashboard
+                if trade_executed and len(bot_state["active_trades"]) < 5: # Max 5 active trades at a time
+                    direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
+                    new_trade = {
+                        "id": int(time.time()),
+                        "symbol": coin_symbol,
+                        "type": direction,
+                        "entry_price": current_price,
+                        "amount_usdt": bot_state["trade_amount_usdt"],
+                        "time": datetime.now().strftime("%H:%M:%S")
+                    }
+                    bot_state["active_trades"].insert(0, new_trade)
                     
+                    broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
+                    add_log(f"⚡ {direction} ORDER EXECUTED: {coin_symbol} at ${current_price} on {broker_name}")
+                    await asyncio.sleep(5) 
+                
+                # SIMULATION: Auto-close trades (TP/SL Hit) to populate History
+                if len(bot_state["active_trades"]) > 0 and random.randint(1, 5) > 3:
+                    closed_trade = bot_state["active_trades"].pop()
+                    pnl_percent = round(random.uniform(-4.0, 12.0), 2) # Random PnL for realistic demo
+                    closed_trade["pnl_percent"] = pnl_percent
+                    closed_trade["pnl_usdt"] = round((closed_trade["amount_usdt"] * pnl_percent) / 100, 2)
+                    closed_trade["close_time"] = datetime.now().strftime("%H:%M:%S")
+                    bot_state["trade_history"].insert(0, closed_trade)
+                    
+                    if len(bot_state["trade_history"]) > 20: bot_state["trade_history"].pop() # Keep history size fixed
+                    add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
+
             except Exception as e:
                 add_log(f"❌ API Error: Retrying connection...")
         
