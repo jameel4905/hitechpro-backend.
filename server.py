@@ -36,12 +36,21 @@ async def connect_exchange(request: Request):
     exchange_id = data.get("exchange", "binance").lower()
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
+    
     bot_state["active_broker"] = exchange_id
     bot_state["api_key"] = api_key
     bot_state["secret_key"] = secret_key
 
     try:
-        if exchange_id == "coindcx":
+        # --- FIXED: $10,000 PAPER TRADING BALANCE ---
+        if exchange_id == "paper":
+            return {
+                "status": "success", 
+                "message": "🟢 Paper Trading Activated! $10,000 Added.", 
+                "balances": {"USDT": 10000.00}
+            }
+            
+        elif exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
             body = {"timestamp": timeStamp}
             json_body = json.dumps(body, separators=(',', ':'))
@@ -68,7 +77,8 @@ async def bot_control(request: Request):
     data = await request.json()
     action = data.get("action")
     if action == "start":
-        if bot_state["api_key"] == "": return {"status": "error", "message": "Connect API First!"}
+        if bot_state["active_broker"] != "paper" and bot_state["api_key"] == "": 
+            return {"status": "error", "message": "Connect API or Paper Trading First!"}
         bot_state["is_running"] = True
         bot_state["trade_amount_usdt"] = float(data.get("amount", 10))
         bot_state["trade_type"] = data.get("trade_type", "intraday")
@@ -103,13 +113,12 @@ async def market_scanner_loop():
                 add_log(f"🔎 [{trade_type.upper()}] Scanning {coin_symbol} using {strategy.upper()} strategy...")
                 await asyncio.sleep(2)
                 
-                # Dynamic Logic Based on Selected Strategy
                 trade_executed = False
                 if strategy == "rsi" and random.randint(1, 10) > 7:
                     add_log(f"🟢 {coin_symbol}: RSI is at 28 (Oversold)! Perfect Reversal Setup.")
                     trade_executed = True
                 elif strategy == "macd" and random.randint(1, 10) > 7:
-                    add_log(f"🟢 {coin_symbol}: MACD Bullish Crossover confirmed on 15m chart.")
+                    add_log(f"🟢 {coin_symbol}: MACD Bullish Crossover confirmed.")
                     trade_executed = True
                 elif strategy == "volume" and float(target_coin['quoteVolume']) > 200000000 and price_change > 3:
                     add_log(f"🟢 {coin_symbol}: Massive Volume Breakout Detected!")
@@ -121,10 +130,11 @@ async def market_scanner_loop():
                     add_log(f"📊 {coin_symbol}: No valid {strategy.upper()} signal. Searching next...")
 
                 if trade_executed:
-                    add_log(f"⚡ EXECUTING {trade_type.upper()} BUY ORDER: {bot_state['trade_amount_usdt']} USDT on {bot_state['active_broker'].upper()}...")
+                    broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
+                    add_log(f"⚡ BUY ORDER: {bot_state['trade_amount_usdt']} USDT on {broker_name}...")
                     await asyncio.sleep(1)
-                    add_log(f"✅ SUCCESS: {coin_symbol} Bought. Auto SL & TP Set for {trade_type.upper()}.")
-                    await asyncio.sleep(10) # Pause after trade to prevent spam
+                    add_log(f"✅ SUCCESS: {coin_symbol} Bought. Auto SL & TP Set.")
+                    await asyncio.sleep(10) 
                     
             except Exception as e:
                 add_log(f"❌ API Error: Retrying connection...")
