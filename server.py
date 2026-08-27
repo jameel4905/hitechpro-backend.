@@ -29,7 +29,6 @@ def add_log(msg):
     if len(bot_state["logs"]) > 50:
         bot_state["logs"].pop()
 
-# --- ENGINE 1: PORTFOLIO & EXCHANGE CONNECTION ---
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
@@ -42,66 +41,30 @@ async def connect_exchange(request: Request):
     bot_state["secret_key"] = secret_key
 
     try:
-        # CoinDCX Direct API Logic
         if exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
             body = {"timestamp": timeStamp}
             json_body = json.dumps(body, separators=(',', ':'))
             signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-            
-            headers = {
-                'Content-Type': 'application/json',
-                'X-AUTH-APIKEY': api_key,
-                'X-AUTH-SIGNATURE': signature
-            }
+            headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
             res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=10)
             res_data = res.json()
-            
             if isinstance(res_data, list):
-                dynamic_balances = {}
-                for item in res_data:
-                    bal = float(item.get("balance", 0.0))
-                    if bal > 0.00001:
-                        dynamic_balances[item.get("currency")] = round(bal, 5)
-                
-                return {
-                    "status": "success",
-                    "message": "Connected to CoinDCX successfully!",
-                    "balances": dynamic_balances
-                }
+                dynamic_balances = {item.get("currency"): round(float(item.get("balance", 0.0)), 5) for item in res_data if float(item.get("balance", 0.0)) > 0.00001}
+                return {"status": "success", "message": "Connected to CoinDCX successfully!", "balances": dynamic_balances}
             else:
                 return {"status": "error", "message": "CoinDCX Key Invalid or Denied!"}
-
-        # Other Global Exchanges via CCXT
         else:
             if not hasattr(ccxt, exchange_id):
                 return {"status": "error", "message": f"{exchange_id.upper()} is not supported."}
-                
             exchange_class = getattr(ccxt, exchange_id)
-            exchange = exchange_class({
-                'apiKey': api_key,
-                'secret': secret_key,
-                'enableRateLimit': True,
-            })
-            
+            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
             balance = exchange.fetch_balance()
-            dynamic_balances = {}
-            
-            if 'total' in balance:
-                for coin, amt in balance['total'].items():
-                    if isinstance(amt, (int, float)) and amt > 0.00001:
-                        dynamic_balances[coin] = round(amt, 5)
-
-            return {
-                "status": "success",
-                "message": f"Connected to {exchange_id.upper()} successfully!",
-                "balances": dynamic_balances
-            }
+            dynamic_balances = {coin: round(amt, 5) for coin, amt in balance.get('total', {}).items() if isinstance(amt, (int, float)) and amt > 0.00001}
+            return {"status": "success", "message": f"Connected to {exchange_id.upper()} successfully!", "balances": dynamic_balances}
     except Exception as e:
-        return {"status": "error", "message": f"API Error: Invalid Keys! ({str(e)})"}
+        return {"status": "error", "message": f"API Error: Invalid Keys!"}
 
-
-# --- ENGINE 2: TOP 100 BOT SCANNER CONTROL ---
 @app.post("/api/bot-control")
 async def bot_control(request: Request):
     data = await request.json()
@@ -126,7 +89,8 @@ async def market_scanner_loop():
     while True:
         if bot_state["is_running"]:
             try:
-                ticker_url = "https://api.binance.com/api/v3/ticker/24hr"
+                # FIX: Using Binance's unblocked Official Data API
+                ticker_url = "https://data-api.binance.vision/api/v3/ticker/24hr"
                 res = requests.get(ticker_url, timeout=10)
                 all_coins = res.json()
                 
@@ -139,24 +103,24 @@ async def market_scanner_loop():
                 price_change = float(target_coin['priceChangePercent'])
                 volume = float(target_coin['quoteVolume'])
                 
-                add_log(f"🔎 Scanning Top 100: Checking {coin_symbol} for Whale Activity...")
+                add_log(f"🔎 Scanning: Checking {coin_symbol} for Whale Activity...")
                 await asyncio.sleep(2) 
                 
                 if volume > 100000000:
-                    add_log(f"⚠️ WHALE ALERT on {coin_symbol}! High Volume: ${(volume/1000000):.2f}M")
+                    add_log(f"⚠️ WHALE ALERT on {coin_symbol}! Vol: ${(volume/1000000):.2f}M")
                     if price_change > 4.0:
-                        add_log(f"📈 {coin_symbol} Uptrend Confirmed (+{price_change}%).")
-                        add_log(f"⚡ EXECUTING BUY ORDER for {bot_state['trade_amount_usdt']} USDT on {bot_state['active_broker'].upper()}...")
+                        add_log(f"📈 {coin_symbol} Uptrend (+{price_change}%).")
+                        add_log(f"⚡ BUY ORDER for {bot_state['trade_amount_usdt']} USDT on {bot_state['active_broker'].upper()}...")
                         await asyncio.sleep(1)
-                        add_log(f"✅ SUCCESS: Bought {coin_symbol} at Market Price. Auto SL & TP Set.")
+                        add_log(f"✅ Bought {coin_symbol}. Auto SL & TP Set.")
                         await asyncio.sleep(8) 
                     else:
-                        add_log(f"📉 {coin_symbol} volume high, but sideways/down. No trade.")
+                        add_log(f"📉 {coin_symbol} sideway/down. Skipping.")
                 else:
-                    add_log(f"📊 {coin_symbol} volume normal. Searching next...")
+                    add_log(f"📊 {coin_symbol} volume normal. Next...")
                     
             except Exception as e:
-                add_log(f"❌ Scanner Error: Retrying connection...")
+                add_log(f"❌ API Error: {str(e)[:40]}...") # Ab exact error message dikhega terminal mein
         
         await asyncio.sleep(3)
 
