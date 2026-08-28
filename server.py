@@ -27,7 +27,6 @@ bot_state = {
     "paper_balance": 10000.0  
 }
 
-# 🔥 NEW: BOT KA MEMORY CARD (PERMANENT STORAGE)
 DATA_FILE = "bot_data.json"
 
 def load_memory():
@@ -52,7 +51,6 @@ def save_memory():
     except:
         pass
 
-# Server Start hote hi purana data load karega
 load_memory()
 
 def add_log(msg):
@@ -67,13 +65,24 @@ async def connect_exchange(request: Request):
     exchange_id = data.get("exchange", "binance").lower()
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
+    
+    # 🔥 NEW: Phone ka backup balance receive karo
+    saved_paper = data.get("saved_paper_balance") 
+
     bot_state["active_broker"] = exchange_id
     bot_state["api_key"] = api_key
     bot_state["secret_key"] = secret_key
 
     try:
         if exchange_id == "paper":
+            if saved_paper is not None:
+                client_bal = float(saved_paper)
+                # Agar phone me balance save hai aur server reset ho gaya tha, toh phone wala manenge
+                if client_bal != 10000.0 or bot_state["paper_balance"] == 10000.0:
+                    bot_state["paper_balance"] = client_bal
+            
             return {"status": "success", "message": "🟢 Paper Trading Activated! Balance Synced.", "balances": {"USDT": bot_state["paper_balance"]}}
+            
         elif exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
             body = {"timestamp": timeStamp}
@@ -175,8 +184,7 @@ async def market_scanner_loop():
                             "time": datetime.now().strftime("%H:%M:%S")
                         }
                         bot_state["active_trades"].insert(0, new_trade)
-                        
-                        save_memory() # 🔥 SAVE TO FILE
+                        save_memory() 
 
                         broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
                         add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price} on {broker_name}")
@@ -194,9 +202,8 @@ async def market_scanner_loop():
                         bot_state["paper_balance"] += (closed_trade["amount_usdt"] + closed_trade["pnl_usdt"])
 
                     bot_state["trade_history"].insert(0, closed_trade)
-                    if len(bot_state["trade_history"]) > 20: bot_state["trade_history"].pop()
-                    
-                    save_memory() # 🔥 SAVE TO FILE
+                    if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
+                    save_memory()
                     
                     add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
 
