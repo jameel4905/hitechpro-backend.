@@ -24,8 +24,36 @@ bot_state = {
     "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
     "active_trades": [],   
     "trade_history": [],    
-    "paper_balance": 10000.0  # 🔥 FIXED: Live Paper Trading Balance
+    "paper_balance": 10000.0  
 }
+
+# 🔥 NEW: BOT KA MEMORY CARD (PERMANENT STORAGE)
+DATA_FILE = "bot_data.json"
+
+def load_memory():
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r") as f:
+                data = json.load(f)
+                bot_state["paper_balance"] = data.get("paper_balance", 10000.0)
+                bot_state["active_trades"] = data.get("active_trades", [])
+                bot_state["trade_history"] = data.get("trade_history", [])
+        except:
+            pass
+
+def save_memory():
+    try:
+        with open(DATA_FILE, "w") as f:
+            json.dump({
+                "paper_balance": bot_state["paper_balance"],
+                "active_trades": bot_state["active_trades"],
+                "trade_history": bot_state["trade_history"]
+            }, f)
+    except:
+        pass
+
+# Server Start hote hi purana data load karega
+load_memory()
 
 def add_log(msg):
     time_str = datetime.now().strftime("%H:%M:%S")
@@ -96,11 +124,10 @@ def get_trades():
         "status": "success", 
         "active": bot_state["active_trades"], 
         "history": bot_state["trade_history"],
-        "paper_balance": bot_state["paper_balance"] # 🔥 Sending Live Balance to Frontend
+        "paper_balance": bot_state["paper_balance"] 
     }
 
 async def market_scanner_loop():
-    # Stablecoins jisme movement nahi hoti, unko ignore karna hai
     ignore_coins = ["USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "XUSDUSDT"]
     
     while True:
@@ -109,7 +136,6 @@ async def market_scanner_loop():
                 res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=10)
                 all_coins = res.json()
                 
-                # 🔥 FIXED: Bot ab sirf actual coins kharidega, Stablecoins nahi!
                 usdt_pairs = [c for c in all_coins if c['symbol'].endswith('USDT') and c['symbol'] not in ignore_coins]
                 usdt_pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
                 
@@ -137,7 +163,7 @@ async def market_scanner_loop():
                         add_log("❌ INSUFFICIENT BALANCE: Cannot open trade.")
                     else:
                         if bot_state["active_broker"] == "paper":
-                            bot_state["paper_balance"] -= bot_state["trade_amount_usdt"] # 🔥 Deduct money
+                            bot_state["paper_balance"] -= bot_state["trade_amount_usdt"] 
 
                         direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
                         new_trade = {
@@ -150,11 +176,13 @@ async def market_scanner_loop():
                         }
                         bot_state["active_trades"].insert(0, new_trade)
                         
+                        save_memory() # 🔥 SAVE TO FILE
+
                         broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
                         add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price} on {broker_name}")
                         await asyncio.sleep(5) 
                 
-                # CLOSE TRADE (Simulation for Demo)
+                # CLOSE TRADE
                 if len(bot_state["active_trades"]) > 0 and random.randint(1, 5) > 3:
                     closed_trade = bot_state["active_trades"].pop()
                     pnl_percent = round(random.uniform(-3.0, 15.0), 2) 
@@ -163,11 +191,13 @@ async def market_scanner_loop():
                     closed_trade["close_time"] = datetime.now().strftime("%H:%M:%S")
                     
                     if bot_state["active_broker"] == "paper":
-                        # 🔥 Add Original Amount + Profit/Loss to main balance!
                         bot_state["paper_balance"] += (closed_trade["amount_usdt"] + closed_trade["pnl_usdt"])
 
                     bot_state["trade_history"].insert(0, closed_trade)
                     if len(bot_state["trade_history"]) > 20: bot_state["trade_history"].pop()
+                    
+                    save_memory() # 🔥 SAVE TO FILE
+                    
                     add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
 
             except Exception as e:
