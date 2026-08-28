@@ -22,8 +22,9 @@ bot_state = {
     "trade_type": "intraday",
     "strategy": "volume",
     "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
-    "active_trades": [],   # NEW: Active Trades List
-    "trade_history": []    # NEW: Trade History List
+    "active_trades": [],   
+    "trade_history": [],    
+    "paper_balance": 10000.0  # 🔥 FIXED: Live Paper Trading Balance
 }
 
 def add_log(msg):
@@ -44,7 +45,7 @@ async def connect_exchange(request: Request):
 
     try:
         if exchange_id == "paper":
-            return {"status": "success", "message": "🟢 Paper Trading Activated! $10,000 Added.", "balances": {"USDT": 10000.00}}
+            return {"status": "success", "message": "🟢 Paper Trading Activated! Balance Synced.", "balances": {"USDT": bot_state["paper_balance"]}}
         elif exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
             body = {"timestamp": timeStamp}
@@ -89,18 +90,27 @@ async def bot_control(request: Request):
 def get_bot_logs():
     return {"status": "success", "is_running": bot_state["is_running"], "logs": bot_state["logs"]}
 
-# NEW ENDPOINT: Dashboard & History Data Fetcher
 @app.get("/api/get-trades")
 def get_trades():
-    return {"status": "success", "active": bot_state["active_trades"], "history": bot_state["trade_history"]}
+    return {
+        "status": "success", 
+        "active": bot_state["active_trades"], 
+        "history": bot_state["trade_history"],
+        "paper_balance": bot_state["paper_balance"] # 🔥 Sending Live Balance to Frontend
+    }
 
 async def market_scanner_loop():
+    # Stablecoins jisme movement nahi hoti, unko ignore karna hai
+    ignore_coins = ["USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "XUSDUSDT"]
+    
     while True:
         if bot_state["is_running"]:
             try:
                 res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=10)
                 all_coins = res.json()
-                usdt_pairs = [c for c in all_coins if c['symbol'].endswith('USDT')]
+                
+                # 🔥 FIXED: Bot ab sirf actual coins kharidega, Stablecoins nahi!
+                usdt_pairs = [c for c in all_coins if c['symbol'].endswith('USDT') and c['symbol'] not in ignore_coins]
                 usdt_pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
                 
                 target_coin = random.choice(usdt_pairs[:100])
@@ -119,35 +129,45 @@ async def market_scanner_loop():
                 elif strategy == "macd" and random.randint(1, 10) > 7: trade_executed = True
                 elif strategy == "volume" and float(target_coin['quoteVolume']) > 200000000 and price_change > 3: trade_executed = True
                 elif strategy == "ema_cross" and random.randint(1, 10) > 7: trade_executed = True
-                elif strategy not in ["rsi", "macd", "volume", "ema_cross"] and random.randint(1, 10) > 8: trade_executed = True # Catch all
+                elif strategy not in ["rsi", "macd", "volume", "ema_cross"] and random.randint(1, 10) > 8: trade_executed = True
 
-                # If Trade condition met, add to Active Dashboard
-                if trade_executed and len(bot_state["active_trades"]) < 5: # Max 5 active trades at a time
-                    direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
-                    new_trade = {
-                        "id": int(time.time()),
-                        "symbol": coin_symbol,
-                        "type": direction,
-                        "entry_price": current_price,
-                        "amount_usdt": bot_state["trade_amount_usdt"],
-                        "time": datetime.now().strftime("%H:%M:%S")
-                    }
-                    bot_state["active_trades"].insert(0, new_trade)
-                    
-                    broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
-                    add_log(f"⚡ {direction} ORDER EXECUTED: {coin_symbol} at ${current_price} on {broker_name}")
-                    await asyncio.sleep(5) 
+                # OPEN TRADE
+                if trade_executed and len(bot_state["active_trades"]) < 5:
+                    if bot_state["active_broker"] == "paper" and bot_state["paper_balance"] < bot_state["trade_amount_usdt"]:
+                        add_log("❌ INSUFFICIENT BALANCE: Cannot open trade.")
+                    else:
+                        if bot_state["active_broker"] == "paper":
+                            bot_state["paper_balance"] -= bot_state["trade_amount_usdt"] # 🔥 Deduct money
+
+                        direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
+                        new_trade = {
+                            "id": int(time.time()),
+                            "symbol": coin_symbol,
+                            "type": direction,
+                            "entry_price": current_price,
+                            "amount_usdt": bot_state["trade_amount_usdt"],
+                            "time": datetime.now().strftime("%H:%M:%S")
+                        }
+                        bot_state["active_trades"].insert(0, new_trade)
+                        
+                        broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
+                        add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price} on {broker_name}")
+                        await asyncio.sleep(5) 
                 
-                # SIMULATION: Auto-close trades (TP/SL Hit) to populate History
+                # CLOSE TRADE (Simulation for Demo)
                 if len(bot_state["active_trades"]) > 0 and random.randint(1, 5) > 3:
                     closed_trade = bot_state["active_trades"].pop()
-                    pnl_percent = round(random.uniform(-4.0, 12.0), 2) # Random PnL for realistic demo
+                    pnl_percent = round(random.uniform(-3.0, 15.0), 2) 
                     closed_trade["pnl_percent"] = pnl_percent
                     closed_trade["pnl_usdt"] = round((closed_trade["amount_usdt"] * pnl_percent) / 100, 2)
                     closed_trade["close_time"] = datetime.now().strftime("%H:%M:%S")
-                    bot_state["trade_history"].insert(0, closed_trade)
                     
-                    if len(bot_state["trade_history"]) > 20: bot_state["trade_history"].pop() # Keep history size fixed
+                    if bot_state["active_broker"] == "paper":
+                        # 🔥 Add Original Amount + Profit/Loss to main balance!
+                        bot_state["paper_balance"] += (closed_trade["amount_usdt"] + closed_trade["pnl_usdt"])
+
+                    bot_state["trade_history"].insert(0, closed_trade)
+                    if len(bot_state["trade_history"]) > 20: bot_state["trade_history"].pop()
                     add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
 
             except Exception as e:
