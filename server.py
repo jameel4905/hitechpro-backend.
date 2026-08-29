@@ -125,7 +125,12 @@ async def bot_control(request: Request):
 
 @app.get("/api/bot-logs")
 def get_bot_logs():
-    return {"status": "success", "is_running": bot_state["is_running"], "logs": bot_state["logs"]}
+    return {
+        "status": "success", 
+        "is_running": bot_state["is_running"], 
+        "logs": bot_state["logs"],
+        "active_broker": bot_state["active_broker"]  # 🔥 NAYA SENSOR ADD KIYA
+    }
 
 @app.get("/api/get-trades")
 def get_trades():
