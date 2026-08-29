@@ -29,6 +29,10 @@ bot_state = {
 
 DATA_FILE = "bot_data.json"
 
+# 🔥 GLOBAL TIME FIX: Universal UTC ISO Format
+def get_global_time():
+    return datetime.utcnow().isoformat() + "Z"
+
 def load_memory():
     if os.path.exists(DATA_FILE):
         try:
@@ -37,6 +41,7 @@ def load_memory():
                 bot_state["paper_balance"] = data.get("paper_balance", 10000.0)
                 bot_state["active_trades"] = data.get("active_trades", [])
                 bot_state["trade_history"] = data.get("trade_history", [])
+                bot_state["is_running"] = data.get("is_running", False)
         except:
             pass
 
@@ -46,7 +51,8 @@ def save_memory():
             json.dump({
                 "paper_balance": bot_state["paper_balance"],
                 "active_trades": bot_state["active_trades"],
-                "trade_history": bot_state["trade_history"]
+                "trade_history": bot_state["trade_history"],
+                "is_running": bot_state["is_running"]
             }, f)
     except:
         pass
@@ -54,8 +60,9 @@ def save_memory():
 load_memory()
 
 def add_log(msg):
-    time_str = datetime.now().strftime("%H:%M:%S")
-    bot_state["logs"].insert(0, f"[{time_str}] {msg}")
+    time_str = get_global_time()
+    # Parde ke peeche Universal Time save hoga, App apne aap convert karegi
+    bot_state["logs"].insert(0, f"{time_str}|{msg}") 
     if len(bot_state["logs"]) > 60:
         bot_state["logs"].pop()
 
@@ -66,8 +73,8 @@ async def connect_exchange(request: Request):
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
     
-    # 🔥 NEW: Phone ka backup balance receive karo
-    saved_paper = data.get("saved_paper_balance") 
+    saved_paper = data.get("saved_paper_balance")
+    force_bot_run = data.get("is_bot_running")
 
     bot_state["active_broker"] = exchange_id
     bot_state["api_key"] = api_key
@@ -75,13 +82,14 @@ async def connect_exchange(request: Request):
 
     try:
         if exchange_id == "paper":
-            if saved_paper is not None:
-                client_bal = float(saved_paper)
-                # Agar phone me balance save hai aur server reset ho gaya tha, toh phone wala manenge
-                if client_bal != 10000.0 or bot_state["paper_balance"] == 10000.0:
-                    bot_state["paper_balance"] = client_bal
+            if saved_paper is not None and str(saved_paper) != "null":
+                bot_state["paper_balance"] = float(saved_paper)
             
-            return {"status": "success", "message": "🟢 Paper Trading Activated! Balance Synced.", "balances": {"USDT": bot_state["paper_balance"]}}
+            if force_bot_run == True and not bot_state["is_running"]:
+                bot_state["is_running"] = True
+                add_log("🔄 Bot automatically resumed from phone backup.")
+
+            return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {"USDT": bot_state["paper_balance"]}}
             
         elif exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
@@ -93,7 +101,7 @@ async def connect_exchange(request: Request):
             res_data = res.json()
             if isinstance(res_data, list):
                 dynamic_balances = {item.get("currency"): round(float(item.get("balance", 0.0)), 5) for item in res_data if float(item.get("balance", 0.0)) > 0.00001}
-                return {"status": "success", "message": "Connected to CoinDCX successfully!", "balances": dynamic_balances}
+                return {"status": "success", "message": "Connected to CoinDCX!", "balances": dynamic_balances}
             else:
                 return {"status": "error", "message": "CoinDCX Key Invalid!"}
         else:
@@ -110,16 +118,16 @@ async def bot_control(request: Request):
     data = await request.json()
     action = data.get("action")
     if action == "start":
-        if bot_state["active_broker"] != "paper" and bot_state["api_key"] == "": 
-            return {"status": "error", "message": "Connect API or Paper Trading First!"}
         bot_state["is_running"] = True
         bot_state["trade_amount_usdt"] = float(data.get("amount", 10))
         bot_state["trade_type"] = data.get("trade_type", "intraday")
         bot_state["strategy"] = data.get("strategy", "volume")
-        add_log(f"🚀 BOT STARTED! Mode: {bot_state['trade_type'].upper()} | Strategy: {bot_state['strategy'].upper()}")
+        save_memory()
+        add_log(f"🚀 BOT STARTED! Mode: {bot_state['trade_type'].upper()}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
         bot_state["is_running"] = False
+        save_memory()
         add_log("🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
@@ -129,7 +137,7 @@ def get_bot_logs():
         "status": "success", 
         "is_running": bot_state["is_running"], 
         "logs": bot_state["logs"],
-        "active_broker": bot_state["active_broker"]  # 🔥 NAYA SENSOR ADD KIYA
+        "active_broker": bot_state["active_broker"]
     }
 
 @app.get("/api/get-trades")
@@ -149,7 +157,6 @@ async def market_scanner_loop():
             try:
                 res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=10)
                 all_coins = res.json()
-                
                 usdt_pairs = [c for c in all_coins if c['symbol'].endswith('USDT') and c['symbol'] not in ignore_coins]
                 usdt_pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
                 
@@ -168,13 +175,11 @@ async def market_scanner_loop():
                 if strategy == "rsi" and random.randint(1, 10) > 7: trade_executed = True
                 elif strategy == "macd" and random.randint(1, 10) > 7: trade_executed = True
                 elif strategy == "volume" and float(target_coin['quoteVolume']) > 200000000 and price_change > 3: trade_executed = True
-                elif strategy == "ema_cross" and random.randint(1, 10) > 7: trade_executed = True
-                elif strategy not in ["rsi", "macd", "volume", "ema_cross"] and random.randint(1, 10) > 8: trade_executed = True
+                elif strategy not in ["rsi", "macd", "volume"] and random.randint(1, 10) > 8: trade_executed = True
 
-                # OPEN TRADE
                 if trade_executed and len(bot_state["active_trades"]) < 5:
                     if bot_state["active_broker"] == "paper" and bot_state["paper_balance"] < bot_state["trade_amount_usdt"]:
-                        add_log("❌ INSUFFICIENT BALANCE: Cannot open trade.")
+                        pass
                     else:
                         if bot_state["active_broker"] == "paper":
                             bot_state["paper_balance"] -= bot_state["trade_amount_usdt"] 
@@ -186,22 +191,19 @@ async def market_scanner_loop():
                             "type": direction,
                             "entry_price": current_price,
                             "amount_usdt": bot_state["trade_amount_usdt"],
-                            "time": datetime.now().strftime("%H:%M:%S")
+                            "time": get_global_time()  # 🔥 GLOBAL UTC TIME
                         }
                         bot_state["active_trades"].insert(0, new_trade)
                         save_memory() 
-
-                        broker_name = "PAPER TRADING" if bot_state['active_broker'] == "paper" else bot_state['active_broker'].upper()
-                        add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price} on {broker_name}")
+                        add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price}")
                         await asyncio.sleep(5) 
                 
-                # CLOSE TRADE
                 if len(bot_state["active_trades"]) > 0 and random.randint(1, 5) > 3:
                     closed_trade = bot_state["active_trades"].pop()
                     pnl_percent = round(random.uniform(-3.0, 15.0), 2) 
                     closed_trade["pnl_percent"] = pnl_percent
                     closed_trade["pnl_usdt"] = round((closed_trade["amount_usdt"] * pnl_percent) / 100, 2)
-                    closed_trade["close_time"] = datetime.now().strftime("%H:%M:%S")
+                    closed_trade["close_time"] = get_global_time() # 🔥 GLOBAL UTC TIME
                     
                     if bot_state["active_broker"] == "paper":
                         bot_state["paper_balance"] += (closed_trade["amount_usdt"] + closed_trade["pnl_usdt"])
@@ -209,9 +211,7 @@ async def market_scanner_loop():
                     bot_state["trade_history"].insert(0, closed_trade)
                     if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
                     save_memory()
-                    
                     add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
-
             except Exception as e:
                 add_log(f"❌ API Error: Retrying connection...")
         
@@ -222,7 +222,7 @@ async def startup():
     asyncio.create_task(market_scanner_loop())
 
 @app.get("/")
-def root(): return {"status": "HiTech Master AI Engine is Live! 🚀"}
+def root(): return {"status": "HiTech AI Engine Live!"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
