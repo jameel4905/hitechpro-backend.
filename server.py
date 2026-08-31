@@ -19,7 +19,7 @@ bot_state = {
     "api_key": "",
     "secret_key": "",
     "trade_amount_usdt": 1000,
-    "trade_type": "intraday", "scalping",
+    "trade_type": "intraday", # Syntax Error Fixed Here
     "strategy": "volume",
     "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
     "active_trades": [],   
@@ -29,7 +29,6 @@ bot_state = {
 
 DATA_FILE = "bot_data.json"
 
-# 🔥 GLOBAL TIME FIX: Universal UTC ISO Format
 def get_global_time():
     return datetime.utcnow().isoformat() + "Z"
 
@@ -61,7 +60,6 @@ load_memory()
 
 def add_log(msg):
     time_str = get_global_time()
-    # Parde ke peeche Universal Time save hoga, App apne aap convert karegi
     bot_state["logs"].insert(0, f"{time_str}|{msg}") 
     if len(bot_state["logs"]) > 60:
         bot_state["logs"].pop()
@@ -172,38 +170,48 @@ async def market_scanner_loop():
                 await asyncio.sleep(2)
                 
                 trade_executed = False
-                if strategy == "rsi" and random.randint(1, 10) > 7: trade_executed = True
-                elif strategy == "macd" and random.randint(1, 10) > 7: trade_executed = True
-                elif strategy == "volume" and float(target_coin['quoteVolume']) > 200000000 and price_change > 3: trade_executed = True
-                elif strategy not in ["rsi", "macd", "volume"] and random.randint(1, 10) > 8: trade_executed = True
+                # Relaxed conditions for faster testing execution
+                if strategy == "rsi" and random.randint(1, 10) > 4: trade_executed = True
+                elif strategy == "macd" and random.randint(1, 10) > 4: trade_executed = True
+                elif strategy == "volume" and float(target_coin['quoteVolume']) > 50000000 and price_change > 1: trade_executed = True
+                elif strategy not in ["rsi", "macd", "volume"] and random.randint(1, 10) > 5: trade_executed = True
 
                 if trade_executed and len(bot_state["active_trades"]) < 5:
-                    if bot_state["active_broker"] == "paper" and bot_state["paper_balance"] < bot_state["trade_amount_usdt"]:
-                        pass
+                    
+                    # 🔥 DAILY COMPOUNDING LOGIC 🔥
+                    if bot_state["active_broker"] == "paper":
+                        compounded_amount = round(bot_state["paper_balance"] * 0.98, 2)
                     else:
-                        if bot_state["active_broker"] == "paper":
-                            bot_state["paper_balance"] -= bot_state["trade_amount_usdt"] 
+                        compounded_amount = bot_state["trade_amount_usdt"]
 
-                        direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
-                        new_trade = {
-                            "id": int(time.time()),
-                            "symbol": coin_symbol,
-                            "type": direction,
-                            "entry_price": current_price,
-                            "amount_usdt": bot_state["trade_amount_usdt"],
-                            "time": get_global_time()  # 🔥 GLOBAL UTC TIME
-                        }
-                        bot_state["active_trades"].insert(0, new_trade)
-                        save_memory() 
-                        add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price}")
-                        await asyncio.sleep(5) 
+                    if compounded_amount < 5.0:
+                        add_log(f"⚠️ Low balance. Available: ${bot_state['paper_balance']:.2f}")
+                        await asyncio.sleep(3)
+                        continue
+
+                    if bot_state["active_broker"] == "paper":
+                        bot_state["paper_balance"] -= compounded_amount 
+
+                    direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
+                    new_trade = {
+                        "id": int(time.time()),
+                        "symbol": coin_symbol,
+                        "type": direction,
+                        "entry_price": current_price,
+                        "amount_usdt": compounded_amount,
+                        "time": get_global_time()  
+                    }
+                    bot_state["active_trades"].insert(0, new_trade)
+                    save_memory() 
+                    add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price} with ${compounded_amount}")
+                    await asyncio.sleep(5) 
                 
                 if len(bot_state["active_trades"]) > 0 and random.randint(1, 5) > 3:
                     closed_trade = bot_state["active_trades"].pop()
                     pnl_percent = round(random.uniform(-3.0, 15.0), 2) 
                     closed_trade["pnl_percent"] = pnl_percent
                     closed_trade["pnl_usdt"] = round((closed_trade["amount_usdt"] * pnl_percent) / 100, 2)
-                    closed_trade["close_time"] = get_global_time() # 🔥 GLOBAL UTC TIME
+                    closed_trade["close_time"] = get_global_time() 
                     
                     if bot_state["active_broker"] == "paper":
                         bot_state["paper_balance"] += (closed_trade["amount_usdt"] + closed_trade["pnl_usdt"])
@@ -213,7 +221,7 @@ async def market_scanner_loop():
                     save_memory()
                     add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
             except Exception as e:
-                add_log(f"❌ API Error: Retrying connection...")
+                add_log(f"❌ API Error: {str(e)[:40]}... Retrying")
         
         await asyncio.sleep(3)
 
