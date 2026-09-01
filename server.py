@@ -19,12 +19,12 @@ bot_state = {
     "api_key": "",
     "secret_key": "",
     "trade_amount_usdt": 1000,
-    "trade_type": "intraday", # Syntax Error Fixed Here
+    "trade_type": "intraday", 
     "strategy": "volume",
     "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
     "active_trades": [],   
     "trade_history": [],    
-    "paper_balance": 100000.0  
+    "paper_balance": 10000.0  # 🔥 Default back to 10000
 }
 
 DATA_FILE = "bot_data.json"
@@ -38,6 +38,9 @@ def load_memory():
             with open(DATA_FILE, "r") as f:
                 data = json.load(f)
                 bot_state["paper_balance"] = data.get("paper_balance", 10000.0)
+                # 🔥 Auto-recovery: Agar purana $1.51 save ho gaya tha, toh reset to 10000
+                if bot_state["paper_balance"] < 10.0:
+                    bot_state["paper_balance"] = 10000.0
                 bot_state["active_trades"] = data.get("active_trades", [])
                 bot_state["trade_history"] = data.get("trade_history", [])
                 bot_state["is_running"] = data.get("is_running", False)
@@ -71,7 +74,6 @@ async def connect_exchange(request: Request):
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
     
-    saved_paper = data.get("saved_paper_balance")
     force_bot_run = data.get("is_bot_running")
 
     bot_state["active_broker"] = exchange_id
@@ -80,8 +82,8 @@ async def connect_exchange(request: Request):
 
     try:
         if exchange_id == "paper":
-            if saved_paper is not None and str(saved_paper) != "null":
-                bot_state["paper_balance"] = float(saved_paper)
+            # 🔥 Frontend ke balance data ko ignore kar diya gaya hai loop break karne ke liye.
+            # Ab Server ka balance hi final balance hoga.
             
             if force_bot_run == True and not bot_state["is_running"]:
                 bot_state["is_running"] = True
@@ -189,8 +191,7 @@ async def market_scanner_loop():
                         await asyncio.sleep(3)
                         continue
 
-                    if bot_state["active_broker"] == "paper":
-                        bot_state["paper_balance"] -= compounded_amount 
+                    # 🔥 REMOVED MARGIN DEDUCTION HERE. Main balance remains intact when trade opens.
 
                     direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
                     new_trade = {
@@ -214,7 +215,9 @@ async def market_scanner_loop():
                     closed_trade["close_time"] = get_global_time() 
                     
                     if bot_state["active_broker"] == "paper":
-                        bot_state["paper_balance"] += (closed_trade["amount_usdt"] + closed_trade["pnl_usdt"])
+                        # 🔥 ONLY ADD/SUBTRACT PNL HERE.
+                        bot_state["paper_balance"] += closed_trade["pnl_usdt"]
+                        bot_state["paper_balance"] = round(bot_state["paper_balance"], 2)
 
                     bot_state["trade_history"].insert(0, closed_trade)
                     if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
