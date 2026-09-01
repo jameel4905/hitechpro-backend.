@@ -25,8 +25,8 @@ bot_state = {
     "active_trades": [],   
     "trade_history": [],    
     "paper_balance": 10000.0,
-    "today_pnl": 0.0, # 🔥 Naya Feature: Din bhar ka Profit/Loss yahan rahega
-    "last_settlement_date": datetime.utcnow().strftime("%Y-%m-%d") # 🔥 Midnight check ke liye
+    "today_pnl": 0.0, 
+    "last_settlement_date": datetime.utcnow().strftime("%Y-%m-%d") 
 }
 
 DATA_FILE = "bot_data.json"
@@ -45,7 +45,6 @@ def load_memory():
                 bot_state["active_trades"] = data.get("active_trades", [])
                 bot_state["trade_history"] = data.get("trade_history", [])
                 bot_state["is_running"] = data.get("is_running", False)
-                # 🔥 Bug Fix: Settings ab save hongi
                 bot_state["trade_type"] = data.get("trade_type", "intraday")
                 bot_state["strategy"] = data.get("strategy", "volume")
                 bot_state["today_pnl"] = data.get("today_pnl", 0.0)
@@ -78,7 +77,6 @@ def add_log(msg):
         bot_state["logs"].pop()
 
 def check_midnight_settlement():
-    # 🔥 Raat 12 baje PNL ko Main Balance mein jodne ka logic
     current_date = datetime.utcnow().strftime("%Y-%m-%d")
     if current_date != bot_state["last_settlement_date"]:
         bot_state["paper_balance"] += bot_state["today_pnl"]
@@ -148,6 +146,53 @@ async def bot_control(request: Request):
         add_log("🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
+# 🔥 NAYA API ENDPOINT: MANUAL TRADE CLOSE KARNE KE LIYE 🔥
+@app.post("/api/close-trade")
+async def close_trade(request: Request):
+    data = await request.json()
+    trade_id = data.get("id")
+    
+    trade_to_close = None
+    for t in bot_state["active_trades"]:
+        if t["id"] == trade_id:
+            trade_to_close = t
+            break
+            
+    if not trade_to_close:
+        return {"status": "error", "message": "Trade already closed or not found!"}
+        
+    try:
+        # Binance se ekdum latest live price mangwana manual exit ke waqt
+        res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={trade_to_close['symbol']}", timeout=5)
+        exit_price = float(res.json()['price'])
+        
+        if trade_to_close["type"] == "LONG":
+            pnl_percent = ((exit_price - trade_to_close["entry_price"]) / trade_to_close["entry_price"]) * 100
+        else:
+            pnl_percent = ((trade_to_close["entry_price"] - exit_price) / trade_to_close["entry_price"]) * 100
+            
+        pnl_usdt = (trade_to_close["amount_usdt"] * pnl_percent) / 100
+        
+        trade_to_close["pnl_percent"] = round(pnl_percent, 2)
+        trade_to_close["pnl_usdt"] = round(pnl_usdt, 2)
+        trade_to_close["exit_price"] = exit_price
+        trade_to_close["close_time"] = get_global_time()
+        
+        if bot_state["active_broker"] == "paper":
+            bot_state["today_pnl"] += trade_to_close["pnl_usdt"]
+            bot_state["today_pnl"] = round(bot_state["today_pnl"], 2)
+
+        bot_state["active_trades"].remove(trade_to_close)
+        bot_state["trade_history"].insert(0, trade_to_close)
+        if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
+        
+        add_log(f"🛑 MANUAL EXIT: {trade_to_close['symbol']} | P&L: {trade_to_close['pnl_percent']}%")
+        save_memory()
+        
+        return {"status": "success", "message": f"Manual Exit Successful! PNL: {trade_to_close['pnl_percent']}%"}
+    except Exception as e:
+        return {"status": "error", "message": "API Error: Could not close trade."}
+
 @app.get("/api/bot-logs")
 def get_bot_logs():
     return {
@@ -159,7 +204,6 @@ def get_bot_logs():
 
 @app.get("/api/get-trades")
 def get_trades():
-    # 🔥 Frontend ko ab Today PNL bhi jayega Red/Green Color ke liye
     return {
         "status": "success", 
         "active": bot_state["active_trades"], 
@@ -172,19 +216,15 @@ async def market_scanner_loop():
     ignore_coins = ["USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "XUSDUSDT"]
     
     while True:
-        check_midnight_settlement() # Raat 12 baje ka check
+        check_midnight_settlement() 
         
         if bot_state["is_running"]:
             try:
                 res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=10)
                 all_coins = res.json()
                 
-                # Sabhi coins ke current price ka dictionary (TSL ke liye)
                 live_prices = {c['symbol']: float(c['lastPrice']) for c in all_coins}
                 
-                # ==========================================
-                # 🔥 TRAILING STOP-LOSS (TSL) ENGINE
-                # ==========================================
                 trades_to_close = []
                 for trade in bot_state["active_trades"]:
                     sym = trade["symbol"]
@@ -192,24 +232,19 @@ async def market_scanner_loop():
                         curr_p = live_prices[sym]
                         
                         if trade["type"] == "LONG":
-                            # Agar price upar gaya toh TSL aage badao (2% trailing)
                             if curr_p > trade["highest_price"]:
                                 trade["highest_price"] = curr_p
                                 trade["sl_price"] = max(trade["sl_price"], curr_p * 0.98)
-                            # Stop Loss Hit
                             if curr_p <= trade["sl_price"]:
                                 trades_to_close.append(trade)
                                 
                         elif trade["type"] == "SHORT":
-                            # Agar price neeche gira toh TSL neeche lao (2% trailing)
                             if curr_p < trade["lowest_price"]:
                                 trade["lowest_price"] = curr_p
                                 trade["sl_price"] = min(trade["sl_price"], curr_p * 1.02)
-                            # Stop Loss Hit
                             if curr_p >= trade["sl_price"]:
                                 trades_to_close.append(trade)
                 
-                # Trades ko close karo aur PNL Book karo
                 for trade in trades_to_close:
                     exit_price = live_prices[trade["symbol"]]
                     
@@ -237,9 +272,6 @@ async def market_scanner_loop():
                 
                 save_memory()
 
-                # ==========================================
-                # 🔥 DUAL DIRECTION NEW TRADE EXECUTION
-                # ==========================================
                 usdt_pairs = [c for c in all_coins if c['symbol'].endswith('USDT') and c['symbol'] not in ignore_coins]
                 usdt_pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
                 
@@ -269,10 +301,7 @@ async def market_scanner_loop():
                         await asyncio.sleep(3)
                         continue
 
-                    # 🔥 Trend Execution: Plus change = LONG, Minus change = SHORT
                     direction = "LONG" if price_change > 0 else "SHORT"
-                    
-                    # Entry Stop Loss Setup (2% margin)
                     initial_sl = current_price * 0.98 if direction == "LONG" else current_price * 1.02
 
                     new_trade = {
