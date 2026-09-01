@@ -24,7 +24,9 @@ bot_state = {
     "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
     "active_trades": [],   
     "trade_history": [],    
-    "paper_balance": 10000.0  # 🔥 Default back to 10000
+    "paper_balance": 10000.0,
+    "today_pnl": 0.0, # 🔥 Naya Feature: Din bhar ka Profit/Loss yahan rahega
+    "last_settlement_date": datetime.utcnow().strftime("%Y-%m-%d") # 🔥 Midnight check ke liye
 }
 
 DATA_FILE = "bot_data.json"
@@ -38,12 +40,16 @@ def load_memory():
             with open(DATA_FILE, "r") as f:
                 data = json.load(f)
                 bot_state["paper_balance"] = data.get("paper_balance", 10000.0)
-                # 🔥 Auto-recovery: Agar purana $1.51 save ho gaya tha, toh reset to 10000
                 if bot_state["paper_balance"] < 10.0:
                     bot_state["paper_balance"] = 10000.0
                 bot_state["active_trades"] = data.get("active_trades", [])
                 bot_state["trade_history"] = data.get("trade_history", [])
                 bot_state["is_running"] = data.get("is_running", False)
+                # 🔥 Bug Fix: Settings ab save hongi
+                bot_state["trade_type"] = data.get("trade_type", "intraday")
+                bot_state["strategy"] = data.get("strategy", "volume")
+                bot_state["today_pnl"] = data.get("today_pnl", 0.0)
+                bot_state["last_settlement_date"] = data.get("last_settlement_date", datetime.utcnow().strftime("%Y-%m-%d"))
         except:
             pass
 
@@ -54,7 +60,11 @@ def save_memory():
                 "paper_balance": bot_state["paper_balance"],
                 "active_trades": bot_state["active_trades"],
                 "trade_history": bot_state["trade_history"],
-                "is_running": bot_state["is_running"]
+                "is_running": bot_state["is_running"],
+                "trade_type": bot_state["trade_type"],
+                "strategy": bot_state["strategy"],
+                "today_pnl": bot_state["today_pnl"],
+                "last_settlement_date": bot_state["last_settlement_date"]
             }, f)
     except:
         pass
@@ -67,13 +77,24 @@ def add_log(msg):
     if len(bot_state["logs"]) > 60:
         bot_state["logs"].pop()
 
+def check_midnight_settlement():
+    # 🔥 Raat 12 baje PNL ko Main Balance mein jodne ka logic
+    current_date = datetime.utcnow().strftime("%Y-%m-%d")
+    if current_date != bot_state["last_settlement_date"]:
+        bot_state["paper_balance"] += bot_state["today_pnl"]
+        bot_state["paper_balance"] = round(bot_state["paper_balance"], 2)
+        settled_amount = bot_state["today_pnl"]
+        bot_state["today_pnl"] = 0.0
+        bot_state["last_settlement_date"] = current_date
+        add_log(f"🏦 Midnight Settlement: ${settled_amount} moved to Wallet.")
+        save_memory()
+
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
     exchange_id = data.get("exchange", "binance").lower()
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
-    
     force_bot_run = data.get("is_bot_running")
 
     bot_state["active_broker"] = exchange_id
@@ -82,13 +103,9 @@ async def connect_exchange(request: Request):
 
     try:
         if exchange_id == "paper":
-            # 🔥 Frontend ke balance data ko ignore kar diya gaya hai loop break karne ke liye.
-            # Ab Server ka balance hi final balance hoga.
-            
             if force_bot_run == True and not bot_state["is_running"]:
                 bot_state["is_running"] = True
-                add_log("🔄 Bot automatically resumed from phone backup.")
-
+                add_log("🔄 Bot automatically resumed from backup.")
             return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {"USDT": bot_state["paper_balance"]}}
             
         elif exchange_id == "coindcx":
@@ -142,21 +159,87 @@ def get_bot_logs():
 
 @app.get("/api/get-trades")
 def get_trades():
+    # 🔥 Frontend ko ab Today PNL bhi jayega Red/Green Color ke liye
     return {
         "status": "success", 
         "active": bot_state["active_trades"], 
         "history": bot_state["trade_history"],
-        "paper_balance": bot_state["paper_balance"] 
+        "paper_balance": bot_state["paper_balance"],
+        "today_pnl": bot_state["today_pnl"] 
     }
 
 async def market_scanner_loop():
     ignore_coins = ["USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "EURUSDT", "XUSDUSDT"]
     
     while True:
+        check_midnight_settlement() # Raat 12 baje ka check
+        
         if bot_state["is_running"]:
             try:
                 res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=10)
                 all_coins = res.json()
+                
+                # Sabhi coins ke current price ka dictionary (TSL ke liye)
+                live_prices = {c['symbol']: float(c['lastPrice']) for c in all_coins}
+                
+                # ==========================================
+                # 🔥 TRAILING STOP-LOSS (TSL) ENGINE
+                # ==========================================
+                trades_to_close = []
+                for trade in bot_state["active_trades"]:
+                    sym = trade["symbol"]
+                    if sym in live_prices:
+                        curr_p = live_prices[sym]
+                        
+                        if trade["type"] == "LONG":
+                            # Agar price upar gaya toh TSL aage badao (2% trailing)
+                            if curr_p > trade["highest_price"]:
+                                trade["highest_price"] = curr_p
+                                trade["sl_price"] = max(trade["sl_price"], curr_p * 0.98)
+                            # Stop Loss Hit
+                            if curr_p <= trade["sl_price"]:
+                                trades_to_close.append(trade)
+                                
+                        elif trade["type"] == "SHORT":
+                            # Agar price neeche gira toh TSL neeche lao (2% trailing)
+                            if curr_p < trade["lowest_price"]:
+                                trade["lowest_price"] = curr_p
+                                trade["sl_price"] = min(trade["sl_price"], curr_p * 1.02)
+                            # Stop Loss Hit
+                            if curr_p >= trade["sl_price"]:
+                                trades_to_close.append(trade)
+                
+                # Trades ko close karo aur PNL Book karo
+                for trade in trades_to_close:
+                    exit_price = live_prices[trade["symbol"]]
+                    
+                    if trade["type"] == "LONG":
+                        pnl_percent = ((exit_price - trade["entry_price"]) / trade["entry_price"]) * 100
+                    else:
+                        pnl_percent = ((trade["entry_price"] - exit_price) / trade["entry_price"]) * 100
+                        
+                    pnl_usdt = (trade["amount_usdt"] * pnl_percent) / 100
+                    
+                    trade["pnl_percent"] = round(pnl_percent, 2)
+                    trade["pnl_usdt"] = round(pnl_usdt, 2)
+                    trade["exit_price"] = exit_price
+                    trade["close_time"] = get_global_time()
+                    
+                    if bot_state["active_broker"] == "paper":
+                        bot_state["today_pnl"] += trade["pnl_usdt"]
+                        bot_state["today_pnl"] = round(bot_state["today_pnl"], 2)
+
+                    bot_state["active_trades"].remove(trade)
+                    bot_state["trade_history"].insert(0, trade)
+                    if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
+                    
+                    add_log(f"🔔 TSL HIT: {trade['symbol']} | P&L: {trade['pnl_percent']}%")
+                
+                save_memory()
+
+                # ==========================================
+                # 🔥 DUAL DIRECTION NEW TRADE EXECUTION
+                # ==========================================
                 usdt_pairs = [c for c in all_coins if c['symbol'].endswith('USDT') and c['symbol'] not in ignore_coins]
                 usdt_pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
                 
@@ -168,19 +251,14 @@ async def market_scanner_loop():
                 strategy = bot_state["strategy"]
                 trade_type = bot_state["trade_type"]
                 
-                add_log(f"🔎 [{trade_type.upper()}] Scanning {coin_symbol}...")
-                await asyncio.sleep(2)
-                
                 trade_executed = False
-                # Relaxed conditions for faster testing execution
                 if strategy == "rsi" and random.randint(1, 10) > 4: trade_executed = True
                 elif strategy == "macd" and random.randint(1, 10) > 4: trade_executed = True
-                elif strategy == "volume" and float(target_coin['quoteVolume']) > 50000000 and price_change > 1: trade_executed = True
+                elif strategy == "volume" and float(target_coin['quoteVolume']) > 50000000 and abs(price_change) > 1: trade_executed = True
                 elif strategy not in ["rsi", "macd", "volume"] and random.randint(1, 10) > 5: trade_executed = True
 
                 if trade_executed and len(bot_state["active_trades"]) < 5:
                     
-                    # 🔥 DAILY COMPOUNDING LOGIC 🔥
                     if bot_state["active_broker"] == "paper":
                         compounded_amount = round(bot_state["paper_balance"] * 0.98, 2)
                     else:
@@ -191,38 +269,28 @@ async def market_scanner_loop():
                         await asyncio.sleep(3)
                         continue
 
-                    # 🔥 REMOVED MARGIN DEDUCTION HERE. Main balance remains intact when trade opens.
+                    # 🔥 Trend Execution: Plus change = LONG, Minus change = SHORT
+                    direction = "LONG" if price_change > 0 else "SHORT"
+                    
+                    # Entry Stop Loss Setup (2% margin)
+                    initial_sl = current_price * 0.98 if direction == "LONG" else current_price * 1.02
 
-                    direction = "LONG" if trade_type in ["intraday", "scalping", "swing", "futures_long"] else "SHORT"
                     new_trade = {
                         "id": int(time.time()),
                         "symbol": coin_symbol,
                         "type": direction,
                         "entry_price": current_price,
                         "amount_usdt": compounded_amount,
+                        "highest_price": current_price,
+                        "lowest_price": current_price,
+                        "sl_price": initial_sl,
                         "time": get_global_time()  
                     }
                     bot_state["active_trades"].insert(0, new_trade)
                     save_memory() 
-                    add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price} with ${compounded_amount}")
+                    add_log(f"⚡ {direction} EXECUTED: {coin_symbol} at ${current_price}")
                     await asyncio.sleep(5) 
-                
-                if len(bot_state["active_trades"]) > 0 and random.randint(1, 5) > 3:
-                    closed_trade = bot_state["active_trades"].pop()
-                    pnl_percent = round(random.uniform(-3.0, 15.0), 2) 
-                    closed_trade["pnl_percent"] = pnl_percent
-                    closed_trade["pnl_usdt"] = round((closed_trade["amount_usdt"] * pnl_percent) / 100, 2)
-                    closed_trade["close_time"] = get_global_time() 
                     
-                    if bot_state["active_broker"] == "paper":
-                        # 🔥 ONLY ADD/SUBTRACT PNL HERE.
-                        bot_state["paper_balance"] += closed_trade["pnl_usdt"]
-                        bot_state["paper_balance"] = round(bot_state["paper_balance"], 2)
-
-                    bot_state["trade_history"].insert(0, closed_trade)
-                    if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
-                    save_memory()
-                    add_log(f"🔔 TRADE CLOSED: {closed_trade['symbol']} | P&L: {pnl_percent}%")
             except Exception as e:
                 add_log(f"❌ API Error: {str(e)[:40]}... Retrying")
         
