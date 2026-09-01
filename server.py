@@ -24,7 +24,7 @@ bot_state = {
     "logs": ["🤖 Master AI Bot Initialized. Waiting for command..."],
     "active_trades": [],   
     "trade_history": [],    
-    "paper_balance": 10000.0  
+    "paper_balance": 100000.0  
 }
 
 DATA_FILE = "bot_data.json"
