@@ -49,6 +49,9 @@ def load_memory():
                 bot_state["strategy"] = data.get("strategy", "volume")
                 bot_state["today_pnl"] = data.get("today_pnl", 0.0)
                 bot_state["last_settlement_date"] = data.get("last_settlement_date", datetime.utcnow().strftime("%Y-%m-%d"))
+                bot_state["active_broker"] = data.get("active_broker", "none")
+                bot_state["api_key"] = data.get("api_key", "")
+                bot_state["secret_key"] = data.get("secret_key", "")
         except:
             pass
 
@@ -63,7 +66,10 @@ def save_memory():
                 "trade_type": bot_state["trade_type"],
                 "strategy": bot_state["strategy"],
                 "today_pnl": bot_state["today_pnl"],
-                "last_settlement_date": bot_state["last_settlement_date"]
+                "last_settlement_date": bot_state["last_settlement_date"],
+                "active_broker": bot_state["active_broker"],
+                "api_key": bot_state["api_key"],
+                "secret_key": bot_state["secret_key"]
             }, f)
     except:
         pass
@@ -87,6 +93,74 @@ def check_midnight_settlement():
         add_log(f"🏦 Midnight Settlement: ${settled_amount} moved to Wallet.")
         save_memory()
 
+# 🔥 HELPER FUNCTION: COINDCX PAR REAL MARKET SELL ORDER LAGANA 🔥
+def execute_coindcx_sell(symbol, quantity=0):
+    api_key = bot_state.get("api_key", "").strip()
+    secret_key = bot_state.get("secret_key", "").strip()
+    if not api_key or not secret_key:
+        return False, "API keys missing"
+
+    try:
+        clean_coin = symbol.replace("USDT", "").replace("/", "").replace("B-", "").replace("_", "").upper()
+
+        # 1. CoinDCX Market Name dhoondhna
+        ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
+        tickers = ticker_res.json()
+        target_market = f"B-{clean_coin}_USDT"
+        for t in tickers:
+            m = t.get('market', '')
+            if m in [f"B-{clean_coin}_USDT", f"{clean_coin}USDT", f"B-{clean_coin}USDT"]:
+                target_market = m
+                break
+
+        # 2. Agar quantity pass nahi hui toh wallet balance se fetch karna
+        sell_qty = quantity
+        if sell_qty <= 0:
+            timeStamp = int(round(time.time() * 1000))
+            bal_body = json.dumps({"timestamp": timeStamp}, separators=(',', ':'))
+            bal_sig = hmac.new(secret_key.encode('utf-8'), bal_body.encode('utf-8'), hashlib.sha256).hexdigest()
+            bal_headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': bal_sig}
+            bal_res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=bal_body, headers=bal_headers, timeout=8)
+            bal_data = bal_res.json()
+            if isinstance(bal_data, list):
+                for item in bal_data:
+                    if item.get("currency") == clean_coin:
+                        sell_qty = float(item.get("balance", 0.0))
+                        break
+
+        # Precision 0 (DOGE ke liye bina decimal poora integer)
+        if clean_coin == "DOGE":
+            sell_qty = int(sell_qty)
+        else:
+            sell_qty = round(sell_qty, 2)
+
+        if sell_qty <= 0:
+            return False, f"No {clean_coin} balance found to sell"
+
+        # 3. Direct CoinDCX Market Sell Order Execute Karna
+        time_stamp = int(round(time.time() * 1000))
+        order_body = {
+            "side": "sell",
+            "order_type": "market_order",
+            "market": target_market,
+            "total_quantity": sell_qty,
+            "timestamp": time_stamp
+        }
+        json_order = json.dumps(order_body, separators=(',', ':'))
+        sig = hmac.new(secret_key.encode('utf-8'), json_order.encode('utf-8'), hashlib.sha256).hexdigest()
+        headers = {
+            'Content-Type': 'application/json',
+            'X-AUTH-APIKEY': api_key,
+            'X-AUTH-SIGNATURE': sig
+        }
+        res = requests.post("https://api.coindcx.com/exchange/v1/orders/create", data=json_order, headers=headers, timeout=10)
+        res_json = res.json()
+        add_log(f"📤 REAL EXIT EXECUTED: Sold {sell_qty} {clean_coin} on CoinDCX!")
+        return True, res_json
+    except Exception as e:
+        add_log(f"⚠️ CoinDCX Sell Failed: {str(e)[:40]}")
+        return False, str(e)
+
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
@@ -98,6 +172,7 @@ async def connect_exchange(request: Request):
     bot_state["active_broker"] = exchange_id
     bot_state["api_key"] = api_key
     bot_state["secret_key"] = secret_key
+    save_memory()
 
     try:
         if exchange_id == "paper":
@@ -128,7 +203,7 @@ async def connect_exchange(request: Request):
     except Exception as e:
         return {"status": "error", "message": "API Error: Invalid Keys!"}
 
-# 🔥 REAL $5 TEST ORDER VIA OFFICIAL COINDCX REST API (PRECISION 0 FIXED) 🔥
+# 🔥 REAL $5 TEST ORDER VIA OFFICIAL COINDCX REST API 🔥
 @app.post("/api/test-coindcx-order")
 async def test_coindcx_order(request: Request):
     try:
@@ -138,6 +213,11 @@ async def test_coindcx_order(request: Request):
 
         if not api_key or not secret_key:
             return {"status": "error", "message": "API Keys missing! Connect in Portfolio first."}
+
+        bot_state["active_broker"] = "coindcx"
+        bot_state["api_key"] = api_key
+        bot_state["secret_key"] = secret_key
+        save_memory()
 
         # 1. CoinDCX se DOGE live market & price prapt karna
         ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10)
@@ -152,7 +232,7 @@ async def test_coindcx_order(request: Request):
                 current_price = float(t.get('last_price', 0.15))
                 break
 
-        # $5 USDT Test Order Quantity (CoinDCX DOGE Precision 0 - No Decimals)
+        # $5 USDT Test Order Quantity (CoinDCX DOGE Precision 0)
         target_usdt = 5.0
         quantity = int(round(target_usdt / current_price))
         if quantity <= 0:
@@ -187,6 +267,7 @@ async def test_coindcx_order(request: Request):
                 "symbol": "DOGEUSDT",
                 "type": "LONG",
                 "entry_price": current_price,
+                "quantity": quantity,
                 "amount_usdt": round(quantity * current_price, 2),
                 "highest_price": current_price,
                 "lowest_price": current_price,
@@ -231,6 +312,7 @@ async def bot_control(request: Request):
         add_log("🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
+# 🔥 EXIT TRADE ENDPOINT (REAL COINDCX SELL ORDER CONNECTED) 🔥
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -246,6 +328,10 @@ async def close_trade(request: Request):
         return {"status": "error", "message": "Trade already closed or not found!"}
         
     try:
+        # Agar CoinDCX par real trade chal rahi hai, toh turant real SELL order bhejein
+        if bot_state.get("active_broker") == "coindcx" or "DOGE" in trade_to_close.get("symbol", ""):
+            execute_coindcx_sell(trade_to_close.get("symbol", "DOGEUSDT"), trade_to_close.get("quantity", 0))
+
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={trade_to_close['symbol']}", timeout=5)
         exit_price = float(res.json()['price'])
         
@@ -269,12 +355,12 @@ async def close_trade(request: Request):
         bot_state["trade_history"].insert(0, trade_to_close)
         if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
         
-        add_log(f"🛑 MANUAL EXIT: {trade_to_close['symbol']} | P&L: {trade_to_close['pnl_percent']}%")
+        add_log(f"🛑 REAL EXIT COMPLETED: {trade_to_close['symbol']} | P&L: {trade_to_close['pnl_percent']}%")
         save_memory()
         
-        return {"status": "success", "message": f"Manual Exit Successful! PNL: {trade_to_close['pnl_percent']}%"}
+        return {"status": "success", "message": f"Real Exit Successful! PNL: {trade_to_close['pnl_percent']}%"}
     except Exception as e:
-        return {"status": "error", "message": "API Error: Could not close trade."}
+        return {"status": "error", "message": f"API Error: {str(e)}"}
 
 @app.get("/api/bot-logs")
 def get_bot_logs():
@@ -331,6 +417,10 @@ async def market_scanner_loop():
                 for trade in trades_to_close:
                     exit_price = live_prices[trade["symbol"]]
                     
+                    # Auto TSL hit hone par bhi CoinDCX par real sell order execute hoga
+                    if bot_state.get("active_broker") == "coindcx":
+                        execute_coindcx_sell(trade.get("symbol", "DOGEUSDT"), trade.get("quantity", 0))
+
                     if trade["type"] == "LONG":
                         pnl_percent = ((exit_price - trade["entry_price"]) / trade["entry_price"]) * 100
                     else:
