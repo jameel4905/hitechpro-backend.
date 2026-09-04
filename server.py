@@ -128,6 +128,89 @@ async def connect_exchange(request: Request):
     except Exception as e:
         return {"status": "error", "message": "API Error: Invalid Keys!"}
 
+# 🔥 REAL $5 TEST ORDER VIA OFFICIAL COINDCX REST API 🔥
+@app.post("/api/test-coindcx-order")
+async def test_coindcx_order(request: Request):
+    try:
+        data = await request.json()
+        api_key = data.get('api_key', bot_state["api_key"]).strip()
+        secret_key = data.get('secret_key', bot_state["secret_key"]).strip()
+
+        if not api_key or not secret_key:
+            return {"status": "error", "message": "API Keys missing! Connect in Portfolio first."}
+
+        # 1. CoinDCX se DOGE live market & price prapt karna
+        ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=10)
+        tickers = ticker_res.json()
+        
+        doge_market = "B-DOGE_USDT"
+        current_price = 0.15
+        for t in tickers:
+            m = t.get('market', '')
+            if m in ['B-DOGE_USDT', 'DOGEUSDT', 'B-DOGEUSDT']:
+                doge_market = m
+                current_price = float(t.get('last_price', 0.15))
+                break
+
+        # $5 USDT Test Order Quantity
+        target_usdt = 5.0
+        quantity = round(target_usdt / current_price, 1)
+
+        # 2. CoinDCX Official HMAC-SHA256 Signature
+        time_stamp = int(round(time.time() * 1000))
+        body = {
+            "side": "buy",
+            "order_type": "market_order",
+            "market": doge_market,
+            "total_quantity": quantity,
+            "timestamp": time_stamp
+        }
+
+        json_body = json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        headers = {
+            'Content-Type': 'application/json',
+            'X-AUTH-APIKEY': api_key,
+            'X-AUTH-SIGNATURE': signature
+        }
+
+        # 3. Direct CoinDCX Execution
+        res = requests.post("https://api.coindcx.com/exchange/v1/orders/create", data=json_body, headers=headers, timeout=10)
+        res_data = res.json()
+
+        if res.status_code == 200 and ("orders" in res_data or "id" in res_data or isinstance(res_data, list)):
+            new_trade = {
+                "id": int(time.time()),
+                "symbol": "DOGEUSDT",
+                "type": "LONG",
+                "entry_price": current_price,
+                "amount_usdt": target_usdt,
+                "highest_price": current_price,
+                "lowest_price": current_price,
+                "sl_price": current_price * 0.98,
+                "time": get_global_time()
+            }
+            bot_state["active_trades"].insert(0, new_trade)
+            save_memory()
+            add_log(f"🧪 REAL TEST ORDER: Bought {quantity} DOGE at ${current_price}")
+            
+            return {
+                "status": "success",
+                "message": "Order Placed Successfully",
+                "trade": {
+                    "symbol": "DOGE/USDT",
+                    "entry_price": current_price,
+                    "amount": quantity
+                }
+            }
+        else:
+            err_text = res_data.get("message", str(res_data)) if isinstance(res_data, dict) else str(res_data)
+            return {"status": "error", "message": f"CoinDCX: {err_text}"}
+
+    except Exception as e:
+        return {"status": "error", "message": f"Server Error: {str(e)}"}
+
 @app.post("/api/bot-control")
 async def bot_control(request: Request):
     data = await request.json()
@@ -146,7 +229,6 @@ async def bot_control(request: Request):
         add_log("🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
-# 🔥 NAYA API ENDPOINT: MANUAL TRADE CLOSE KARNE KE LIYE 🔥
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -162,7 +244,6 @@ async def close_trade(request: Request):
         return {"status": "error", "message": "Trade already closed or not found!"}
         
     try:
-        # Binance se ekdum latest live price mangwana manual exit ke waqt
         res = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={trade_to_close['symbol']}", timeout=5)
         exit_price = float(res.json()['price'])
         
@@ -334,43 +415,3 @@ def root(): return {"status": "HiTech AI Engine Live!"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-from fastapi import Request
-from fastapi.responses import JSONResponse
-import ccxt
-
-@app.post("/api/test-coindcx-order")
-async def test_coindcx_order(request: Request):
-    try:
-        data = await request.json()
-        api_key = data.get('api_key')
-        secret_key = data.get('secret_key')
-        symbol = data.get('symbol', 'DOGE/USDT')
-
-        if not api_key or not secret_key:
-            return JSONResponse(status_code=400, content={"status": "error", "message": "API Keys missing!"})
-
-        exchange = ccxt.coindcx({
-            'apiKey': api_key,
-            'secret': secret_key,
-            'enableRateLimit': True,
-        })
-
-        # $5 USDT Test Order Logic
-        ticker = exchange.fetch_ticker(symbol)
-        current_price = float(ticker['last'])
-        test_amount_usdt = 5.0
-        quantity = exchange.amount_to_precision(symbol, test_amount_usdt / current_price)
-
-        order = exchange.create_market_buy_order(symbol, quantity)
-        return {
-            "status": "success",
-            "message": "Order Placed Successfully",
-            "trade": {
-                "symbol": symbol,
-                "entry_price": current_price,
-                "amount": quantity,
-                "order_id": order.get('id', '')
-            }
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
