@@ -128,7 +128,7 @@ async def connect_exchange(request: Request):
     except Exception as e:
         return {"status": "error", "message": "API Error: Invalid Keys!"}
 
-# 🔥 REAL $5 TEST ORDER VIA OFFICIAL COINDCX REST API 🔥
+# 🔥 REAL $5 TEST ORDER VIA OFFICIAL COINDCX REST API (PRECISION 0 FIXED) 🔥
 @app.post("/api/test-coindcx-order")
 async def test_coindcx_order(request: Request):
     try:
@@ -152,9 +152,11 @@ async def test_coindcx_order(request: Request):
                 current_price = float(t.get('last_price', 0.15))
                 break
 
-        # $5 USDT Test Order Quantity
+        # $5 USDT Test Order Quantity (CoinDCX DOGE Precision 0 - No Decimals)
         target_usdt = 5.0
-        quantity = round(target_usdt / current_price, 1)
+        quantity = int(round(target_usdt / current_price))
+        if quantity <= 0:
+            quantity = 10
 
         # 2. CoinDCX Official HMAC-SHA256 Signature
         time_stamp = int(round(time.time() * 1000))
@@ -185,7 +187,7 @@ async def test_coindcx_order(request: Request):
                 "symbol": "DOGEUSDT",
                 "type": "LONG",
                 "entry_price": current_price,
-                "amount_usdt": target_usdt,
+                "amount_usdt": round(quantity * current_price, 2),
                 "highest_price": current_price,
                 "lowest_price": current_price,
                 "sl_price": current_price * 0.98,
