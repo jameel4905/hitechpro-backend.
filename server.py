@@ -334,3 +334,43 @@ def root(): return {"status": "HiTech AI Engine Live!"}
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+from fastapi import Request
+from fastapi.responses import JSONResponse
+import ccxt
+
+@app.post("/api/test-coindcx-order")
+async def test_coindcx_order(request: Request):
+    try:
+        data = await request.json()
+        api_key = data.get('api_key')
+        secret_key = data.get('secret_key')
+        symbol = data.get('symbol', 'DOGE/USDT')
+
+        if not api_key or not secret_key:
+            return JSONResponse(status_code=400, content={"status": "error", "message": "API Keys missing!"})
+
+        exchange = ccxt.coindcx({
+            'apiKey': api_key,
+            'secret': secret_key,
+            'enableRateLimit': True,
+        })
+
+        # $5 USDT Test Order Logic
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = float(ticker['last'])
+        test_amount_usdt = 5.0
+        quantity = exchange.amount_to_precision(symbol, test_amount_usdt / current_price)
+
+        order = exchange.create_market_buy_order(symbol, quantity)
+        return {
+            "status": "success",
+            "message": "Order Placed Successfully",
+            "trade": {
+                "symbol": symbol,
+                "entry_price": current_price,
+                "amount": quantity,
+                "order_id": order.get('id', '')
+            }
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
