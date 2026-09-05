@@ -177,7 +177,6 @@ async def verify_vip_key(request: Request):
 
     # Case 1: Key already used previously
     if record["used"]:
-        # If device matches, check if still within 30-day window
         if record["device_id"] == device_id:
             try:
                 exp_dt = datetime.fromisoformat(record["expires_at"].replace("Z", ""))
@@ -322,7 +321,7 @@ def fetch_active_exchange_markets():
     except:
         return []
 
-# 🔥 REAL BUY ENGINE (COINDCX DUAL MARKET SUPPORT)
+# 🔥 REAL BUY ENGINE (COINDCX DUAL MARKET SUPPORT + STRICT > 100 INR PROTECTION)
 def execute_coindcx_buy(symbol, target_amount=5.0):
     api_key = bot_state.get("api_key", "").strip()
     secret_key = bot_state.get("secret_key", "").strip()
@@ -355,6 +354,11 @@ def execute_coindcx_buy(symbol, target_amount=5.0):
 
         calc_qty = target_amount / current_price
         quantity = int(round(calc_qty)) if clean_coin in ["DOGE", "TRX", "SHIB"] else round(calc_qty, 3)
+        
+        # Ensure CoinDCX rule: order value must strictly exceed ₹100 INR
+        if quote == "INR" and (quantity * current_price) <= 102.0:
+            quantity += 1
+            
         if quantity <= 0:
             quantity = 1
 
@@ -382,7 +386,7 @@ def execute_coindcx_buy(symbol, target_amount=5.0):
     except Exception as e:
         return False, 0, 0, str(e)
 
-# 🔥 BULLETPROOF REAL SELL ENGINE (WITH LIVE BALANCE AUDIT)
+# 🔥 BULLETPROOF REAL SELL ENGINE (WITH ZERO-BALANCE AUTO-RESOLVE)
 def execute_coindcx_sell(symbol, quantity=0):
     api_key = bot_state.get("api_key", "").strip()
     secret_key = bot_state.get("secret_key", "").strip()
@@ -418,9 +422,10 @@ def execute_coindcx_sell(symbol, quantity=0):
         else:
             sell_qty = round(sell_qty, 3)
 
+        # Fix: If exchange balance is zero, gracefully clear position without locking user
         if sell_qty <= 0:
-            add_log(f"⚠️ Sell Skipped: 0 {clean_coin} balance on CoinDCX!")
-            return False, f"Zero {clean_coin} in wallet"
+            add_log(f"⚠️ Sell Notice: 0 {clean_coin} on CoinDCX. Clearing local position.")
+            return True, f"Cleared local position (0 {clean_coin} in wallet)"
 
         ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
         tickers = ticker_res.json()
