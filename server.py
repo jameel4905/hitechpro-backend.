@@ -1,9 +1,17 @@
 import os, time, hmac, hashlib, json, requests, ccxt, uvicorn, asyncio, random
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+# 🔄 BACKGROUND SCANNER LIFESPAN HANDLER
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scanner_task = asyncio.create_task(market_scanner_loop())
+    yield
+    scanner_task.cancel()
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,19 +23,20 @@ app.add_middleware(
 
 bot_state = {
     "is_running": False,
-    "active_broker": "paper",
+    "active_broker": "paper",   # 'paper' ya 'coindcx'
+    "market_mode": "spot",      # 'spot' (safe dip) ya 'futures' (shorting)
     "api_key": "",
     "secret_key": "",
-    "quote_currency": "USDT",
-    "trade_amount": 5.0,
+    "quote_currency": "USDT",   # 'USDT' ya 'INR'
+    "trade_amount": 5.0,        # USDT mein $5 ya INR mein ₹500
     "trade_type": "intraday", 
     "strategy": "volume",
-    "logs": ["🤖 Master AI Engine Initialized. VIP Security & Live Execution Ready."],
+    "logs": ["🤖 Master AI Engine Initialized. Dual Spot/Futures Ready."],
     "active_trades": [],   
     "trade_history": [],    
     "paper_balance": 10000.0,
     "today_pnl": 0.0, 
-    "last_settlement_date": datetime.utcnow().strftime("%Y-%m-%d") 
+    "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d") 
 }
 
 DATA_FILE = "bot_data.json"
@@ -86,7 +95,7 @@ def save_keys_database():
 load_keys_database()
 
 def get_global_time():
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat() + "Z"
 
 def get_curr_symbol():
     return "₹" if bot_state.get("quote_currency") == "INR" else "$"
@@ -102,12 +111,13 @@ def load_memory():
                 bot_state["active_trades"] = data.get("active_trades", [])
                 bot_state["trade_history"] = data.get("trade_history", [])
                 bot_state["is_running"] = data.get("is_running", False)
+                bot_state["market_mode"] = data.get("market_mode", "spot")
                 bot_state["quote_currency"] = data.get("quote_currency", "USDT")
                 bot_state["trade_amount"] = data.get("trade_amount", 5.0)
                 bot_state["trade_type"] = data.get("trade_type", "intraday")
                 bot_state["strategy"] = data.get("strategy", "volume")
                 bot_state["today_pnl"] = data.get("today_pnl", 0.0)
-                bot_state["last_settlement_date"] = data.get("last_settlement_date", datetime.utcnow().strftime("%Y-%m-%d"))
+                bot_state["last_settlement_date"] = data.get("last_settlement_date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
                 bot_state["active_broker"] = data.get("active_broker", "paper")
                 bot_state["api_key"] = data.get("api_key", "")
                 bot_state["secret_key"] = data.get("secret_key", "")
@@ -122,6 +132,7 @@ def save_memory():
                 "active_trades": bot_state["active_trades"],
                 "trade_history": bot_state["trade_history"],
                 "is_running": bot_state["is_running"],
+                "market_mode": bot_state["market_mode"],
                 "quote_currency": bot_state["quote_currency"],
                 "trade_amount": bot_state["trade_amount"],
                 "trade_type": bot_state["trade_type"],
@@ -144,7 +155,7 @@ def add_log(msg):
         bot_state["logs"].pop()
 
 def check_midnight_settlement():
-    current_date = datetime.utcnow().strftime("%Y-%m-%d")
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if current_date != bot_state["last_settlement_date"]:
         curr_sym = get_curr_symbol()
         bot_state["paper_balance"] += bot_state["today_pnl"]
@@ -155,6 +166,7 @@ def check_midnight_settlement():
         add_log(f"🏦 Midnight Settlement: {curr_sym}{settled_amount} moved to Wallet.")
         save_memory()
 
+# 🔑 VIP VERIFICATION ENGINE
 @app.post("/api/verify-vip-key")
 async def verify_vip_key(request: Request):
     data = await request.json()
@@ -169,12 +181,12 @@ async def verify_vip_key(request: Request):
         return {"status": "error", "message": "Invalid Activation Key. Please verify with admin."}
 
     record = keys_db[key]
-    now_dt = datetime.utcnow()
+    now_dt = datetime.now(timezone.utc)
 
     if record["used"]:
         if record["device_id"] == device_id:
             try:
-                exp_dt = datetime.fromisoformat(record["expires_at"].replace("Z", ""))
+                exp_dt = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
                 if exp_dt > now_dt:
                     days_left = (exp_dt - now_dt).days + 1
                     return {
@@ -183,7 +195,7 @@ async def verify_vip_key(request: Request):
                         "expires_at": record["expires_at"]
                     }
                 else:
-                    return {"status": "error", "message": "This VIP Key has expired. Please renew for ₹199."}
+                    return {"status": "error", "message": "This VIP Key has expired. Please renew."}
             except:
                 pass
         return {"status": "error", "message": "This key has already been activated on another device!"}
@@ -193,31 +205,31 @@ async def verify_vip_key(request: Request):
 
     record["used"] = True
     record["device_id"] = device_id if device_id else f"DEV_{int(time.time())}"
-    record["activated_at"] = activation_time.isoformat() + "Z"
-    record["expires_at"] = expiry_time.isoformat() + "Z"
+    record["activated_at"] = activation_time.isoformat()
+    record["expires_at"] = expiry_time.isoformat()
 
     if referral_code and referral_code in keys_db and referral_code != key:
         ref_record = keys_db[referral_code]
         if ref_record["used"] and ref_record["expires_at"]:
             try:
-                ref_exp = datetime.fromisoformat(ref_record["expires_at"].replace("Z", ""))
+                ref_exp = datetime.fromisoformat(ref_record["expires_at"].replace("Z", "+00:00"))
                 base_time = ref_exp if ref_exp > now_dt else now_dt
                 new_ref_exp = base_time + timedelta(days=10)
-                ref_record["expires_at"] = new_ref_exp.isoformat() + "Z"
+                ref_record["expires_at"] = new_ref_exp.isoformat()
                 ref_record["referral_count"] = ref_record.get("referral_count", 0) + 1
-                add_log(f"🎁 REFERRAL REWARD: 10 extra days added to referrer key [{referral_code}]!")
+                add_log(f"🎁 REFERRAL REWARD: 10 extra days added to referrer [{referral_code}]!")
             except Exception as ex:
-                add_log(f"⚠️ Referral extension error: {str(ex)[:30]}")
+                add_log(f"⚠️ Referral error: {str(ex)[:30]}")
 
     save_keys_database()
-    add_log(f"👑 VIP KEY ACTIVATED: [{key}] unlocked for 30 days on device [{record['device_id'][:10]}...].")
-    
+    add_log(f"👑 VIP KEY ACTIVATED: [{key}] unlocked for 30 days.")
     return {
         "status": "success",
         "message": "VIP Key verified successfully! 30-Day access granted.",
         "expires_at": record["expires_at"]
     }
 
+# 🌐 UNIVERSAL MARKET DATA FEED
 def fetch_active_exchange_markets():
     broker = bot_state.get("active_broker", "paper")
     quote = bot_state.get("quote_currency", "USDT").upper()
@@ -272,16 +284,6 @@ def fetch_active_exchange_markets():
                         "volume": float(t.get("quoteVolume", 0.0) or 0.0),
                         "change": float(t.get("percentage", 0.0) or 0.0)
                     })
-            if not market_list and quote == "INR":
-                for sym, t in tickers.items():
-                    if sym.endswith("/USDT"):
-                        market_list.append({
-                            "symbol": sym.replace("/", ""),
-                            "raw_symbol": sym,
-                            "price": float(t.get("last", 0.0)),
-                            "volume": float(t.get("quoteVolume", 0.0) or 0.0),
-                            "change": float(t.get("percentage", 0.0) or 0.0)
-                        })
             return market_list
         except Exception as e:
             add_log(f"⚠️ {broker.upper()} Feed Error: {str(e)[:30]}")
@@ -313,13 +315,14 @@ def fetch_active_exchange_markets():
     except:
         return []
 
-def execute_coindcx_buy(symbol, target_amount=5.0):
+# 🔥 DUAL MULTI-COIN EXECUTOR (SPOT & FUTURES SHORT/BUY)
+def execute_coindcx_order(symbol, side="buy", target_amount=5.0, exact_qty=0):
     api_key = bot_state.get("api_key", "").strip()
     secret_key = bot_state.get("secret_key", "").strip()
     quote = bot_state.get("quote_currency", "USDT").upper()
 
     if not api_key or not secret_key:
-        return False, None, 0, "API Keys missing"
+        return False, 0, 0, "API Keys missing"
 
     try:
         clean_coin = symbol.replace("USDT", "").replace("INR", "").replace("/", "").replace("B-", "").replace("I-", "").replace("_", "").upper()
@@ -328,33 +331,40 @@ def execute_coindcx_buy(symbol, target_amount=5.0):
         
         target_market = f"I-{clean_coin}_INR" if quote == "INR" else f"B-{clean_coin}_USDT"
         current_price = 0.0
-        
         for t in tickers:
             m = t.get('market', '')
-            if quote == "INR" and clean_coin in m and "INR" in m:
-                target_market = m
-                current_price = float(t.get('last_price', 0.0))
-                break
-            elif quote == "USDT" and clean_coin in m and "USDT" in m:
+            if (quote in m) and (clean_coin in m):
                 target_market = m
                 current_price = float(t.get('last_price', 0.0))
                 break
 
         if current_price <= 0:
-            return False, None, 0, f"Price not found for {clean_coin} ({quote})"
+            return False, 0, 0, f"Price not found for {clean_coin} ({quote})"
 
-        calc_qty = target_amount / current_price
-        quantity = int(round(calc_qty)) if clean_coin in ["DOGE", "TRX", "SHIB"] else round(calc_qty, 3)
-        
+        if exact_qty > 0:
+            quantity = exact_qty
+        else:
+            calc_qty = target_amount / current_price
+            if current_price < 20:
+                quantity = int(round(calc_qty))
+            elif current_price < 1000:
+                quantity = round(calc_qty, 2)
+            else:
+                quantity = round(calc_qty, 5)
+
+        # CoinDCX > ₹100 Strict Protection
         if quote == "INR" and (quantity * current_price) <= 102.0:
-            quantity += 1
-            
+            if current_price < 20:
+                quantity += 1
+            else:
+                quantity = round(115.0 / current_price, 5 if current_price > 1000 else 2)
+
         if quantity <= 0:
             quantity = 1
 
         time_stamp = int(round(time.time() * 1000))
         body = {
-            "side": "buy",
+            "side": side.lower(),
             "order_type": "market_order",
             "market": target_market,
             "total_quantity": quantity,
@@ -376,13 +386,13 @@ def execute_coindcx_buy(symbol, target_amount=5.0):
     except Exception as e:
         return False, 0, 0, str(e)
 
+# 🔥 SPOT CLOSE/SELL ENGINE (ZERO-BALANCE AUTO-CLEAR)
 def execute_coindcx_sell(symbol, quantity=0):
     api_key = bot_state.get("api_key", "").strip()
     secret_key = bot_state.get("secret_key", "").strip()
     quote = bot_state.get("quote_currency", "USDT").upper()
 
     if not api_key or not secret_key:
-        add_log("❌ SELL ABORTED: CoinDCX API Keys missing!")
         return False, "API keys missing"
 
     try:
@@ -404,69 +414,36 @@ def execute_coindcx_sell(symbol, quantity=0):
                     break
 
         sell_qty = actual_available if actual_available > 0 else float(quantity)
-        
-        if clean_coin in ["DOGE", "TRX", "SHIB"]:
-            sell_qty = int(sell_qty)
-        else:
-            sell_qty = round(sell_qty, 3)
+        sell_qty = int(sell_qty) if sell_qty > 20 else round(sell_qty, 3)
 
         if sell_qty <= 0:
-            add_log(f"⚠️ Sell Notice: 0 {clean_coin} on CoinDCX. Clearing local position.")
-            return True, f"Cleared local position (0 {clean_coin} in wallet)"
+            add_log(f"⚠️ Zero balance on CoinDCX for {clean_coin}. Clearing local trade.")
+            return True, "Position cleared"
 
-        ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
-        tickers = ticker_res.json()
-        target_market = f"I-{clean_coin}_INR" if quote == "INR" else f"B-{clean_coin}_USDT"
-        for t in tickers:
-            m = t.get('market', '')
-            if quote == "INR" and clean_coin in m and "INR" in m:
-                target_market = m
-                break
-            elif quote == "USDT" and clean_coin in m and "USDT" in m:
-                target_market = m
-                break
-
-        time_stamp = int(round(time.time() * 1000))
-        order_body = {
-            "side": "sell",
-            "order_type": "market_order",
-            "market": target_market,
-            "total_quantity": sell_qty,
-            "timestamp": time_stamp
-        }
-        json_order = json.dumps(order_body, separators=(',', ':'))
-        sig = hmac.new(secret_key.encode('utf-8'), json_order.encode('utf-8'), hashlib.sha256).hexdigest()
-        headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': sig}
-        
-        res = requests.post("https://api.coindcx.com/exchange/v1/orders/create", data=json_order, headers=headers, timeout=10)
-        res_data = res.json()
-
-        if res.status_code == 200 and ("orders" in res_data or "id" in res_data or isinstance(res_data, list)):
-            add_log(f"📤 REAL EXIT SUCCESS: Sold {sell_qty} {clean_coin} on CoinDCX ({target_market})")
-            return True, res_data
-        else:
-            err_msg = res_data.get("message", str(res_data)) if isinstance(res_data, dict) else str(res_data)
-            add_log(f"❌ REAL SELL REJECTED: {err_msg[:40]}")
-            return False, err_msg
-            
+        success, _, _, res = execute_coindcx_order(symbol, side="sell", exact_qty=sell_qty)
+        return success, res
     except Exception as e:
-        add_log(f"❌ Sell Exception: {str(e)[:35]}")
         return False, str(e)
+
+# 🔄 MODE SWITCH ENDPOINTS
+@app.post("/api/set-market-mode")
+async def set_market_mode(request: Request):
+    data = await request.json()
+    mode = data.get("mode", "spot").lower()
+    if mode in ["spot", "futures"]:
+        bot_state["market_mode"] = mode
+        save_memory()
+        add_log(f"🎯 Market Mode Changed to: {mode.upper()}")
+        return {"status": "success", "market_mode": mode}
+    return {"status": "error", "message": "Mode must be 'spot' or 'futures'"}
 
 @app.post("/api/set-broker-mode")
 async def set_broker_mode(request: Request):
     data = await request.json()
     mode = data.get("mode", "paper").lower()
-    
-    if mode == "real":
-        if not bot_state.get("api_key") or not bot_state.get("secret_key"):
-            return {"status": "error", "message": "API keys not set. Connect in Portfolio!"}
-        bot_state["active_broker"] = "coindcx"
-    else:
-        bot_state["active_broker"] = "paper"
-        
+    bot_state["active_broker"] = "coindcx" if mode == "real" else "paper"
     save_memory()
-    add_log(f"⚡ Broker Mode Switched to: {bot_state['active_broker'].upper()}")
+    add_log(f"⚡ Broker Switched to: {bot_state['active_broker'].upper()}")
     return {"status": "success", "active_broker": bot_state["active_broker"]}
 
 @app.post("/api/set-currency")
@@ -477,11 +454,7 @@ async def set_currency(request: Request):
         return {"status": "error", "message": "Only 'USDT' and 'INR' are supported"}
     
     bot_state["quote_currency"] = currency
-    if currency == "INR" and bot_state["trade_amount"] < 100:
-        bot_state["trade_amount"] = 500.0
-    elif currency == "USDT" and bot_state["trade_amount"] >= 100:
-        bot_state["trade_amount"] = 5.0
-
+    bot_state["trade_amount"] = 500.0 if currency == "INR" else 5.0
     save_memory()
     add_log(f"💱 Currency switched to {currency} ({get_curr_symbol()})")
     return {
@@ -508,7 +481,6 @@ async def connect_exchange(request: Request):
         if exchange_id == "paper":
             if force_bot_run == True and not bot_state["is_running"]:
                 bot_state["is_running"] = True
-                add_log("🔄 Bot resumed on Paper Mode.")
             return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {bot_state["quote_currency"]: bot_state["paper_balance"]}}
             
         elif exchange_id == "coindcx":
@@ -531,7 +503,6 @@ async def connect_exchange(request: Request):
             exchange = getattr(ccxt, exchange_id)({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
             balance = exchange.fetch_balance()
             dynamic_balances = {coin: round(amt, 5) for coin, amt in balance.get('total', {}).items() if isinstance(amt, (int, float)) and amt > 0.00001}
-            add_log(f"🔗 Connected to {exchange_id.upper()} via CCXT.")
             return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
     except Exception as e:
         return {"status": "error", "message": "API Error: Invalid Keys!"}
@@ -553,7 +524,7 @@ async def test_coindcx_order(request: Request):
 
         quote = bot_state.get("quote_currency", "USDT")
         test_amount = 115.0 if quote == "INR" else 5.0
-        success, price, qty, res = execute_coindcx_buy(f"DOGE{quote}", test_amount)
+        success, price, qty, res = execute_coindcx_order(f"DOGE{quote}", "buy", target_amount=test_amount)
         curr_sym = get_curr_symbol()
 
         if success:
@@ -585,15 +556,9 @@ async def bot_control(request: Request):
     action = data.get("action")
     if action == "start":
         bot_state["is_running"] = True
-        if "currency" in data and data["currency"].upper() in ["USDT", "INR"]:
-            bot_state["quote_currency"] = data["currency"].upper()
-        if "amount" in data and float(data["amount"]) > 0:
-            bot_state["trade_amount"] = float(data["amount"])
-        bot_state["trade_type"] = data.get("trade_type", bot_state["trade_type"])
-        bot_state["strategy"] = data.get("strategy", bot_state["strategy"])
         save_memory()
         curr_sym = get_curr_symbol()
-        add_log(f"🚀 BOT STARTED on {bot_state['active_broker'].upper()} | {bot_state['quote_currency']} Mode | Lot: {curr_sym}{bot_state['trade_amount']}")
+        add_log(f"🚀 BOT STARTED | Mode: {bot_state['market_mode'].upper()} | Broker: {bot_state['active_broker'].upper()} | Lot: {curr_sym}{bot_state['trade_amount']}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
         bot_state["is_running"] = False
@@ -601,32 +566,29 @@ async def bot_control(request: Request):
         add_log("🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
+# 🔥 CLOSE TRADE (HANDLES BOTH LONG EXIT & SHORT COVER)
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
     trade_id = data.get("id")
     
-    trade_to_close = None
-    for t in bot_state["active_trades"]:
-        if t["id"] == trade_id:
-            trade_to_close = t
-            break
-            
+    trade_to_close = next((t for t in bot_state["active_trades"] if t["id"] == trade_id), None)
     if not trade_to_close:
         return {"status": "error", "message": "Trade not found!"}
         
     try:
+        side_to_exit = "sell" if trade_to_close["type"] == "LONG" else "buy"
         if bot_state.get("active_broker") == "coindcx":
-            sold, msg = execute_coindcx_sell(trade_to_close.get("symbol", "DOGEUSDT"), trade_to_close.get("quantity", 0))
+            if trade_to_close["type"] == "LONG":
+                sold, msg = execute_coindcx_sell(trade_to_close.get("symbol"), trade_to_close.get("quantity", 0))
+            else:
+                sold, _, _, msg = execute_coindcx_order(trade_to_close.get("symbol"), side=side_to_exit, exact_qty=trade_to_close.get("quantity", 0))
+            
             if not sold:
                 return {"status": "error", "message": f"CoinDCX Exit Failed: {msg}"}
 
         markets = fetch_active_exchange_markets()
-        exit_price = trade_to_close["entry_price"]
-        for m in markets:
-            if m["symbol"] == trade_to_close["symbol"]:
-                exit_price = m["price"]
-                break
+        exit_price = next((m["price"] for m in markets if m["symbol"] == trade_to_close["symbol"]), trade_to_close["entry_price"])
         
         if trade_to_close["type"] == "LONG":
             pnl_percent = ((exit_price - trade_to_close["entry_price"]) / trade_to_close["entry_price"]) * 100
@@ -647,10 +609,11 @@ async def close_trade(request: Request):
 
         bot_state["active_trades"].remove(trade_to_close)
         bot_state["trade_history"].insert(0, trade_to_close)
-        if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
+        if len(bot_state["trade_history"]) > 30: 
+            bot_state["trade_history"].pop()
         
         save_memory()
-        return {"status": "success", "message": f"Exit Confirmed on CoinDCX! PNL: {trade_to_close['pnl_percent']}%"}
+        return {"status": "success", "message": f"Exit Confirmed! PNL: {trade_to_close['pnl_percent']}%"}
     except Exception as e:
         return {"status": "error", "message": f"API Error: {str(e)}"}
 
@@ -659,6 +622,7 @@ def get_bot_logs():
     return {
         "status": "success", 
         "is_running": bot_state["is_running"], 
+        "market_mode": bot_state["market_mode"],
         "logs": bot_state["logs"],
         "active_broker": bot_state["active_broker"],
         "quote_currency": bot_state["quote_currency"],
@@ -673,11 +637,13 @@ def get_trades():
         "active": bot_state["active_trades"], 
         "history": bot_state["trade_history"],
         "paper_balance": bot_state["paper_balance"],
+        "market_mode": bot_state["market_mode"],
         "quote_currency": bot_state["quote_currency"],
         "currency_symbol": get_curr_symbol(),
         "today_pnl": bot_state["today_pnl"] 
     }
 
+# 🔄 DUAL HYBRID SCANNER (TEJI MEIN BUY / MANDI MEIN SHORT YA DIP-HUNT)
 async def market_scanner_loop():
     while True:
         check_midnight_settlement() 
@@ -691,6 +657,7 @@ async def market_scanner_loop():
 
                 live_prices = {c['symbol']: c['price'] for c in all_coins}
                 
+                # 1. Trailing Stop Loss Monitor (Longs & Shorts)
                 trades_to_close = []
                 for trade in bot_state["active_trades"]:
                     sym = trade["symbol"]
@@ -702,14 +669,24 @@ async def market_scanner_loop():
                                 trade["sl_price"] = max(trade["sl_price"], curr_p * 0.98)
                             if curr_p <= trade["sl_price"]:
                                 trades_to_close.append(trade)
+                        elif trade["type"] == "SHORT":
+                            if curr_p < trade["lowest_price"]:
+                                trade["lowest_price"] = curr_p
+                                trade["sl_price"] = min(trade["sl_price"], curr_p * 1.02)
+                            if curr_p >= trade["sl_price"]:
+                                trades_to_close.append(trade)
                 
                 for trade in trades_to_close:
                     exit_p = live_prices[trade["symbol"]]
+                    side_to_exit = "sell" if trade["type"] == "LONG" else "buy"
                     
                     if bot_state.get("active_broker") == "coindcx":
-                        execute_coindcx_sell(trade.get("symbol", "DOGEUSDT"), trade.get("quantity", 0))
+                        if trade["type"] == "LONG":
+                            execute_coindcx_sell(trade.get("symbol"), trade.get("quantity", 0))
+                        else:
+                            execute_coindcx_order(trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0))
 
-                    pnl_percent = ((exit_p - trade["entry_price"]) / trade["entry_price"]) * 100
+                    pnl_percent = ((exit_p - trade["entry_price"]) / trade["entry_price"] * 100) if trade["type"] == "LONG" else ((trade["entry_price"] - exit_p) / trade["entry_price"] * 100)
                     trade_amt = trade.get("amount", 5.0)
                     pnl_val = (trade_amt * pnl_percent) / 100
                     
@@ -724,81 +701,95 @@ async def market_scanner_loop():
 
                     bot_state["active_trades"].remove(trade)
                     bot_state["trade_history"].insert(0, trade)
-                    if len(bot_state["trade_history"]) > 30: bot_state["trade_history"].pop()
-                    add_log(f"🔔 TSL HIT: {trade['symbol']} | P&L: {trade['pnl_percent']}%")
+                    if len(bot_state["trade_history"]) > 30: 
+                        bot_state["trade_history"].pop()
+                    add_log(f"🔔 TSL HIT: {trade['type']} {trade['symbol']} | P&L: {trade['pnl_percent']}%")
                 
                 save_memory()
 
+                # 2. Dynamic Market Entry Scanner
                 if len(bot_state["active_trades"]) < 1:
-                    order_amount = bot_state["trade_amount"]
-                    quote = bot_state.get("quote_currency", "USDT")
-                    curr_sym = get_curr_symbol()
+                    valid = [c for c in all_coins if c['price'] > 0 and c['volume'] > 20]
+                    if valid:
+                        mode = bot_state.get("market_mode", "spot")
+                        gainers = sorted(valid, key=lambda x: x.get('change', 0.0), reverse=True)
+                        losers = sorted(valid, key=lambda x: x.get('change', 0.0))
 
-                    target_coin = next((c for c in all_coins if "DOGE" in c['symbol']), None)
-                    if not target_coin and all_coins:
-                        target_coin = all_coins[0]
+                        top_gainer = gainers[0]
+                        top_loser = losers[0]
 
-                    if target_coin:
+                        # TEJI SENSE: Top gainer pumping
+                        if top_gainer.get('change', 0.0) >= 0.3:
+                            target_coin = top_gainer
+                            pos_type = "LONG"
+                        # MANDI SENSE: Market dipping
+                        else:
+                            target_coin = top_loser
+                            pos_type = "SHORT" if mode == "futures" else "LONG" # Spot buys oversold dip
+
                         coin_sym = target_coin['symbol']
                         current_p = target_coin['price']
+                        order_amount = bot_state["trade_amount"]
+                        quote = bot_state.get("quote_currency", "USDT")
+                        curr_sym = get_curr_symbol()
+
+                        if mode == "spot" and pos_type == "LONG" and target_coin.get('change', 0.0) < 0:
+                            add_log(f"📉 Dip Sniper Active: Buying bottom of {coin_sym} ({target_coin.get('change', 0.0)}%)")
 
                         if bot_state["active_broker"] == "coindcx":
-                            success, buy_price, buy_qty, res = execute_coindcx_buy(coin_sym, order_amount)
+                            side = "buy" if pos_type == "LONG" else "sell"
+                            success, buy_price, buy_qty, res = execute_coindcx_order(coin_sym, side=side, target_amount=order_amount)
                             if success:
                                 new_trade = {
                                     "id": int(time.time()),
                                     "symbol": coin_sym,
                                     "currency": quote,
-                                    "type": "LONG",
+                                    "type": pos_type,
                                     "entry_price": buy_price,
                                     "quantity": buy_qty,
                                     "amount": round(buy_qty * buy_price, 2),
                                     "highest_price": buy_price,
                                     "lowest_price": buy_price,
-                                    "sl_price": buy_price * 0.98,
+                                    "sl_price": buy_price * 0.98 if pos_type == "LONG" else buy_price * 1.02,
                                     "time": get_global_time()
                                 }
                                 bot_state["active_trades"].insert(0, new_trade)
                                 save_memory()
-                                add_log(f"⚡ REAL BUY: {buy_qty} {coin_sym} at {curr_sym}{buy_price}")
+                                add_log(f"⚡ REAL {pos_type}: {buy_qty} {coin_sym} at {curr_sym}{buy_price}")
                             else:
-                                add_log(f"⚠️ Auto-Buy Failed: {str(res)[:35]}")
+                                add_log(f"⚠️ Auto-Trade Failed: {str(res)[:35]}")
                         
                         elif bot_state["active_broker"] == "paper":
-                            calc_qty = int(order_amount / current_p) if current_p > 0 else 1
+                            calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 3)
                             new_trade = {
                                 "id": int(time.time()),
                                 "symbol": coin_sym,
                                 "currency": quote,
-                                "type": "LONG",
+                                "type": pos_type,
                                 "entry_price": current_p,
                                 "quantity": calc_qty,
                                 "amount": order_amount,
                                 "highest_price": current_p,
                                 "lowest_price": current_p,
-                                "sl_price": current_p * 0.98,
+                                "sl_price": current_p * 0.98 if pos_type == "LONG" else current_p * 1.02,
                                 "time": get_global_time()
                             }
                             bot_state["active_trades"].insert(0, new_trade)
                             save_memory()
-                            add_log(f"⚡ [PAPER] BUY: {coin_sym} at {curr_sym}{current_p}")
+                            add_log(f"⚡ [PAPER] {pos_type}: {coin_sym} at {curr_sym}{current_p}")
 
                         await asyncio.sleep(5)
-                        
             except Exception as e:
                 add_log(f"❌ Scanner Loop Error: {str(e)[:35]}")
         
         await asyncio.sleep(3)
 
-@app.on_event("startup")
-async def startup(): 
-    asyncio.create_task(market_scanner_loop())
-
 @app.get("/")
 def root(): 
     return {
-        "status": "HiTech AI Engine Live!", 
+        "status": "HiTech Dual AI Engine Live!", 
         "broker": bot_state["active_broker"], 
+        "market_mode": bot_state["market_mode"],
         "currency": bot_state["quote_currency"],
         "symbol": get_curr_symbol(),
         "total_vip_keys": len(keys_db)
