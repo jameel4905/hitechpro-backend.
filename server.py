@@ -1,7 +1,7 @@
 import os, time, hmac, hashlib, json, requests, ccxt, uvicorn, asyncio, random
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -22,7 +22,7 @@ bot_state = {
     "trade_amount": 5.0,         # USDT mein $5 ya INR mein ₹500
     "trade_type": "intraday", 
     "strategy": "volume",
-    "logs": ["🤖 Master AI Engine Initialized. Multi-Currency & Live Execution Ready."],
+    "logs": ["🤖 Master AI Engine Initialized. VIP Security & Live Execution Ready."],
     "active_trades": [],   
     "trade_history": [],    
     "paper_balance": 10000.0,
@@ -31,6 +31,62 @@ bot_state = {
 }
 
 DATA_FILE = "bot_data.json"
+KEYS_DB_FILE = "keys_db.json"
+
+# 👑 MASTER LIST OF VIP ACTIVATION KEYS (SINGLE-USE & DEVICE-BOUND)
+MASTER_VIP_KEYS = [
+    "Ttyux7837", "yyuxv9990", "zazoz7689", "wqxxb8112", "ddrxz9099", "ssolp0112",
+    "dxxct8900", "vvvst6090", "topct4562", "jamrt2189", "bcjoz0445", "savvc3188",
+    "gyyop5678", "somno8955", "okxdc9967", "ssopx3991", "sddtc0332", "wqplo0349",
+    "ccdri8922", "vdszx5678", "Ecxaz8881", "cccto8110", "ffrtc4590", "cvxns4286",
+    "drtpc7634", "trxza3339", "hctza7811", "drtrc4589", "ffctb8745", "Ahode3462",
+    "yjdtes8950", "huawol7624", "kiyfs8907", "hhyat7866", "hhgat8201", "hgwkl6544",
+    "ghlao8900", "hungd8765", "hutes9032", "huowl1425", "uwlak6902", "haqao3430",
+    "haeri9023", "lopas8443", "olase9088", "xvcbm3286", "cmzxn0990", "rteoa6723",
+    "awalo0120", "smxfg9034", "qoesk0098", "gdncm8674", "azmzn3490", "bhafi6789",
+    "plomc7563", "cvbfz5601", "hpctn8823", "qarap1209", "akyce9743", "dyyct1239",
+    "lopst2179", "wqlla1356", "bgmvs8040", "daytc7654", "slmpo4597", "ftesr0967",
+    "qawas8654", "vcxqa6789", "poiyt1452", "utyuo1001", "wopae9882", "lpost3459",
+    "laalo5901", "tyucv7732", "yeduo0111", "waqao9090", "wasar7728", "iitrc4567",
+    "tuyvc6610", "resct6712", "ohpor5098", "rwocp8724", "ghuyt6723", "Jiuno0989",
+    "ploar7093", "aeiop9321", "ppout9955", "ictno7766", "aicio7711", "ddrco3750",
+    "abovc8023", "ddcrt9959", "qoplu1898", "oiuyt4587", "qpoui0908", "woplt1010",
+    "mnuni4089", "dcvna3090", "aavvc0001", "aolct0099", "sasat7890", "llpot8686",
+    "kkubx0567", "ilctn4590", "actto1209", "ssdco5678"
+]
+
+keys_db = {}
+
+def load_keys_database():
+    global keys_db
+    if os.path.exists(KEYS_DB_FILE):
+        try:
+            with open(KEYS_DB_FILE, "r") as f:
+                keys_db = json.load(f)
+        except:
+            keys_db = {}
+    
+    # Initialize unseeded keys
+    for k in MASTER_VIP_KEYS:
+        clean_k = k.strip()
+        if clean_k not in keys_db:
+            keys_db[clean_k] = {
+                "used": False,
+                "device_id": None,
+                "activated_at": None,
+                "expires_at": None,
+                "referral_count": 0
+            }
+    save_keys_database()
+
+def save_keys_database():
+    try:
+        with open(KEYS_DB_FILE, "w") as f:
+            json.dump(keys_db, f, indent=2)
+    except:
+        pass
+
+load_keys_database()
 
 def get_global_time():
     return datetime.utcnow().isoformat() + "Z"
@@ -102,12 +158,79 @@ def check_midnight_settlement():
         add_log(f"🏦 Midnight Settlement: {curr_sym}{settled_amount} moved to Wallet.")
         save_memory()
 
+# 🔑 VIP SUBSCRIPTION VERIFICATION (30-DAY + DEVICE LOCK + REFERRAL ENGINE)
+@app.post("/api/verify-vip-key")
+async def verify_vip_key(request: Request):
+    data = await request.json()
+    key = data.get("key", "").strip()
+    device_id = data.get("device_id", "").strip()
+    referral_code = data.get("referral_code", "").strip()
+
+    if not key:
+        return {"status": "error", "message": "Key cannot be empty."}
+
+    if key not in keys_db:
+        return {"status": "error", "message": "Invalid Activation Key. Please verify with admin."}
+
+    record = keys_db[key]
+    now_dt = datetime.utcnow()
+
+    # Case 1: Key already used previously
+    if record["used"]:
+        # If device matches, check if still within 30-day window
+        if record["device_id"] == device_id:
+            try:
+                exp_dt = datetime.fromisoformat(record["expires_at"].replace("Z", ""))
+                if exp_dt > now_dt:
+                    days_left = (exp_dt - now_dt).days + 1
+                    return {
+                        "status": "success",
+                        "message": f"Key verified! Valid for {days_left} remaining day(s).",
+                        "expires_at": record["expires_at"]
+                    }
+                else:
+                    return {"status": "error", "message": "This VIP Key has expired. Please renew for ₹199."}
+            except:
+                pass
+        return {"status": "error", "message": "This key has already been activated on another device!"}
+
+    # Case 2: Fresh Key Activation (Strict 30 Days)
+    activation_time = now_dt
+    expiry_time = activation_time + timedelta(days=30)
+
+    record["used"] = True
+    record["device_id"] = device_id if device_id else f"DEV_{int(time.time())}"
+    record["activated_at"] = activation_time.isoformat() + "Z"
+    record["expires_at"] = expiry_time.isoformat() + "Z"
+
+    # Case 3: Referral Bonus Engine (+10 Days for Referrer)
+    if referral_code and referral_code in keys_db and referral_code != key:
+        ref_record = keys_db[referral_code]
+        if ref_record["used"] and ref_record["expires_at"]:
+            try:
+                ref_exp = datetime.fromisoformat(ref_record["expires_at"].replace("Z", ""))
+                base_time = ref_exp if ref_exp > now_dt else now_dt
+                new_ref_exp = base_time + timedelta(days=10)
+                ref_record["expires_at"] = new_ref_exp.isoformat() + "Z"
+                ref_record["referral_count"] = ref_record.get("referral_count", 0) + 1
+                add_log(f"🎁 REFERRAL REWARD: 10 extra days added to referrer key [{referral_code}]!")
+            except Exception as ex:
+                add_log(f"⚠️ Referral extension error: {str(ex)[:30]}")
+
+    save_keys_database()
+    add_log(f"👑 VIP KEY ACTIVATED: [{key}] unlocked for 30 days on device [{record['device_id'][:10]}...].")
+    
+    return {
+        "status": "success",
+        "message": "VIP Key verified successfully! 30-Day access granted.",
+        "expires_at": record["expires_at"]
+    }
+
 # 🌐 UNIVERSAL MARKET DATA FEED
 def fetch_active_exchange_markets():
     broker = bot_state.get("active_broker", "paper")
     quote = bot_state.get("quote_currency", "USDT").upper()
     
-    # 1. CoinDCX Active (Supports INR and USDT directly)
     if broker == "coindcx":
         try:
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
@@ -142,7 +265,6 @@ def fetch_active_exchange_markets():
             add_log(f"⚠️ CoinDCX Feed Error: {str(e)[:30]}")
             return []
 
-    # 2. CCXT Exchanges (Binance, Bybit etc.)
     elif broker in ccxt.exchanges:
         try:
             exchange_class = getattr(ccxt, broker)
@@ -173,7 +295,6 @@ def fetch_active_exchange_markets():
         except Exception as e:
             add_log(f"⚠️ {broker.upper()} Feed Error: {str(e)[:30]}")
 
-    # 3. Default / Paper Trading Mode
     if quote == "INR":
         try:
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
@@ -274,7 +395,7 @@ def execute_coindcx_sell(symbol, quantity=0):
     try:
         clean_coin = symbol.replace("USDT", "").replace("INR", "").replace("/", "").replace("B-", "").replace("I-", "").replace("_", "").upper()
         
-        # 1. LIVE WALLET AUDIT: Check actual available balance after fee deduction
+        # Live wallet balance check to handle fee deduction
         timeStamp = int(round(time.time() * 1000))
         bal_body = json.dumps({"timestamp": timeStamp}, separators=(',', ':'))
         bal_sig = hmac.new(secret_key.encode('utf-8'), bal_body.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -301,7 +422,6 @@ def execute_coindcx_sell(symbol, quantity=0):
             add_log(f"⚠️ Sell Skipped: 0 {clean_coin} balance on CoinDCX!")
             return False, f"Zero {clean_coin} in wallet"
 
-        # 2. Match Market Pair
         ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
         tickers = ticker_res.json()
         target_market = f"I-{clean_coin}_INR" if quote == "INR" else f"B-{clean_coin}_USDT"
@@ -314,7 +434,6 @@ def execute_coindcx_sell(symbol, quantity=0):
                 target_market = m
                 break
 
-        # 3. Fire Real Order to CoinDCX
         time_stamp = int(round(time.time() * 1000))
         order_body = {
             "side": "sell",
@@ -330,7 +449,6 @@ def execute_coindcx_sell(symbol, quantity=0):
         res = requests.post("https://api.coindcx.com/exchange/v1/orders/create", data=json_order, headers=headers, timeout=10)
         res_data = res.json()
 
-        # 4. Strict Validation: Confirm exchange order receipt
         if res.status_code == 200 and ("orders" in res_data or "id" in res_data or isinstance(res_data, list)):
             add_log(f"📤 REAL EXIT SUCCESS: Sold {sell_qty} {clean_coin} on CoinDCX ({target_market})")
             return True, res_data
@@ -509,7 +627,6 @@ async def close_trade(request: Request):
         return {"status": "error", "message": "Trade not found!"}
         
     try:
-        # AGAR COINDCX HAI: Pehle live exchange sell verify karo
         if bot_state.get("active_broker") == "coindcx":
             sold, msg = execute_coindcx_sell(trade_to_close.get("symbol", "DOGEUSDT"), trade_to_close.get("quantity", 0))
             if not sold:
@@ -602,7 +719,6 @@ async def market_scanner_loop():
                 for trade in trades_to_close:
                     exit_p = live_prices[trade["symbol"]]
                     
-                    # Live CoinDCX Exit
                     if bot_state.get("active_broker") == "coindcx":
                         execute_coindcx_sell(trade.get("symbol", "DOGEUSDT"), trade.get("quantity", 0))
 
@@ -626,7 +742,7 @@ async def market_scanner_loop():
                 
                 save_memory()
 
-                # Scanner Auto Trigger (Single trade lock during test phase)
+                # Scanner Auto Trigger
                 if len(bot_state["active_trades"]) < 1:
                     order_amount = bot_state["trade_amount"]
                     quote = bot_state.get("quote_currency", "USDT")
@@ -640,7 +756,6 @@ async def market_scanner_loop():
                         coin_sym = target_coin['symbol']
                         current_p = target_coin['price']
 
-                        # CoinDCX Real Order Trigger
                         if bot_state["active_broker"] == "coindcx":
                             success, buy_price, buy_qty, res = execute_coindcx_buy(coin_sym, order_amount)
                             if success:
@@ -699,7 +814,8 @@ def root():
         "status": "HiTech AI Engine Live!", 
         "broker": bot_state["active_broker"], 
         "currency": bot_state["quote_currency"],
-        "symbol": get_curr_symbol()
+        "symbol": get_curr_symbol(),
+        "total_vip_keys": len(keys_db)
     }
 
 if __name__ == "__main__":
