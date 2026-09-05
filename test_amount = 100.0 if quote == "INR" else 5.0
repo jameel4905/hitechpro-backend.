@@ -15,11 +15,11 @@ app.add_middleware(
 
 bot_state = {
     "is_running": False,
-    "active_broker": "paper",   # 'paper' ya 'coindcx'
+    "active_broker": "paper",
     "api_key": "",
     "secret_key": "",
-    "quote_currency": "USDT",   # 'USDT' ya 'INR'
-    "trade_amount": 5.0,         # USDT mein $5 ya INR mein ₹500
+    "quote_currency": "USDT",
+    "trade_amount": 5.0,
     "trade_type": "intraday", 
     "strategy": "volume",
     "logs": ["🤖 Master AI Engine Initialized. VIP Security & Live Execution Ready."],
@@ -33,7 +33,6 @@ bot_state = {
 DATA_FILE = "bot_data.json"
 KEYS_DB_FILE = "keys_db.json"
 
-# 👑 MASTER LIST OF VIP ACTIVATION KEYS (SINGLE-USE & DEVICE-BOUND)
 MASTER_VIP_KEYS = [
     "Ttyux7837", "yyuxv9990", "zazoz7689", "wqxxb8112", "ddrxz9099", "ssolp0112",
     "dxxct8900", "vvvst6090", "topct4562", "jamrt2189", "bcjoz0445", "savvc3188",
@@ -65,8 +64,6 @@ def load_keys_database():
                 keys_db = json.load(f)
         except:
             keys_db = {}
-    
-    # Initialize unseeded keys
     for k in MASTER_VIP_KEYS:
         clean_k = k.strip()
         if clean_k not in keys_db:
@@ -158,7 +155,6 @@ def check_midnight_settlement():
         add_log(f"🏦 Midnight Settlement: {curr_sym}{settled_amount} moved to Wallet.")
         save_memory()
 
-# 🔑 VIP SUBSCRIPTION VERIFICATION (30-DAY + DEVICE LOCK + REFERRAL ENGINE)
 @app.post("/api/verify-vip-key")
 async def verify_vip_key(request: Request):
     data = await request.json()
@@ -175,7 +171,6 @@ async def verify_vip_key(request: Request):
     record = keys_db[key]
     now_dt = datetime.utcnow()
 
-    # Case 1: Key already used previously
     if record["used"]:
         if record["device_id"] == device_id:
             try:
@@ -193,7 +188,6 @@ async def verify_vip_key(request: Request):
                 pass
         return {"status": "error", "message": "This key has already been activated on another device!"}
 
-    # Case 2: Fresh Key Activation (Strict 30 Days)
     activation_time = now_dt
     expiry_time = activation_time + timedelta(days=30)
 
@@ -202,7 +196,6 @@ async def verify_vip_key(request: Request):
     record["activated_at"] = activation_time.isoformat() + "Z"
     record["expires_at"] = expiry_time.isoformat() + "Z"
 
-    # Case 3: Referral Bonus Engine (+10 Days for Referrer)
     if referral_code and referral_code in keys_db and referral_code != key:
         ref_record = keys_db[referral_code]
         if ref_record["used"] and ref_record["expires_at"]:
@@ -225,7 +218,6 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# 🌐 UNIVERSAL MARKET DATA FEED
 def fetch_active_exchange_markets():
     broker = bot_state.get("active_broker", "paper")
     quote = bot_state.get("quote_currency", "USDT").upper()
@@ -321,7 +313,6 @@ def fetch_active_exchange_markets():
     except:
         return []
 
-# 🔥 REAL BUY ENGINE (COINDCX DUAL MARKET SUPPORT + STRICT > 100 INR PROTECTION)
 def execute_coindcx_buy(symbol, target_amount=5.0):
     api_key = bot_state.get("api_key", "").strip()
     secret_key = bot_state.get("secret_key", "").strip()
@@ -355,7 +346,6 @@ def execute_coindcx_buy(symbol, target_amount=5.0):
         calc_qty = target_amount / current_price
         quantity = int(round(calc_qty)) if clean_coin in ["DOGE", "TRX", "SHIB"] else round(calc_qty, 3)
         
-        # Ensure CoinDCX rule: order value must strictly exceed ₹100 INR
         if quote == "INR" and (quantity * current_price) <= 102.0:
             quantity += 1
             
@@ -386,7 +376,6 @@ def execute_coindcx_buy(symbol, target_amount=5.0):
     except Exception as e:
         return False, 0, 0, str(e)
 
-# 🔥 BULLETPROOF REAL SELL ENGINE (WITH ZERO-BALANCE AUTO-RESOLVE)
 def execute_coindcx_sell(symbol, quantity=0):
     api_key = bot_state.get("api_key", "").strip()
     secret_key = bot_state.get("secret_key", "").strip()
@@ -399,7 +388,6 @@ def execute_coindcx_sell(symbol, quantity=0):
     try:
         clean_coin = symbol.replace("USDT", "").replace("INR", "").replace("/", "").replace("B-", "").replace("I-", "").replace("_", "").upper()
         
-        # Live wallet balance check to handle fee deduction
         timeStamp = int(round(time.time() * 1000))
         bal_body = json.dumps({"timestamp": timeStamp}, separators=(',', ':'))
         bal_sig = hmac.new(secret_key.encode('utf-8'), bal_body.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -422,7 +410,6 @@ def execute_coindcx_sell(symbol, quantity=0):
         else:
             sell_qty = round(sell_qty, 3)
 
-        # Fix: If exchange balance is zero, gracefully clear position without locking user
         if sell_qty <= 0:
             add_log(f"⚠️ Sell Notice: 0 {clean_coin} on CoinDCX. Clearing local position.")
             return True, f"Cleared local position (0 {clean_coin} in wallet)"
@@ -466,7 +453,6 @@ def execute_coindcx_sell(symbol, quantity=0):
         add_log(f"❌ Sell Exception: {str(e)[:35]}")
         return False, str(e)
 
-# 🔄 DYNAMIC BROKER MODE SWITCH ENDPOINT (Real vs Paper)
 @app.post("/api/set-broker-mode")
 async def set_broker_mode(request: Request):
     data = await request.json()
@@ -483,7 +469,6 @@ async def set_broker_mode(request: Request):
     add_log(f"⚡ Broker Mode Switched to: {bot_state['active_broker'].upper()}")
     return {"status": "success", "active_broker": bot_state["active_broker"]}
 
-# 🔄 DYNAMIC CURRENCY SWITCH ENDPOINT (INR vs USDT)
 @app.post("/api/set-currency")
 async def set_currency(request: Request):
     data = await request.json()
@@ -616,7 +601,6 @@ async def bot_control(request: Request):
         add_log("🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
-# 🔥 CLOSE TRADE API WITH STRICT REAL EXECUTION HANDSHAKE
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -694,7 +678,6 @@ def get_trades():
         "today_pnl": bot_state["today_pnl"] 
     }
 
-# 🔄 SCANNER LOOP (DUAL CURRENCY & SMART AUTO EXECUTION)
 async def market_scanner_loop():
     while True:
         check_midnight_settlement() 
@@ -708,7 +691,6 @@ async def market_scanner_loop():
 
                 live_prices = {c['symbol']: c['price'] for c in all_coins}
                 
-                # Active Trades TSL Check
                 trades_to_close = []
                 for trade in bot_state["active_trades"]:
                     sym = trade["symbol"]
@@ -747,7 +729,6 @@ async def market_scanner_loop():
                 
                 save_memory()
 
-                # Scanner Auto Trigger
                 if len(bot_state["active_trades"]) < 1:
                     order_amount = bot_state["trade_amount"]
                     quote = bot_state.get("quote_currency", "USDT")
