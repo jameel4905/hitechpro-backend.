@@ -562,7 +562,7 @@ async def test_coindcx_order(request: Request):
         save_memory()
 
         quote = bot_state.get("quote_currency", "USDT")
-        test_amount = 100.0 if quote == "INR" else 5.0
+        test_amount = 115.0 if quote == "INR" else 5.0
         success, price, qty, res = execute_coindcx_buy(f"DOGE{quote}", test_amount)
         curr_sym = get_curr_symbol()
 
