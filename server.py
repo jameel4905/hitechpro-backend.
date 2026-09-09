@@ -493,6 +493,25 @@ async def direct_sell(request: Request):
         return {"status": "error", "message": f"Server Error: {str(e)}"}
 
 @app.post("/api/execute-order")
+# /api/execute-order ke andar:
+sl_pct = float(data.get("sl_percent", 2.0)) / 100.0
+target_pct = float(data.get("target_percent", 1.5)) / 100.0
+
+# Trade create karte waqt:
+new_trade = {
+    "id": int(time.time()),
+    "symbol": symbol,
+    "currency": currency,
+    "type": "LONG" if side == "buy" else "SHORT",
+    "entry_price": price,
+    "quantity": qty,
+    "amount": round(qty * price, 2),
+    "highest_price": price,
+    "lowest_price": price,
+    "sl_price": price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct),
+    "target_price": price * (1.0 + target_pct) if side == "buy" else price * (1.0 - target_pct),
+    "time": get_global_time()
+}
 async def execute_order(request: Request):
     try:
         data = await request.json()
