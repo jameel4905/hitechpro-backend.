@@ -44,6 +44,9 @@ def get_user_session(device_id: str):
             "trade_history": [],    
             "paper_balance": 500000.0,
             "today_pnl": 0.0, 
+            "session_start_fund": 744.0,  # Starting Capital Baseline
+            "sleep_until": None,          # 12-Hour Cooldown Timestamp
+            "sleep_reason": "",
             "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d")
         }
     return user_sessions[device_id]
@@ -281,7 +284,7 @@ def fetch_active_exchange_markets(state):
     except:
         return []
 
-# 🔥 DUAL COINDCX ORDER EXECUTOR (STRICT PRECISION & CURRENCY RULES)
+# 🔥 DUAL COINDCX ORDER EXECUTOR (WITH EXACT PRECISION MAP)
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
@@ -361,13 +364,12 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
             else:
                 quantity = round(calc_qty, precision)
 
-        # Minimum order value safe check (CoinDCX minimum order rule)
+        # Minimum order value safe check
         if quote == "INR" and (quantity * current_price) < 102.0:
             if precision == 0:
                 quantity = int(round(115.0 / current_price)) + 1
             else:
                 quantity = round(115.0 / current_price, precision)
-                # Extra check in case rounding dropped it below threshold
                 if (quantity * current_price) < 100.0:
                     quantity += round(1.0 / (10 ** precision), precision)
 
@@ -405,7 +407,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
 def execute_coindcx_sell(state, symbol, quantity=0):
     return execute_coindcx_order(state, symbol, side="sell", exact_qty=quantity)
 
-# 🚀 UNIVERSAL ORDER EXECUTION ENDPOINT (CALLED BY MOBILE APP)
+# 🚀 UNIVERSAL ORDER EXECUTION ENDPOINT
 @app.post("/api/execute-order")
 async def execute_order(request: Request):
     try:
@@ -429,7 +431,7 @@ async def execute_order(request: Request):
 
         curr_sym = get_curr_symbol(state)
 
-        # 1. Real CoinDCX Execution
+        # Real CoinDCX Execution
         if exchange == "coindcx":
             success, price, qty, res = execute_coindcx_order(state, symbol, side=side, target_amount=amount)
             if success:
@@ -453,7 +455,7 @@ async def execute_order(request: Request):
                 add_log(state, f"❌ CoinDCX Rejected: {res}")
                 return {"status": "error", "message": str(res)}
 
-        # 2. Paper Trading Simulation
+        # Paper Trading Simulation
         else:
             markets = fetch_active_exchange_markets(state)
             clean_coin = symbol.replace("INR", "").replace("USDT", "")
@@ -546,7 +548,10 @@ async def connect_exchange(request: Request):
             res_data = res.json()
             if isinstance(res_data, list):
                 dynamic_balances = {item.get("currency"): round(float(item.get("balance", 0.0)), 5) for item in res_data if float(item.get("balance", 0.0)) > 0.00001}
-                add_log(state, "🔗 Connected to CoinDCX Direct API.")
+                # Sync session start fund with live balance
+                inr_bal = dynamic_balances.get("INR", 744.0)
+                state["session_start_fund"] = inr_bal if state["quote_currency"] == "INR" else dynamic_balances.get("USDT", 8.31)
+                add_log(state, f"🔗 Connected to CoinDCX! Live Baseline: {get_curr_symbol(state)}{state['session_start_fund']}")
                 return {"status": "success", "message": "Connected to CoinDCX!", "balances": dynamic_balances}
             else:
                 return {"status": "error", "message": "CoinDCX Key Invalid!"}
@@ -566,6 +571,12 @@ async def bot_control(request: Request):
     state = get_user_session(data.get("device_id", ""))
     action = data.get("action")
     if action == "start":
+        # Check if 12h cooldown is active
+        now_ts = time.time()
+        if state.get("sleep_until") and now_ts < state["sleep_until"]:
+            hrs_left = round((state["sleep_until"] - now_ts) / 3600, 1)
+            return {"status": "error", "message": f"Bot is in 12-Hour Cooldown Mode ({state['sleep_reason']}). {hrs_left}h remaining!"}
+
         state["is_running"] = True
         if "currency" in data: state["quote_currency"] = data["currency"].upper()
         if "amount" in data: state["trade_amount"] = float(data["amount"])
@@ -573,7 +584,7 @@ async def bot_control(request: Request):
         if "deal_condition" in data: state["deal_condition"] = data["deal_condition"]
         
         curr_sym = get_curr_symbol(state)
-        add_log(state, f"🚀 BOT STARTED | Mode: {state['market_mode'].upper()} | Broker: {state['active_broker'].upper()} | Pair Quote: {state['quote_currency']} | Lot: {curr_sym}{state['trade_amount']}")
+        add_log(state, f"🚀 BOT STARTED | Mode: {state['market_mode'].upper()} | Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
         state["is_running"] = False
@@ -614,9 +625,8 @@ async def close_trade(request: Request):
         trade_to_close["exit_price"] = exit_price
         trade_to_close["close_time"] = get_global_time()
         
-        if state["active_broker"] == "paper":
-            state["today_pnl"] += trade_to_close["pnl_val"]
-            state["today_pnl"] = round(state["today_pnl"], 2)
+        state["today_pnl"] += trade_to_close["pnl_val"]
+        state["today_pnl"] = round(state["today_pnl"], 2)
 
         state["active_trades"].remove(trade_to_close)
         state["trade_history"].insert(0, trade_to_close)
@@ -630,9 +640,14 @@ async def close_trade(request: Request):
 @app.get("/api/bot-logs")
 def get_bot_logs(device_id: str = ""):
     state = get_user_session(device_id)
+    now_ts = time.time()
+    is_sleeping = bool(state.get("sleep_until") and now_ts < state["sleep_until"])
+    sleep_left_h = round((state["sleep_until"] - now_ts) / 3600, 1) if is_sleeping else 0
     return {
         "status": "success", 
         "is_running": state["is_running"], 
+        "is_sleeping": is_sleeping,
+        "sleep_hours_left": sleep_left_h,
         "market_mode": state["market_mode"],
         "logs": state["logs"],
         "active_broker": state["active_broker"],
@@ -655,13 +670,48 @@ def get_trades(device_id: str = ""):
         "today_pnl": state["today_pnl"] 
     }
 
-# 🔄 DUAL HYBRID SCANNER (DIP-HUNT & REAL DEAL EXECUTION)
+# 🔄 DUAL HYBRID SCANNER WITH 12-HOUR SLEEP ENGINE (+15% / -10%)
 async def market_scanner_loop():
     while True:
         try:
+            now_ts = time.time()
             for dev_id, state in list(user_sessions.items()):
                 check_midnight_settlement(state) 
                 
+                # 🛑 12-HOUR COOLDOWN ENGINE CHECK
+                if state.get("sleep_until"):
+                    if now_ts < state["sleep_until"]:
+                        # Bot is currently in 12h sleep mode, skip scanning
+                        continue
+                    else:
+                        # 12h cooldown elapsed, wake up!
+                        state["sleep_until"] = None
+                        state["sleep_reason"] = ""
+                        state["today_pnl"] = 0.0
+                        state["is_running"] = True
+                        add_log(state, "⏰ 12-Hour Cooldown Completed! Bot Engine Resumed.")
+
+                # 🛡️ CAPITAL PROTECTION CIRCUIT BREAKER (+15% Profit OR -10% Loss)
+                base_fund = state.get("session_start_fund", 744.0)
+                if base_fund > 0:
+                    profit_limit_15 = base_fund * 0.15
+                    loss_limit_10 = -(base_fund * 0.10)
+                    curr_sym = get_curr_symbol(state)
+
+                    if state["today_pnl"] >= profit_limit_15:
+                        state["is_running"] = False
+                        state["sleep_until"] = now_ts + (12 * 3600)  # 12 Hours
+                        state["sleep_reason"] = f"+15% Target Hit ({curr_sym}{state['today_pnl']})"
+                        add_log(state, f"🎉 15% PROFIT TARGET HIT (+{curr_sym}{state['today_pnl']})! Bot Sleeping for 12 Hours to protect gains.")
+                        continue
+
+                    elif state["today_pnl"] <= loss_limit_10:
+                        state["is_running"] = False
+                        state["sleep_until"] = now_ts + (12 * 3600)  # 12 Hours
+                        state["sleep_reason"] = f"-10% Loss Shield ({curr_sym}{state['today_pnl']})"
+                        add_log(state, f"🛡️ 10% LOSS SHIELD TRIGGERED ({curr_sym}{state['today_pnl']})! Bot Sleeping for 12 Hours to protect capital.")
+                        continue
+
                 if state["is_running"]:
                     all_coins = fetch_active_exchange_markets(state)
                     if not all_coins:
@@ -669,7 +719,7 @@ async def market_scanner_loop():
 
                     live_prices = {c['symbol']: c['price'] for c in all_coins}
                     
-                    # 1. Trailing Stop Loss Monitor
+                    # 1. Trailing Stop Loss & Target Monitor
                     trades_to_close = []
                     for trade in state["active_trades"]:
                         sym = trade["symbol"]
@@ -704,9 +754,8 @@ async def market_scanner_loop():
                         trade["exit_price"] = exit_p
                         trade["close_time"] = get_global_time()
                         
-                        if state["active_broker"] == "paper":
-                            state["today_pnl"] += trade["pnl_val"]
-                            state["today_pnl"] = round(state["today_pnl"], 2)
+                        state["today_pnl"] += trade["pnl_val"]
+                        state["today_pnl"] = round(state["today_pnl"], 2)
 
                         if trade in state["active_trades"]:
                             state["active_trades"].remove(trade)
