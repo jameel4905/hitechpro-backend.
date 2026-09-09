@@ -30,12 +30,12 @@ def get_user_session(device_id: str):
     if device_id not in user_sessions:
         user_sessions[device_id] = {
             "is_running": False,
-            "active_broker": "coindcx",  # Default to coindcx
-            "market_mode": "spot",       # 'spot' ya 'futures'
+            "active_broker": "coindcx",
+            "market_mode": "spot",
             "api_key": "",
             "secret_key": "",
-            "quote_currency": "INR",     # Default to INR
-            "trade_amount": 500.0,       # Default INR lot
+            "quote_currency": "INR",
+            "trade_amount": 500.0,
             "trade_type": "intraday", 
             "strategy": "volume",
             "deal_condition": "ASAP",
@@ -198,8 +198,6 @@ def fetch_active_exchange_markets(state):
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
             data = res.json()
             market_list = []
-            
-            # Curated liquid INR and USDT coins to prevent delisted/dormant coins
             liquid_bases = ["BTC", "ETH", "SOL", "DOGE", "SHIB", "XRP", "ADA", "MATIC", "TRX", "PEPE", "LTC", "NEAR", "SUI"]
             
             for item in data:
@@ -212,7 +210,6 @@ def fetch_active_exchange_markets(state):
 
                 clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
                 
-                # Agar user INR par hai toh sirf pure INR pairs allow karo
                 if quote == "INR" and (m.endswith("_INR") or m.endswith("INR")) and not ("USDT" in m):
                     if clean_coin in liquid_bases or vol > 100:
                         market_list.append({
@@ -223,7 +220,6 @@ def fetch_active_exchange_markets(state):
                             "volume": vol,
                             "change": change
                         })
-                # Agar user USDT par hai toh USDT pairs allow karo
                 elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
                     if clean_coin in liquid_bases or vol > 1000:
                         market_list.append({
@@ -240,7 +236,6 @@ def fetch_active_exchange_markets(state):
         except Exception as e:
             pass
 
-    # CCXT Fallback
     if broker in ccxt.exchanges:
         try:
             exchange_class = getattr(ccxt, broker)
@@ -264,7 +259,6 @@ def fetch_active_exchange_markets(state):
         except Exception as e:
             pass
 
-    # Global Binance Fallback (USDT)
     try:
         res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=8)
         data = res.json()
@@ -287,7 +281,7 @@ def fetch_active_exchange_markets(state):
     except:
         return []
 
-# 🔥 DUAL COINDCX ORDER EXECUTOR (STRICT INR & USDT RESOLUTION)
+# 🔥 DUAL COINDCX ORDER EXECUTOR (STRICT PRECISION & CURRENCY RULES)
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
@@ -307,11 +301,9 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         target_market = None
         current_price = 0.0
 
-        # Strict Matching: User INR par hai toh sirf INR pair do, USDT par hai toh USDT do
         for t in tickers:
             m = t.get('market', '')
             if quote == "INR":
-                # CoinDCX Spot INR formats: "BTCINR" ya "I-BTC_INR"
                 if m == f"{clean_coin}INR" or m == f"I-{clean_coin}_INR":
                     target_market = m
                     current_price = float(t.get('last_price', 0.0))
@@ -322,7 +314,6 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
                     current_price = float(t.get('last_price', 0.0))
                     break
 
-        # Agar specific pair nahi mila toh popular coin par fallback karo
         if not target_market or current_price <= 0:
             clean_coin = "DOGE"
             for t in tickers:
@@ -339,27 +330,49 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         if current_price <= 0:
             return False, 0, 0, f"No live price for {clean_coin} ({quote})"
 
-        # Quantity calculation with precision safety
+        # 🎯 COINDCX EXACT PRECISION MAP
+        precision = 2
+        if "BTC" in clean_coin:
+            precision = 5  # Strictly 5 decimals for BTC
+        elif "ETH" in clean_coin:
+            precision = 4
+        elif any(c in clean_coin for c in ["SOL", "BNB", "LTC", "AVAX"]):
+            precision = 2
+        elif any(c in clean_coin for c in ["DOGE", "XRP", "ADA", "TRX", "MATIC"]):
+            precision = 1 if current_price > 10 else 0
+        elif any(c in clean_coin for c in ["SHIB", "PEPE", "BONK", "FLOKI"]):
+            precision = 0
+        else:
+            if current_price < 20:
+                precision = 0
+            elif current_price < 1000:
+                precision = 2
+            else:
+                precision = 4
+
         if exact_qty > 0:
-            quantity = exact_qty
+            quantity = exact_qty if precision == 0 else round(exact_qty, precision)
+            if precision == 0: quantity = int(round(quantity))
         else:
             calc_qty = float(target_amount) / current_price
-            if current_price < 20:
+            if precision == 0:
                 quantity = int(round(calc_qty))
-            elif current_price < 1000:
-                quantity = round(calc_qty, 2)
+                if quantity <= 0: quantity = 1
             else:
-                quantity = round(calc_qty, 6)
+                quantity = round(calc_qty, precision)
 
-        # CoinDCX minimum value rules
+        # Minimum order value safe check (CoinDCX minimum order rule)
         if quote == "INR" and (quantity * current_price) < 102.0:
-            if current_price < 20:
-                quantity += 1
+            if precision == 0:
+                quantity = int(round(115.0 / current_price)) + 1
             else:
-                quantity = round(115.0 / current_price, 6 if current_price > 1000 else 2)
+                quantity = round(115.0 / current_price, precision)
+                # Extra check in case rounding dropped it below threshold
+                if (quantity * current_price) < 100.0:
+                    quantity += round(1.0 / (10 ** precision), precision)
 
         if quantity <= 0:
-            quantity = 1
+            quantity = 1 if precision == 0 else round(1.0 / (10 ** precision), precision)
 
         time_stamp = int(round(time.time() * 1000))
         body = {
@@ -392,7 +405,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
 def execute_coindcx_sell(state, symbol, quantity=0):
     return execute_coindcx_order(state, symbol, side="sell", exact_qty=quantity)
 
-# 🚀 NEW UNIVERSAL ORDER EXECUTION ENDPOINT (CALLED BY MOBILE APP)
+# 🚀 UNIVERSAL ORDER EXECUTION ENDPOINT (CALLED BY MOBILE APP)
 @app.post("/api/execute-order")
 async def execute_order(request: Request):
     try:
