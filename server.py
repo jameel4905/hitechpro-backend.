@@ -397,7 +397,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
     except Exception as e:
         return False, 0, 0, str(e)
 
-# 🚀 100% BULLETPROOF DIRECT SELL ENDPOINT (FOR ASSET EXIT BUTTON)
+# 🚀 100% DIRECT COIN SELL ENDPOINT (FOR ASSET EXIT BUTTON)
 @app.post("/api/direct-sell")
 async def direct_sell(request: Request):
     try:
@@ -493,25 +493,6 @@ async def direct_sell(request: Request):
         return {"status": "error", "message": f"Server Error: {str(e)}"}
 
 @app.post("/api/execute-order")
-# /api/execute-order ke andar:
-sl_pct = float(data.get("sl_percent", 2.0)) / 100.0
-target_pct = float(data.get("target_percent", 1.5)) / 100.0
-
-# Trade create karte waqt:
-new_trade = {
-    "id": int(time.time()),
-    "symbol": symbol,
-    "currency": currency,
-    "type": "LONG" if side == "buy" else "SHORT",
-    "entry_price": price,
-    "quantity": qty,
-    "amount": round(qty * price, 2),
-    "highest_price": price,
-    "lowest_price": price,
-    "sl_price": price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct),
-    "target_price": price * (1.0 + target_pct) if side == "buy" else price * (1.0 - target_pct),
-    "time": get_global_time()
-}
 async def execute_order(request: Request):
     try:
         data = await request.json()
@@ -525,6 +506,10 @@ async def execute_order(request: Request):
         amount = float(data.get("amount", state.get("trade_amount", 500)))
         side = data.get("side", "BUY").lower()
         mode = data.get("mode", state.get("market_mode", "spot")).lower()
+
+        # Dynamic Stop Loss & Target calculation from frontend
+        sl_pct = float(data.get("sl_percent", 2.0)) / 100.0
+        target_pct = float(data.get("target_percent", 1.5)) / 100.0
 
         state["active_broker"] = exchange
         state["quote_currency"] = currency
@@ -547,7 +532,8 @@ async def execute_order(request: Request):
                     "amount": round(qty * price, 2),
                     "highest_price": price,
                     "lowest_price": price,
-                    "sl_price": price * 0.98 if side == "buy" else price * 1.02,
+                    "sl_price": price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct),
+                    "target_price": price * (1.0 + target_pct) if side == "buy" else price * (1.0 - target_pct),
                     "time": get_global_time()
                 }
                 state["active_trades"].insert(0, new_trade)
@@ -575,7 +561,8 @@ async def execute_order(request: Request):
                 "amount": amount,
                 "highest_price": sim_price,
                 "lowest_price": sim_price,
-                "sl_price": sim_price * 0.98 if side == "buy" else sim_price * 1.02,
+                "sl_price": sim_price * (1.0 - sl_pct) if side == "buy" else sim_price * (1.0 + sl_pct),
+                "target_price": sim_price * (1.0 + target_pct) if side == "buy" else sim_price * (1.0 - target_pct),
                 "time": get_global_time()
             }
             state["active_trades"].insert(0, new_trade)
@@ -697,7 +684,6 @@ async def close_trade(request: Request):
 
     trade_to_close = next((t for t in state["active_trades"] if t["id"] == trade_id), None)
     if not trade_to_close:
-        # Fallback: Agar ID match na ho toh direct sell trigger karo
         return await direct_sell(request)
 
     try:
@@ -817,17 +803,20 @@ async def market_scanner_loop():
                         sym = trade["symbol"]
                         if sym in live_prices:
                             curr_p = live_prices[sym]
+                            target_p = trade.get("target_price", trade["entry_price"] * 1.015)
+                            sl_p = trade.get("sl_price", trade["entry_price"] * 0.98)
+
                             if trade["type"] == "LONG":
                                 if curr_p > trade["highest_price"]:
                                     trade["highest_price"] = curr_p
                                     trade["sl_price"] = max(trade["sl_price"], curr_p * 0.98)
-                                if curr_p <= trade["sl_price"] or curr_p >= trade["entry_price"] * 1.015:
+                                if curr_p <= sl_p or curr_p >= target_p:
                                     trades_to_close.append(trade)
                             elif trade["type"] == "SHORT":
                                 if curr_p < trade["lowest_price"]:
                                     trade["lowest_price"] = curr_p
                                     trade["sl_price"] = min(trade["sl_price"], curr_p * 1.02)
-                                if curr_p >= trade["sl_price"] or curr_p <= trade["entry_price"] * 0.985:
+                                if curr_p >= sl_p or curr_p <= target_p:
                                     trades_to_close.append(trade)
 
                     for trade in trades_to_close:
@@ -886,6 +875,7 @@ async def market_scanner_loop():
                                         "highest_price": buy_price,
                                         "lowest_price": buy_price,
                                         "sl_price": buy_price * 0.98,
+                                        "target_price": buy_price * 1.015,
                                         "time": get_global_time()
                                     }
                                     state["active_trades"].insert(0, new_trade)
@@ -905,6 +895,7 @@ async def market_scanner_loop():
                                     "highest_price": current_p,
                                     "lowest_price": current_p,
                                     "sl_price": current_p * 0.98,
+                                    "target_price": current_p * 1.015,
                                     "time": get_global_time()
                                 }
                                 state["active_trades"].insert(0, new_trade)
