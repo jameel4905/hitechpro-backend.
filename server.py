@@ -278,7 +278,13 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# ----------------- MARKET SCANNER ENGINE -----------------
+# ----------------- TOP 30 LIQUID MARKET SCANNER ENGINE -----------------
+TOP_30_LIQUID_COINS = [
+    "BTC", "ETH", "SOL", "DOGE", "SHIB", "XRP", "ADA", "PEPE", "NEAR", "SUI", 
+    "AVAX", "LINK", "LTC", "TRX", "DOT", "MATIC", "BCH", "UNI", "APT", "ARB", 
+    "OP", "RENDER", "ICP", "FET", "INJ", "FIL", "TIA", "ATOM", "BONK", "FLOKI"
+]
+
 def fetch_active_exchange_markets(state):
     broker = state.get("active_broker", "coindcx")
     quote = state.get("quote_currency", "INR").upper()
@@ -288,7 +294,6 @@ def fetch_active_exchange_markets(state):
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
             data = res.json()
             market_list = []
-            liquid_bases = ["BTC", "ETH", "SOL", "DOGE", "SHIB", "XRP", "ADA", "MATIC", "TRX", "PEPE", "LTC", "NEAR", "SUI"]
 
             for item in data:
                 m = item.get("market", "")
@@ -301,7 +306,7 @@ def fetch_active_exchange_markets(state):
                 clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
 
                 if quote == "INR" and (m.endswith("_INR") or m.endswith("INR")) and not ("USDT" in m):
-                    if clean_coin in liquid_bases or vol > 100:
+                    if clean_coin in TOP_30_LIQUID_COINS or vol > 100:
                         market_list.append({
                             "symbol": clean_coin + "INR",
                             "base_coin": clean_coin,
@@ -311,7 +316,7 @@ def fetch_active_exchange_markets(state):
                             "change": change
                         })
                 elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
-                    if clean_coin in liquid_bases or vol > 1000:
+                    if clean_coin in TOP_30_LIQUID_COINS or vol > 1000:
                         market_list.append({
                             "symbol": clean_coin + "USDT",
                             "base_coin": clean_coin,
@@ -390,35 +395,7 @@ def get_coin_precision(clean_coin, current_price):
         else:
             return 4
 
-# ----------------- COINDCX LIVE POSITION SYNC -----------------
-def get_coindcx_live_portfolio(state):
-    api_key = state.get("api_key", "").strip()
-    secret_key = state.get("secret_key", "").strip()
-    if not api_key or not secret_key:
-        return []
-
-    try:
-        time_stamp = int(round(time.time() * 1000))
-        body = {"timestamp": time_stamp}
-        json_body = json.dumps(body, separators=(',', ':'))
-        signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-        headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
-        
-        res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=8)
-        data = res.json()
-        
-        holdings = []
-        if isinstance(data, list):
-            for item in data:
-                bal = float(item.get("balance", 0.0))
-                curr = item.get("currency", "").upper()
-                if curr not in ["INR", "USDT"] and bal > 0:
-                    holdings.append({"coin": curr, "balance": bal})
-        return holdings
-    except Exception:
-        return []
-
-# ----------------- ORDER EXECUTION (STRICT USER SYMBOL - NO BTC FALLBACK) -----------------
+# ----------------- ORDER EXECUTION (NO BTC FALLBACK) -----------------
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
@@ -450,7 +427,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
                     break
 
         if not target_market or current_price <= 0:
-            return False, 0, 0, f"Valid CoinDCX pair for '{clean_coin}' ({quote}) not found! Please check coin symbol."
+            return False, 0, 0, f"Valid CoinDCX pair for '{clean_coin}' ({quote}) not found! Please check symbol."
 
         precision = get_coin_precision(clean_coin, current_price)
 
@@ -543,7 +520,6 @@ async def direct_sell(request: Request):
                 "status": "MANUAL EXIT",
                 "close_time": get_global_time()
             }
-            # Save permanently to DB
             db_save_trade(sold_trade, device_id, state.get("active_broker", "coindcx"))
             add_log(state, f"✅ MANUAL EXIT FILLED: Sold {sell_qty} {coin} at ₹{current_price} on CoinDCX!")
             return {"status": "success", "message": f"Successfully Sold {sell_qty} {coin} on CoinDCX!"}
@@ -565,7 +541,6 @@ async def execute_order(request: Request):
         api_key = data.get("api_key", state.get("api_key", "")).strip()
         secret_key = data.get("secret_key", state.get("secret_key", "")).strip()
         
-        # User specified symbol or default
         symbol = data.get("symbol", "").upper().strip()
         if not symbol:
             symbol = "BTCINR" if state.get("quote_currency") == "INR" else "BTCUSDT"
@@ -739,7 +714,7 @@ async def bot_control(request: Request):
         if "target_coin" in data: state["selected_coin"] = data["target_coin"].upper()
 
         curr_sym = get_curr_symbol(state)
-        target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "Top Gainer Scanner"
+        target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "Top 30 Market Scanner"
         add_log(state, f"🚀 BOT STARTED | Target: {target_info} | Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
@@ -813,37 +788,15 @@ def get_bot_logs(device_id: str = "DEFAULT_DEVICE"):
         "trade_amount": state["trade_amount"]
     }
 
-# ----------------- GET TRADES WITH LIVE PORTFOLIO & DATABASE SYNC -----------------
+# ----------------- GET TRADES (SEPARATED FROM WALLET DUST) -----------------
 @app.get("/api/get-trades")
 def get_trades(device_id: str = "DEFAULT_DEVICE"):
     state = get_user_session(device_id)
 
-    # 1. CoinDCX Portfolio Direct Sync (Active Positions Bug Fix)
-    if state.get("active_broker") == "coindcx" and state.get("api_key"):
-        holdings = get_coindcx_live_portfolio(state)
-        existing_coins = [t["symbol"].replace("INR", "").replace("USDT", "") for t in state["active_trades"]]
-        
-        for h in holdings:
-            c = h["coin"]
-            if c not in existing_coins:
-                state["active_trades"].append({
-                    "id": int(time.time()),
-                    "symbol": f"{c}INR" if state["quote_currency"] == "INR" else f"{c}USDT",
-                    "currency": state["quote_currency"],
-                    "type": "LONG",
-                    "entry_price": 0.0,
-                    "quantity": h["balance"],
-                    "amount": 0.0,
-                    "highest_price": 0.0,
-                    "lowest_price": 0.0,
-                    "sl_price": 0.0,
-                    "target_price": 0.0,
-                    "time": get_global_time()
-                })
-
-    # 2. Permanent SQLite History Pull
+    # Permanent SQLite History Pull
     history_records = db_get_all_trades(device_id, limit=500)
 
+    # Active Trades strictly contains trades placed by BOT or USER (Zero Ghost Dust Holdings)
     return {
         "status": "success",
         "active": state["active_trades"],
@@ -951,7 +904,7 @@ async def market_scanner_loop():
                         db_save_trade(trade, dev_id, state.get("active_broker", "coindcx"))
                         add_log(state, f"🎯 DEAL CLOSED: {trade['type']} {trade['symbol']} | P&L: {trade['pnl_percent']}% ({trade['status']})")
 
-                    # NEW TRADE TRIGGER (STRICT SELECTION OR SCANNER)
+                    # NEW TRADE TRIGGER (STRICT 30-COIN SCANNER OR USER TARGET)
                     if len(state["active_trades"]) < 1:
                         valid = [c for c in all_coins if c['price'] > 0]
                         if valid:
