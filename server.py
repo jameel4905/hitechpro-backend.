@@ -125,6 +125,7 @@ def get_user_session(device_id: str):
             "secret_key": "",
             "quote_currency": "INR",
             "trade_amount": 500.0,
+            "max_trades": 1,
             "trade_type": "intraday",
             "strategy": "volume",
             "deal_condition": "ASAP",
@@ -394,6 +395,43 @@ def get_coin_precision(clean_coin, current_price):
         else:
             return 4
 
+# 🚀 REAL LIVE AVAILABLE CASH CHECK (PREVENTS INSUFFICIENT BALANCE REJECTIONS)
+def fetch_real_cash_balance(state):
+    broker = state.get("active_broker", "coindcx").lower()
+    api_key = state.get("api_key", "").strip()
+    secret_key = state.get("secret_key", "").strip()
+    quote = state.get("quote_currency", "INR").upper()
+
+    if broker == "paper":
+        return float(state.get("paper_balance", 500000.0))
+
+    if not api_key or not secret_key:
+        return 0.0
+
+    try:
+        if broker == "coindcx":
+            time_stamp = int(round(time.time() * 1000))
+            body = {"timestamp": time_stamp}
+            json_body = json.dumps(body, separators=(',', ':'))
+            signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+            headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
+            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=8)
+            res_data = res.json()
+            if isinstance(res_data, list):
+                for item in res_data:
+                    if item.get("currency", "").upper() == quote:
+                        return float(item.get("balance", 0.0))
+            return 0.0
+        else:
+            if hasattr(ccxt, broker):
+                exchange = getattr(ccxt, broker)({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+                balance = exchange.fetch_balance()
+                free_bals = balance.get('free', {})
+                return float(free_bals.get(quote, 0.0))
+            return 0.0
+    except Exception:
+        return 0.0
+
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
@@ -593,6 +631,13 @@ async def execute_order(request: Request):
 
         curr_sym = get_curr_symbol(state)
 
+        # Pre-execution Cash Check
+        available_cash = fetch_real_cash_balance(state)
+        if available_cash < amount:
+            msg = f"Insufficient Balance: Need {curr_sym}{amount}, Available {curr_sym}{available_cash:.2f}"
+            add_log(state, f"⚠️ {msg}")
+            return {"status": "error", "message": msg}
+
         if exchange == "paper":
             markets = fetch_active_exchange_markets(state)
             clean_coin = symbol.replace("INR", "").replace("USDT", "")
@@ -755,17 +800,18 @@ async def bot_control(request: Request):
         if "exchange" in data: state["active_broker"] = data["exchange"].lower()
         if "deal_condition" in data: state["deal_condition"] = data["deal_condition"]
         if "target_coin" in data: state["selected_coin"] = data["target_coin"].upper()
+        if "max_trades" in data: state["max_trades"] = int(data["max_trades"])
 
         curr_sym = get_curr_symbol(state)
         target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "High-Volume Breakout Scanner"
-        add_log(state, f"🚀 BOT STARTED | Target: {target_info} | Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']}")
+        add_log(state, f"🚀 BOT STARTED | Target: {target_info} | Slots: {state['max_trades']} | Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
         state["is_running"] = False
         add_log(state, "🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
-# 🚀 100% MATHEMATICALLY EXACT MANUAL DEAL CLOSER
+# 🚀 100% MATHEMATICALLY EXACT MANUAL DEAL CLOSER WITH STRICT VERIFICATION
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -780,6 +826,8 @@ async def close_trade(request: Request):
     try:
         side_to_exit = "sell" if trade_to_close["type"] in ["LONG", "BUY"] else "buy"
         broker = state.get("active_broker", "coindcx").lower()
+        sold = True
+        msg = ""
 
         if broker == "coindcx":
             sold, exit_price, _, msg = execute_coindcx_order(state, trade_to_close.get("symbol"), side=side_to_exit, exact_qty=trade_to_close.get("quantity", 0))
@@ -838,7 +886,8 @@ def get_bot_logs(device_id: str = "DEFAULT_DEVICE"):
         "active_broker": state["active_broker"],
         "quote_currency": state["quote_currency"],
         "currency_symbol": get_curr_symbol(state),
-        "trade_amount": state["trade_amount"]
+        "trade_amount": state["trade_amount"],
+        "max_trades": state.get("max_trades", 1)
     }
 
 @app.get("/api/get-trades")
@@ -856,7 +905,7 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "today_pnl": state["today_pnl"]
     }
 
-# 🚀 HIGH-VOLUME BREAKOUT SCANNER & CONTINUOUS TRAILING STOP ENGINE
+# 🚀 HIGH-VOLUME BREAKOUT SCANNER, LOW BALANCE PROTECTION & STRICT CONFIRMATION ENGINE
 async def market_scanner_loop():
     while True:
         try:
@@ -911,7 +960,6 @@ async def market_scanner_loop():
                             sl_p = trade.get("sl_price", trade["entry_price"] * 0.98)
 
                             if trade["type"] in ["LONG", "BUY"]:
-                                # Target chahe 1.5% ho ya 5.5%, SL price ke sath trailing upar karta rahega
                                 if curr_p > trade.get("highest_price", trade["entry_price"]):
                                     trade["highest_price"] = curr_p
                                     trade["sl_price"] = max(trade["sl_price"], curr_p * 0.98)
@@ -926,15 +974,30 @@ async def market_scanner_loop():
                                     trade["close_reason"] = "TARGET HIT" if curr_p <= target_p else "TRAILING SL HIT"
                                     trades_to_close.append(trade)
 
+                    # 🛑 CRITICAL FIX: Sell Fail hone par active trades se delete nahi hoga (Zero Ghost Coins)
                     for trade in trades_to_close:
                         exit_p = live_prices.get(trade["symbol"], trade["entry_price"])
                         side_to_exit = "sell" if trade["type"] in ["LONG", "BUY"] else "buy"
                         broker = state.get("active_broker", "coindcx").lower()
+                        sell_success = True
+                        msg = ""
 
                         if broker == "coindcx":
-                            execute_coindcx_order(state, trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0))
+                            sell_success, live_exit_price, _, msg = execute_coindcx_order(
+                                state, trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0)
+                            )
+                            if live_exit_price > 0:
+                                exit_p = live_exit_price
                         elif broker != "paper":
-                            execute_ccxt_order(state, trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0))
+                            sell_success, live_exit_price, _, msg = execute_ccxt_order(
+                                state, trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0)
+                            )
+                            if live_exit_price > 0:
+                                exit_p = live_exit_price
+
+                        if not sell_success:
+                            add_log(state, f"⚠️ EXIT REJECTED on {broker.upper()}: {msg}. Retrying position exit next cycle...")
+                            continue
 
                         entry = float(trade.get("entry_price", 1.0))
                         qty = float(trade.get("quantity", 0.0))
@@ -963,8 +1026,18 @@ async def market_scanner_loop():
                         db_save_trade(trade, dev_id, broker)
                         add_log(state, f"🎯 DEAL CLOSED: {trade['type']} {trade['symbol']} | P&L: {trade['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade['pnl_val']}) [{trade['status']}]")
 
-                    # 🚀 HIGH-VOLUME BREAKOUT SCANNER (Fresh +2.5% to +8.5% with Liquidity Check)
-                    if len(state["active_trades"]) < 1:
+                    # 🚀 SLOTS & LOW-BALANCE SAFE SCANNER
+                    allowed_slots = int(state.get("max_trades", 1))
+                    if len(state["active_trades"]) < allowed_slots:
+                        order_amount = float(state.get("trade_amount", 500.0))
+                        curr_sym = get_curr_symbol(state)
+
+                        # Check actual available liquid cash before triggering new trade
+                        available_cash = fetch_real_cash_balance(state)
+                        if available_cash < order_amount:
+                            # Do not take trade, only keep scanning
+                            continue
+
                         valid = [c for c in all_coins if c.get('price', 0) > 0]
                         if valid:
                             selected = state.get("selected_coin", "AUTO")
@@ -979,7 +1052,7 @@ async def market_scanner_loop():
                                 for c in valid:
                                     vol = float(c.get("volume", 0.0))
                                     chg = float(c.get("change", 0.0))
-                                    # Rule: High Volume + Fresh Breakout Momentum (Prevents Top Buying Trap)
+                                    # Rule: High Volume + Fresh Breakout Momentum (2.2% to 8.8%)
                                     if vol >= min_volume and 2.2 <= chg <= 8.8:
                                         breakout_candidates.append(c)
 
@@ -988,7 +1061,6 @@ async def market_scanner_loop():
                                     target_coin = breakout_candidates[0]
                                     add_log(state, f"⚡ BREAKOUT SIGNAL: {target_coin['symbol']} (+{target_coin['change']:.2f}%, Vol: {target_coin['volume']:.0f})")
                                 else:
-                                    # Fallback to top positive liquid coin if no fresh breakout
                                     positive_coins = [c for c in valid if c.get('change', 0.0) > 0.5]
                                     if positive_coins:
                                         target_coin = sorted(positive_coins, key=lambda x: x.get('volume', 0.0), reverse=True)[0]
@@ -997,9 +1069,7 @@ async def market_scanner_loop():
                                 pos_type = "LONG"
                                 coin_sym = target_coin['symbol']
                                 current_p = target_coin['price']
-                                order_amount = state["trade_amount"]
                                 quote = state.get("quote_currency", "INR")
-                                curr_sym = get_curr_symbol(state)
                                 broker = state["active_broker"].lower()
 
                                 if broker == "paper":
