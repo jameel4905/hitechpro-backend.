@@ -278,23 +278,17 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# ----------------- TOP 30 LIQUID MARKET SCANNER ENGINE -----------------
-TOP_30_LIQUID_COINS = [
-    "BTC", "ETH", "SOL", "DOGE", "SHIB", "XRP", "ADA", "PEPE", "NEAR", "SUI", 
-    "AVAX", "LINK", "LTC", "TRX", "DOT", "MATIC", "BCH", "UNI", "APT", "ARB", 
-    "OP", "RENDER", "ICP", "FET", "INJ", "FIL", "TIA", "ATOM", "BONK", "FLOKI"
-]
-
+# ----------------- DYNAMIC NIFTY-STYLE TOP 100 MARKET SCANNER ENGINE -----------------
 def fetch_active_exchange_markets(state):
     broker = state.get("active_broker", "coindcx")
     quote = state.get("quote_currency", "INR").upper()
+
+    market_list = []
 
     if broker == "coindcx":
         try:
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
             data = res.json()
-            market_list = []
-
             for item in data:
                 m = item.get("market", "")
                 price = float(item.get("last_price", 0.0))
@@ -306,37 +300,31 @@ def fetch_active_exchange_markets(state):
                 clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
 
                 if quote == "INR" and (m.endswith("_INR") or m.endswith("INR")) and not ("USDT" in m):
-                    if clean_coin in TOP_30_LIQUID_COINS or vol > 100:
-                        market_list.append({
-                            "symbol": clean_coin + "INR",
-                            "base_coin": clean_coin,
-                            "raw_symbol": m,
-                            "price": price,
-                            "volume": vol,
-                            "change": change
-                        })
+                    market_list.append({
+                        "symbol": clean_coin + "INR",
+                        "base_coin": clean_coin,
+                        "raw_symbol": m,
+                        "price": price,
+                        "volume": vol,
+                        "change": change
+                    })
                 elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
-                    if clean_coin in TOP_30_LIQUID_COINS or vol > 1000:
-                        market_list.append({
-                            "symbol": clean_coin + "USDT",
-                            "base_coin": clean_coin,
-                            "raw_symbol": m,
-                            "price": price,
-                            "volume": vol,
-                            "change": change
-                        })
-
-            if market_list:
-                return market_list
+                    market_list.append({
+                        "symbol": clean_coin + "USDT",
+                        "base_coin": clean_coin,
+                        "raw_symbol": m,
+                        "price": price,
+                        "volume": vol,
+                        "change": change
+                    })
         except Exception:
             pass
 
-    if broker in ccxt.exchanges:
+    elif broker in ccxt.exchanges:
         try:
             exchange_class = getattr(ccxt, broker)
             inst = exchange_class({'enableRateLimit': True})
             tickers = inst.fetch_tickers()
-            market_list = []
             target_suffix = f"/{quote}"
             for sym, t in tickers.items():
                 if sym.endswith(target_suffix):
@@ -349,32 +337,36 @@ def fetch_active_exchange_markets(state):
                         "volume": float(t.get("quoteVolume", 0.0) or 0.0),
                         "change": float(t.get("percentage", 0.0) or 0.0)
                     })
-            if market_list:
-                return market_list
         except Exception:
             pass
 
-    try:
-        res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=8)
-        data = res.json()
-        usd_to_inr = 89.5
-        out = []
-        for c in data:
-            if c["symbol"].endswith("USDT") and not any(x in c["symbol"] for x in ["CREAM", "UP", "DOWN"]):
-                p = float(c["lastPrice"])
-                clean_sym = c["symbol"].replace("USDT", "")
-                final_p = p * usd_to_inr if quote == "INR" else p
-                out.append({
-                    "symbol": clean_sym + quote,
-                    "base_coin": clean_sym,
-                    "raw_symbol": c["symbol"],
-                    "price": final_p,
-                    "volume": float(c["quoteVolume"]),
-                    "change": float(c["priceChangePercent"])
-                })
-        return out
-    except:
-        return []
+    if not market_list:
+        try:
+            res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=8)
+            data = res.json()
+            usd_to_inr = 89.5
+            for c in data:
+                if c["symbol"].endswith("USDT") and not any(x in c["symbol"] for x in ["CREAM", "UP", "DOWN"]):
+                    p = float(c["lastPrice"])
+                    clean_sym = c["symbol"].replace("USDT", "")
+                    final_p = p * usd_to_inr if quote == "INR" else p
+                    market_list.append({
+                        "symbol": clean_sym + quote,
+                        "base_coin": clean_sym,
+                        "raw_symbol": c["symbol"],
+                        "price": final_p,
+                        "volume": float(c["quoteVolume"]),
+                        "change": float(c["priceChangePercent"])
+                    })
+        except:
+            pass
+
+    # 🚀 NIFTY-STYLE INDEX SORTING: Sort by 24h Volume descending & take TOP 100 dynamically
+    if market_list:
+        market_list.sort(key=lambda x: x.get("volume", 0.0), reverse=True)
+        return market_list[:100]
+
+    return []
 
 def get_coin_precision(clean_coin, current_price):
     if "BTC" in clean_coin:
@@ -803,7 +795,7 @@ async def bot_control(request: Request):
         if "max_trades" in data: state["max_trades"] = int(data["max_trades"])
 
         curr_sym = get_curr_symbol(state)
-        target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "High-Volume Breakout Scanner"
+        target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "Nifty-Style Dynamic Top 100 Index Scanner"
         add_log(state, f"🚀 BOT STARTED | Target: {target_info} | Slots: {state['max_trades']} | Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
@@ -905,7 +897,7 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "today_pnl": state["today_pnl"]
     }
 
-# 🚀 HIGH-VOLUME BREAKOUT SCANNER, LOW BALANCE PROTECTION & STRICT CONFIRMATION ENGINE
+# 🚀 NIFTY-STYLE DYNAMIC TOP 100 SCANNER, LOW BALANCE PROTECTION & STRICT CONFIRMATION ENGINE
 async def market_scanner_loop():
     while True:
         try:
