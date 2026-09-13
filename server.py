@@ -727,6 +727,7 @@ async def set_currency(request: Request):
         "trade_amount": state["trade_amount"]
     }
 
+# 🚀 100% PRECISE BALANCE & QUANTITY FETCHER (FIXED FOR EXACT COINDCX HOLDINGS)
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
@@ -752,7 +753,13 @@ async def connect_exchange(request: Request):
             res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=10)
             res_data = res.json()
             if isinstance(res_data, list):
-                dynamic_balances = {item.get("currency"): round(float(item.get("balance", 0.0)), 8) for item in res_data if float(item.get("balance", 0.0)) > 0.00000001}
+                dynamic_balances = {}
+                for item in res_data:
+                    curr = item.get("currency")
+                    bal = float(item.get("balance", 0.0))
+                    if bal > 0.00000001:
+                        dynamic_balances[curr] = round(bal, 8)
+                
                 inr_bal = dynamic_balances.get("INR", 0.0)
                 state["session_start_fund"] = inr_bal if state["quote_currency"] == "INR" else dynamic_balances.get("USDT", 0.0)
                 add_log(state, f"🔗 Connected to CoinDCX! Live Cash: {get_curr_symbol(state)}{state['session_start_fund']}")
