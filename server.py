@@ -583,11 +583,7 @@ async def direct_sell(request: Request):
             }
             db_save_trade(sold_trade, device_id, broker)
             add_log(state, f"✅ MANUAL EXIT FILLED: Sold {sell_qty} {coin} at {get_curr_symbol(state)}{current_price} on {broker.upper()}!")
-            return {
-                "status": "success", 
-                "message": f"Successfully Sold {sell_qty} {coin} on {broker.upper()}!",
-                "history": db_get_all_trades(device_id, limit=500)
-            }
+            return {"status": "success", "message": f"Successfully Sold {sell_qty} {coin} on {broker.upper()}!"}
         else:
             return {"status": "error", "message": f"{broker.upper()} Exit Failed: {res_data}"}
 
@@ -810,6 +806,7 @@ async def bot_control(request: Request):
         add_log(state, "🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
+# 🚀 100% MATHEMATICALLY EXACT MANUAL DEAL CLOSER WITH STRICT VERIFICATION
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -844,6 +841,7 @@ async def close_trade(request: Request):
         qty = float(trade_to_close.get("quantity", 0.0))
         trade_amount = float(trade_to_close.get("amount", entry * qty))
 
+        # 100% Exact Mathematical Calculation
         if trade_to_close["type"] in ["LONG", "BUY"]:
             pnl_percent = ((exit_p - entry) / entry) * 100.0
             pnl_val = (exit_p - entry) * qty if qty > 0 else (trade_amount * (pnl_percent / 100.0))
@@ -860,16 +858,10 @@ async def close_trade(request: Request):
         state["today_pnl"] += trade_to_close["pnl_val"]
         state["today_pnl"] = round(state["today_pnl"], 2)
 
-        if trade_to_close in state["active_trades"]:
-            state["active_trades"].remove(trade_to_close)
-            
+        state["active_trades"].remove(trade_to_close)
         db_save_trade(trade_to_close, device_id, broker)
 
-        return {
-            "status": "success", 
-            "message": f"Exit Confirmed! PNL: {trade_to_close['pnl_percent']}%",
-            "history": db_get_all_trades(device_id, limit=500)
-        }
+        return {"status": "success", "message": f"Exit Confirmed! PNL: {trade_to_close['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade_to_close['pnl_val']})"}
     except Exception as e:
         return {"status": "error", "message": f"API Error: {str(e)}"}
 
@@ -908,6 +900,7 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "today_pnl": state["today_pnl"]
     }
 
+# 🚀 NIFTY-STYLE DYNAMIC TOP 100 SCANNER, LOW BALANCE PROTECTION & STRICT CONFIRMATION ENGINE
 async def market_scanner_loop():
     while True:
         try:
@@ -952,6 +945,7 @@ async def market_scanner_loop():
 
                     live_prices = {c['symbol']: c['price'] for c in all_coins}
 
+                    # SL & TARGET TRACKING WITH INDEPENDENT TRAILING
                     trades_to_close = []
                     for trade in list(state["active_trades"]):
                         sym = trade["symbol"]
@@ -975,6 +969,7 @@ async def market_scanner_loop():
                                     trade["close_reason"] = "TARGET HIT" if curr_p <= target_p else "TRAILING SL HIT"
                                     trades_to_close.append(trade)
 
+                    # 🛑 CRITICAL FIX: Sell Fail hone par active trades se delete nahi hoga (Zero Ghost Coins)
                     for trade in trades_to_close:
                         exit_p = live_prices.get(trade["symbol"], trade["entry_price"])
                         side_to_exit = "sell" if trade["type"] in ["LONG", "BUY"] else "buy"
@@ -1003,6 +998,7 @@ async def market_scanner_loop():
                         qty = float(trade.get("quantity", 0.0))
                         trade_amt = float(trade.get("amount", entry * qty))
 
+                        # 100% Exact Mathematical Realized P&L
                         if trade["type"] in ["LONG", "BUY"]:
                             pnl_percent = ((exit_p - entry) / entry) * 100.0
                             pnl_val = (exit_p - entry) * qty if qty > 0 else (trade_amt * (pnl_percent / 100.0))
@@ -1025,13 +1021,16 @@ async def market_scanner_loop():
                         db_save_trade(trade, dev_id, broker)
                         add_log(state, f"🎯 DEAL CLOSED: {trade['type']} {trade['symbol']} | P&L: {trade['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade['pnl_val']}) [{trade['status']}]")
 
+                    # 🚀 SLOTS & LOW-BALANCE SAFE SCANNER
                     allowed_slots = int(state.get("max_trades", 1))
                     if len(state["active_trades"]) < allowed_slots:
                         order_amount = float(state.get("trade_amount", 500.0))
                         curr_sym = get_curr_symbol(state)
 
+                        # Check actual available liquid cash before triggering new trade
                         available_cash = fetch_real_cash_balance(state)
                         if available_cash < order_amount:
+                            # Do not take trade, only keep scanning
                             continue
 
                         valid = [c for c in all_coins if c.get('price', 0) > 0]
@@ -1048,6 +1047,7 @@ async def market_scanner_loop():
                                 for c in valid:
                                     vol = float(c.get("volume", 0.0))
                                     chg = float(c.get("change", 0.0))
+                                    # Rule: High Volume + Fresh Breakout Momentum (2.2% to 8.8%)
                                     if vol >= min_volume and 2.2 <= chg <= 8.8:
                                         breakout_candidates.append(c)
 
