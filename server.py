@@ -918,7 +918,6 @@ async def set_currency(request: Request):
         "trade_amount": state["trade_amount"]
     }
 
-# 🚀 100% PRECISE BALANCE & QUANTITY FETCHER (FIXED FOR EXACT COINDCX HOLDINGS)
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
@@ -943,10 +942,11 @@ async def connect_exchange(request: Request):
             headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
             res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=10)
             res_data = res.json()
+            
             if isinstance(res_data, list):
                 dynamic_balances = {}
                 for item in res_data:
-                    curr = item.get("currency")
+                    curr = item.get("currency", "").upper()
                     bal = float(item.get("balance", 0.0))
                     if bal > 0.00000001:
                         dynamic_balances[curr] = round(bal, 8)
@@ -957,6 +957,20 @@ async def connect_exchange(request: Request):
                 return {"status": "success", "message": "Connected to CoinDCX!", "balances": dynamic_balances}
             else:
                 return {"status": "error", "message": "CoinDCX Keys Invalid!"}
+        
+        else:
+            if not hasattr(ccxt, exchange_id):
+                return {"status": "error", "message": f"Exchange '{exchange_id}' not supported."}
+            exchange = getattr(ccxt, exchange_id)({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+            balance = exchange.fetch_balance()
+            dynamic_balances = {coin: round(amt, 8) for coin, amt in balance.get('total', {}).items() if isinstance(amt, (int, float)) and amt > 0.00000001}
+            cash_fund = dynamic_balances.get(state["quote_currency"], 0.0)
+            state["session_start_fund"] = cash_fund
+            add_log(state, f"🔗 Connected to {exchange_id.upper()}! Cash: {get_curr_symbol(state)}{cash_fund}")
+            return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
+            
+    except Exception as e:
+        return {"status": "error", "message": f"API Error ({exchange_id.upper()}): {str(e)}"}
         
         else:
             if not hasattr(ccxt, exchange_id):
