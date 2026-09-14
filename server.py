@@ -422,7 +422,122 @@ def fetch_real_cash_balance(state):
     except Exception:
         return 0.0
 
+def _extract_coindcx_order(data):
+    """Normalize CoinDCX create/status responses to one order dictionary."""
+    if isinstance(data, dict):
+        if isinstance(data.get("orders"), list) and data["orders"]:
+            return data["orders"][0]
+        if isinstance(data.get("order"), dict):
+            return data["order"]
+        if data.get("id") is not None:
+            return data
+    elif isinstance(data, list) and data:
+        if isinstance(data[0], dict):
+            return data[0]
+    return {}
+
+
+def _coindcx_auth_post(state, endpoint, body, timeout=10):
+    """Authenticated CoinDCX private API POST."""
+    api_key = state.get("api_key", "").strip()
+    secret_key = state.get("secret_key", "").strip()
+    if not api_key or not secret_key:
+        raise RuntimeError("API Keys missing! Connect in Portfolio tab.")
+
+    json_body = json.dumps(body, separators=(',', ':'))
+    signature = hmac.new(
+        secret_key.encode("utf-8"),
+        json_body.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": api_key,
+        "X-AUTH-SIGNATURE": signature,
+    }
+    res = requests.post(
+        f"https://api.coindcx.com{endpoint}",
+        data=json_body,
+        headers=headers,
+        timeout=timeout,
+    )
+    try:
+        payload = res.json()
+    except Exception:
+        payload = {"message": res.text}
+    return res, payload
+
+
+def get_coindcx_order_status(state, order_id):
+    """Fetch the real exchange status of a CoinDCX spot order."""
+    body = {
+        "id": int(str(order_id)),
+        "timestamp": int(round(time.time() * 1000)),
+    }
+    res, payload = _coindcx_auth_post(state, "/exchange/v1/orders/status", body, timeout=8)
+    if res.status_code != 200:
+        msg = payload.get("message", str(payload)) if isinstance(payload, dict) else str(payload)
+        return False, {}, f"Order status HTTP {res.status_code}: {msg}"
+
+    order = _extract_coindcx_order(payload)
+    if not order:
+        return False, {}, f"Empty CoinDCX order-status response: {payload}"
+    return True, order, ""
+
+
+def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5):
+    """Wait until a spot order is fully filled or reaches a terminal failure state.
+
+    IMPORTANT: HTTP 200 from /orders/create only means the order was accepted.
+    The position is considered closed locally only after status == filled and
+    remaining_quantity == 0.
+    """
+    deadline = time.time() + float(timeout_seconds)
+    last_order = {}
+    last_error = ""
+
+    while time.time() <= deadline:
+        try:
+            ok, order, err = get_coindcx_order_status(state, order_id)
+            if not ok:
+                last_error = err
+            else:
+                last_order = order
+                status = str(order.get("status", "")).lower()
+                total_qty = float(order.get("total_quantity", 0) or 0)
+                remaining_qty = float(order.get("remaining_quantity", 0) or 0)
+                avg_price = float(order.get("avg_price", 0) or 0)
+
+                if status == "filled" and remaining_qty <= 1e-12:
+                    filled_qty = max(0.0, total_qty - remaining_qty)
+                    return True, order, filled_qty, avg_price, "FILLED"
+
+                if status in {"rejected", "cancelled", "partially_cancelled"}:
+                    return False, order, max(0.0, total_qty - remaining_qty), avg_price, status.upper()
+
+                # init/open/partially_filled are still live on the exchange.
+                last_error = f"Order still {status or 'unknown'} (remaining={remaining_qty:g})"
+        except Exception as e:
+            last_error = str(e)
+
+        time.sleep(poll_seconds)
+
+    if last_order:
+        status = str(last_order.get("status", "unknown")).lower()
+        total_qty = float(last_order.get("total_quantity", 0) or 0)
+        remaining_qty = float(last_order.get("remaining_quantity", 0) or 0)
+        avg_price = float(last_order.get("avg_price", 0) or 0)
+        filled_qty = max(0.0, total_qty - remaining_qty)
+        return False, last_order, filled_qty, avg_price, (
+            f"TIMEOUT: order is still {status}; remaining quantity={remaining_qty:g}. "
+            f"Local position was NOT closed. {last_error}"
+        )
+
+    return False, {}, 0.0, 0.0, f"Unable to confirm CoinDCX order fill. {last_error}"
+
+
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
+    """Place a CoinDCX spot market order and confirm the actual exchange fill."""
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
     quote = state.get("quote_currency", "INR").upper()
@@ -431,54 +546,63 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         return False, 0, 0, "API Keys missing! Connect in Portfolio tab."
 
     try:
-        clean_coin = raw_symbol.replace("USDT", "").replace("INR", "").replace("/", "").replace("B-", "").replace("I-", "").replace("_", "").strip().upper()
+        clean_coin = (
+            raw_symbol.replace("USDT", "").replace("INR", "")
+            .replace("/", "").replace("B-", "").replace("I-", "")
+            .replace("_", "").strip().upper()
+        )
 
         ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
+        ticker_res.raise_for_status()
         tickers = ticker_res.json()
 
         target_market = None
         current_price = 0.0
 
         for t in tickers:
-            m = t.get('market', '')
+            m = t.get("market", "")
             if quote == "INR":
-                if m == f"{clean_coin}INR" or m == f"I-{clean_coin}_INR" or m == f"B-{clean_coin}_INR":
+                if m in (f"{clean_coin}INR", f"I-{clean_coin}_INR", f"B-{clean_coin}_INR"):
                     target_market = m
-                    current_price = float(t.get('last_price', 0.0))
+                    current_price = float(t.get("last_price", 0.0) or 0.0)
                     break
             else:
-                if m == f"{clean_coin}USDT" or m == f"B-{clean_coin}_USDT":
+                if m in (f"{clean_coin}USDT", f"B-{clean_coin}_USDT", f"I-{clean_coin}_USDT"):
                     target_market = m
-                    current_price = float(t.get('last_price', 0.0))
+                    current_price = float(t.get("last_price", 0.0) or 0.0)
                     break
 
-        # Fallback safeguard: If INR pair not found, automatically check USDT pair
+        # Fallback: if requested INR pair does not exist, use USDT pair.
+        # Keep the actual market currency only inside this order; do not mutate
+        # state['quote_currency'] because the UI may still be configured for INR.
+        order_quote = quote
         if not target_market and quote == "INR":
             for t in tickers:
-                m = t.get('market', '')
-                if m == f"{clean_coin}USDT" or m == f"B-{clean_coin}_USDT":
+                m = t.get("market", "")
+                if m in (f"{clean_coin}USDT", f"B-{clean_coin}_USDT", f"I-{clean_coin}_USDT"):
                     target_market = m
-                    current_price = float(t.get('last_price', 0.0))
-                    quote = "USDT"
+                    current_price = float(t.get("last_price", 0.0) or 0.0)
+                    order_quote = "USDT"
                     break
 
         if not target_market or current_price <= 0:
             return False, 0, 0, f"Valid CoinDCX pair for '{clean_coin}' not found! Please check symbol."
 
         precision = get_coin_precision(clean_coin, current_price)
-
         if exact_qty > 0:
-            quantity = exact_qty if precision == 0 else round(exact_qty, precision)
-            if precision == 0: quantity = int(round(quantity))
+            quantity = float(exact_qty) if precision == 0 else round(float(exact_qty), precision)
+            if precision == 0:
+                quantity = int(round(quantity))
         else:
             calc_qty = float(target_amount) / current_price
             if precision == 0:
                 quantity = int(round(calc_qty))
-                if quantity <= 0: quantity = 1
+                if quantity <= 0:
+                    quantity = 1
             else:
                 quantity = round(calc_qty, precision)
 
-        if side.lower() == "buy" and quote == "INR" and (quantity * current_price) < 102.0:
+        if side.lower() == "buy" and order_quote == "INR" and (quantity * current_price) < 102.0:
             if precision == 0:
                 quantity = int(round(115.0 / current_price)) + 1
             else:
@@ -489,31 +613,44 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         if quantity <= 0:
             quantity = 1 if precision == 0 else round(1.0 / (10 ** precision), precision)
 
-        time_stamp = int(round(time.time() * 1000))
         body = {
             "side": side.lower(),
             "order_type": "market_order",
             "market": target_market,
             "total_quantity": quantity,
-            "timestamp": time_stamp
+            "timestamp": int(round(time.time() * 1000)),
         }
 
-        json_body = json.dumps(body, separators=(',', ':'))
-        signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-        headers = {
-            'Content-Type': 'application/json',
-            'X-AUTH-APIKEY': api_key,
-            'X-AUTH-SIGNATURE': signature
-        }
-
-        res = requests.post("https://api.coindcx.com/exchange/v1/orders/create", data=json_body, headers=headers, timeout=10)
-        res_data = res.json()
-
-        if res.status_code == 200 and ("orders" in res_data or "id" in res_data or isinstance(res_data, list)):
-            return True, current_price, quantity, res_data
-        else:
+        res, res_data = _coindcx_auth_post(state, "/exchange/v1/orders/create", body, timeout=10)
+        if res.status_code != 200:
             err_msg = res_data.get("message", str(res_data)) if isinstance(res_data, dict) else str(res_data)
-            return False, current_price, quantity, err_msg
+            return False, current_price, quantity, f"HTTP {res.status_code}: {err_msg}"
+
+        order = _extract_coindcx_order(res_data)
+        order_id = order.get("id")
+        if order_id is None:
+            return False, current_price, quantity, f"CoinDCX accepted no usable order id: {res_data}"
+
+        # CRITICAL FIX: do not treat HTTP 200/order acceptance as a fill.
+        filled, final_order, filled_qty, avg_price, status_msg = wait_for_coindcx_fill(
+            state, order_id, timeout_seconds=8.0, poll_seconds=0.5
+        )
+
+        actual_price = avg_price if avg_price > 0 else current_price
+        result = {
+            "order_id": str(order_id),
+            "market": target_market,
+            "requested_quantity": quantity,
+            "filled_quantity": filled_qty,
+            "status": final_order.get("status", "") if isinstance(final_order, dict) else "",
+            "avg_price": actual_price,
+            "order": final_order,
+        }
+
+        if filled:
+            return True, actual_price, filled_qty or quantity, result
+
+        return False, actual_price, filled_qty, f"CoinDCX order {order_id}: {status_msg} | {result}"
     except Exception as e:
         return False, 0, 0, str(e)
 
@@ -560,9 +697,11 @@ async def direct_sell(request: Request):
         quantity = float(data.get("quantity", 0))
         broker = state.get("active_broker", "coindcx").lower()
 
+        if quantity <= 0:
+            return {"status": "error", "message": "Sell quantity must be greater than 0."}
+
         api_key = data.get("api_key", state.get("api_key", "")).strip()
         secret_key = data.get("secret_key", state.get("secret_key", "")).strip()
-
         if not api_key or not secret_key:
             return {"status": "error", "message": "API Keys missing! Reconnect in Portfolio."}
 
@@ -570,20 +709,61 @@ async def direct_sell(request: Request):
         state["secret_key"] = secret_key
 
         if broker == "coindcx":
-            sold, current_price, sell_qty, res_data = execute_coindcx_order(state, coin, side="sell", exact_qty=quantity)
+            sold, exit_price, sell_qty, res_data = execute_coindcx_order(
+                state, coin, side="sell", exact_qty=quantity
+            )
+        elif broker != "paper":
+            sold, exit_price, sell_qty, res_data = execute_ccxt_order(
+                state, coin, side="sell", exact_qty=quantity
+            )
         else:
-            sold, current_price, sell_qty, res_data = execute_ccxt_order(state, coin, side="sell", exact_qty=quantity)
+            return {"status": "error", "message": "Direct sell is not available in paper mode."}
 
-        if sold:
+        if not sold:
+            add_log(state, f"⚠️ MANUAL EXIT NOT CONFIRMED: {coin} | {res_data}")
+            return {"status": "error", "message": f"{broker.upper()} Exit Not Confirmed: {res_data}"}
+
+        # If this manual sell corresponds to a bot position, close the SAME
+        # active trade. This prevents a duplicate history row / ghost position.
+        matched_trade = None
+        for t in list(state["active_trades"]):
+            t_coin = str(t.get("symbol", "")).replace("INR", "").replace("USDT", "").upper()
+            if t_coin == coin:
+                t_qty = float(t.get("quantity", 0) or 0)
+                if abs(t_qty - float(sell_qty)) <= max(1e-8, t_qty * 0.01):
+                    matched_trade = t
+                    break
+
+        if matched_trade:
+            entry = float(matched_trade.get("entry_price", 0) or 0)
+            qty = float(sell_qty or matched_trade.get("quantity", 0) or 0)
+            if entry > 0 and qty > 0:
+                pnl_val = (float(exit_price) - entry) * qty
+                pnl_percent = ((float(exit_price) - entry) / entry) * 100.0
+            else:
+                pnl_val = 0.0
+                pnl_percent = 0.0
+
+            matched_trade["quantity"] = qty
+            matched_trade["pnl_percent"] = round(pnl_percent, 2)
+            matched_trade["pnl_val"] = round(pnl_val, 2)
+            matched_trade["exit_price"] = round(float(exit_price), 6 if float(exit_price) < 1 else 2)
+            matched_trade["close_time"] = get_global_time()
+            matched_trade["status"] = "MANUAL EXIT"
+            state["today_pnl"] = round(state.get("today_pnl", 0.0) + pnl_val, 2)
+            state["active_trades"].remove(matched_trade)
+            db_save_trade(matched_trade, device_id, broker)
+        else:
+            # Genuine wallet/manual sell: keep a standalone history record.
             sold_trade = {
-                "id": int(time.time()),
+                "id": int(time.time() * 1000),
                 "symbol": f"{coin}{state.get('quote_currency', 'INR')}",
-                "currency": state.get('quote_currency', 'INR'),
+                "currency": state.get("quote_currency", "INR"),
                 "type": "SELL",
-                "entry_price": current_price,
-                "exit_price": current_price,
-                "quantity": sell_qty,
-                "amount": round(sell_qty * current_price, 2),
+                "entry_price": float(exit_price),
+                "exit_price": float(exit_price),
+                "quantity": float(sell_qty),
+                "amount": round(float(sell_qty) * float(exit_price), 2),
                 "sl_price": 0.0,
                 "target_price": 0.0,
                 "pnl_percent": 0.0,
@@ -592,11 +772,14 @@ async def direct_sell(request: Request):
                 "close_time": get_global_time()
             }
             db_save_trade(sold_trade, device_id, broker)
-            add_log(state, f"✅ MANUAL EXIT FILLED: Sold {sell_qty} {coin} at {get_curr_symbol(state)}{current_price} on {broker.upper()}!")
-            return {"status": "success", "message": f"Successfully Sold {sell_qty} {coin} on {broker.upper()}!", "history": db_get_all_trades(device_id, limit=500)}
-        else:
-            return {"status": "error", "message": f"{broker.upper()} Exit Failed: {res_data}"}
 
+        add_log(state, f"✅ MANUAL EXIT CONFIRMED: Sold {sell_qty} {coin} at {get_curr_symbol(state)}{exit_price} on {broker.upper()}!")
+        return {
+            "status": "success",
+            "message": f"Successfully Sold {sell_qty} {coin} on {broker.upper()}! Exchange fill confirmed.",
+            "active": state["active_trades"],
+            "history": db_get_all_trades(device_id, limit=500)
+        }
     except Exception as e:
         return {"status": "error", "message": f"Server Error: {str(e)}"}
 
@@ -712,7 +895,9 @@ async def set_broker_mode(request: Request):
     mode = data.get("mode", "real").lower()
     if mode == "paper":
         state["active_broker"] = "paper"
-    add_log(state, f"⚡ Broker Mode: {mode.upper()}")
+    elif mode == "real" and state.get("active_broker") == "paper":
+        state["active_broker"] = "coindcx"
+    add_log(state, f"⚡ Broker Mode: {mode.upper()} | Exchange: {state['active_broker'].upper()}")
     return {"status": "success", "active_broker": state["active_broker"]}
 
 @app.post("/api/set-currency")
@@ -824,62 +1009,74 @@ async def close_trade(request: Request):
     state = get_user_session(device_id)
     trade_id = data.get("id")
 
-    trade_to_close = next((t for t in state["active_trades"] if t["id"] == trade_id), None)
+    trade_to_close = next((t for t in state["active_trades"] if str(t.get("id")) == str(trade_id)), None)
     if not trade_to_close:
         return await direct_sell(request)
 
     try:
         side_to_exit = "sell" if trade_to_close["type"] in ["LONG", "BUY"] else "buy"
         broker = state.get("active_broker", "coindcx").lower()
-        sold = True
-        msg = ""
 
         if broker == "coindcx":
-            sold, exit_price, _, msg = execute_coindcx_order(state, trade_to_close.get("symbol"), side=side_to_exit, exact_qty=trade_to_close.get("quantity", 0))
+            sold, exit_price, filled_qty, msg = execute_coindcx_order(
+                state,
+                trade_to_close.get("symbol"),
+                side=side_to_exit,
+                exact_qty=trade_to_close.get("quantity", 0),
+            )
             if not sold:
-                return {"status": "error", "message": f"CoinDCX Exit Failed: {msg}"}
+                add_log(state, f"⚠️ MANUAL EXIT NOT CONFIRMED: {trade_to_close.get('symbol')} | {msg}")
+                return {"status": "error", "message": f"CoinDCX Exit Not Confirmed: {msg}", "active": state["active_trades"]}
         elif broker != "paper":
-            sold, exit_price, _, msg = execute_ccxt_order(state, trade_to_close.get("symbol"), side=side_to_exit, exact_qty=trade_to_close.get("quantity", 0))
+            sold, exit_price, filled_qty, msg = execute_ccxt_order(
+                state,
+                trade_to_close.get("symbol"),
+                side=side_to_exit,
+                exact_qty=trade_to_close.get("quantity", 0),
+            )
             if not sold:
                 return {"status": "error", "message": f"{broker.upper()} Exit Failed: {msg}"}
         else:
             markets = fetch_active_exchange_markets(state)
-            exit_price = next((m["price"] for m in markets if m["symbol"] == trade_to_close["symbol"]), trade_to_close["entry_price"])
+            exit_price = next(
+                (m["price"] for m in markets if m["symbol"] == trade_to_close["symbol"]),
+                trade_to_close["entry_price"],
+            )
+            filled_qty = float(trade_to_close.get("quantity", 0))
 
-        entry = float(trade_to_close.get("entry_price", 1.0))
+        # Never calculate a completed exit from a ticker price when the exchange
+        # supplied an actual average fill price.
+        entry = float(trade_to_close.get("entry_price", 1.0) or 1.0)
         exit_p = float(exit_price)
-        qty = float(trade_to_close.get("quantity", 0.0))
-        trade_amount = float(trade_to_close.get("amount", entry * qty))
+        qty = float(filled_qty or trade_to_close.get("quantity", 0.0) or 0.0)
+        trade_amount = float(trade_to_close.get("amount", entry * qty) or (entry * qty))
 
-        # 100% Exact Mathematical Calculation
         if trade_to_close["type"] in ["LONG", "BUY"]:
             pnl_percent = ((exit_p - entry) / entry) * 100.0
-            pnl_val = (exit_p - entry) * qty if qty > 0 else (trade_amount * (pnl_percent / 100.0))
+            pnl_val = (exit_p - entry) * qty if qty > 0 else (trade_amount * pnl_percent / 100.0)
         else:
             pnl_percent = ((entry - exit_p) / entry) * 100.0
-            pnl_val = (entry - exit_p) * qty if qty > 0 else (trade_amount * (pnl_percent / 100.0))
+            pnl_val = (entry - exit_p) * qty if qty > 0 else (trade_amount * pnl_percent / 100.0)
 
+        trade_to_close["quantity"] = qty
         trade_to_close["pnl_percent"] = round(pnl_percent, 2)
         trade_to_close["pnl_val"] = round(pnl_val, 2)
         trade_to_close["exit_price"] = round(exit_p, 6 if exit_p < 1 else 2)
         trade_to_close["close_time"] = get_global_time()
         trade_to_close["status"] = "MANUAL EXIT"
 
-        state["today_pnl"] += trade_to_close["pnl_val"]
-        state["today_pnl"] = round(state["today_pnl"], 2)
-
-        if trade_to_close in state["active_trades"]:
-            state["active_trades"].remove(trade_to_close)
-
+        state["today_pnl"] = round(state.get("today_pnl", 0.0) + pnl_val, 2)
+        state["active_trades"].remove(trade_to_close)
         db_save_trade(trade_to_close, device_id, broker)
 
         return {
-            "status": "success", 
+            "status": "success",
             "message": f"Exit Confirmed! PNL: {trade_to_close['pnl_percent']}%",
             "active": state["active_trades"],
-            "history": db_get_all_trades(device_id, limit=500)
+            "history": db_get_all_trades(device_id, limit=500),
         }
     except Exception as e:
+        add_log(state, f"❌ CLOSE TRADE ERROR: {str(e)}")
         return {"status": "error", "message": f"API Error: {str(e)}"}
 
 @app.get("/api/bot-logs")
@@ -986,43 +1183,55 @@ async def market_scanner_loop():
                                     trade["close_reason"] = "TARGET HIT" if curr_p <= target_p else "TRAILING SL HIT"
                                     trades_to_close.append(trade)
 
-                    # 🛑 CRITICAL FIX: Sell Fail hone par active trades se delete nahi hoga (Zero Ghost Coins)
+                    # 🛑 EXIT CONFIRMATION: local position is removed ONLY after
+                    # the exchange confirms the order is fully filled.
                     for trade in trades_to_close:
                         exit_p = live_prices.get(trade["symbol"], trade["entry_price"])
                         side_to_exit = "sell" if trade["type"] in ["LONG", "BUY"] else "buy"
                         broker = state.get("active_broker", "coindcx").lower()
                         sell_success = True
+                        filled_qty = float(trade.get("quantity", 0.0))
                         msg = ""
 
                         if broker == "coindcx":
-                            sell_success, live_exit_price, _, msg = execute_coindcx_order(
-                                state, trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0)
+                            sell_success, confirmed_price, filled_qty, msg = execute_coindcx_order(
+                                state,
+                                trade.get("symbol"),
+                                side=side_to_exit,
+                                exact_qty=trade.get("quantity", 0),
                             )
-                            if live_exit_price > 0:
-                                exit_p = live_exit_price
+                            if sell_success and confirmed_price > 0:
+                                exit_p = confirmed_price
                         elif broker != "paper":
-                            sell_success, live_exit_price, _, msg = execute_ccxt_order(
-                                state, trade.get("symbol"), side=side_to_exit, exact_qty=trade.get("quantity", 0)
+                            sell_success, confirmed_price, filled_qty, msg = execute_ccxt_order(
+                                state,
+                                trade.get("symbol"),
+                                side=side_to_exit,
+                                exact_qty=trade.get("quantity", 0),
                             )
-                            if live_exit_price > 0:
-                                exit_p = live_exit_price
+                            if sell_success and confirmed_price > 0:
+                                exit_p = confirmed_price
 
                         if not sell_success:
-                            add_log(state, f"⚠️ EXIT REJECTED on {broker.upper()}: {msg}. Retrying position exit next cycle...")
+                            add_log(
+                                state,
+                                f"⚠️ EXIT NOT CONFIRMED on {broker.upper()}: {msg}. "
+                                f"Position remains active; retrying next cycle..."
+                            )
                             continue
 
-                        entry = float(trade.get("entry_price", 1.0))
-                        qty = float(trade.get("quantity", 0.0))
-                        trade_amt = float(trade.get("amount", entry * qty))
+                        entry = float(trade.get("entry_price", 1.0) or 1.0)
+                        qty = float(filled_qty or trade.get("quantity", 0.0) or 0.0)
+                        trade_amt = float(trade.get("amount", entry * qty) or (entry * qty))
 
-                        # 100% Exact Mathematical Realized P&L
                         if trade["type"] in ["LONG", "BUY"]:
                             pnl_percent = ((exit_p - entry) / entry) * 100.0
-                            pnl_val = (exit_p - entry) * qty if qty > 0 else (trade_amt * (pnl_percent / 100.0))
+                            pnl_val = (exit_p - entry) * qty if qty > 0 else (trade_amt * pnl_percent / 100.0)
                         else:
                             pnl_percent = ((entry - exit_p) / entry) * 100.0
-                            pnl_val = (entry - exit_p) * qty if qty > 0 else (trade_amt * (pnl_percent / 100.0))
+                            pnl_val = (entry - exit_p) * qty if qty > 0 else (trade_amt * pnl_percent / 100.0)
 
+                        trade["quantity"] = qty
                         trade["pnl_percent"] = round(pnl_percent, 2)
                         trade["pnl_val"] = round(pnl_val, 2)
                         trade["exit_price"] = round(exit_p, 6 if exit_p < 1 else 2)
@@ -1036,7 +1245,12 @@ async def market_scanner_loop():
                             state["active_trades"].remove(trade)
 
                         db_save_trade(trade, dev_id, broker)
-                        add_log(state, f"🎯 DEAL CLOSED: {trade['type']} {trade['symbol']} | P&L: {trade['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade['pnl_val']}) [{trade['status']}]")
+                        add_log(
+                            state,
+                            f"🎯 DEAL CLOSED & EXCHANGE FILLED: {trade['type']} {trade['symbol']} | "
+                            f"P&L: {trade['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade['pnl_val']}) "
+                            f"[{trade['status']}]"
+                        )
 
                     # 🚀 SLOTS & LOW-BALANCE SAFE SCANNER
                     allowed_slots = int(state.get("max_trades", 1))
@@ -1128,8 +1342,8 @@ async def market_scanner_loop():
                                         }
                                         state["active_trades"].insert(0, new_trade)
                                         add_log(state, f"⚡ REAL {pos_type}: {buy_qty} {coin_sym} at {curr_sym}{buy_price} on {broker.upper()}")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[SCANNER ERROR] {type(e).__name__}: {e}")
 
         await asyncio.sleep(3.5)
 
