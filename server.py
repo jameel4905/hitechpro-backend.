@@ -452,8 +452,18 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
                     current_price = float(t.get('last_price', 0.0))
                     break
 
+        # Fallback safeguard: If INR pair not found, automatically check USDT pair
+        if not target_market and quote == "INR":
+            for t in tickers:
+                m = t.get('market', '')
+                if m == f"{clean_coin}USDT" or m == f"B-{clean_coin}_USDT":
+                    target_market = m
+                    current_price = float(t.get('last_price', 0.0))
+                    quote = "USDT"
+                    break
+
         if not target_market or current_price <= 0:
-            return False, 0, 0, f"Valid CoinDCX pair for '{clean_coin}' ({quote}) not found! Please check symbol."
+            return False, 0, 0, f"Valid CoinDCX pair for '{clean_coin}' not found! Please check symbol."
 
         precision = get_coin_precision(clean_coin, current_price)
 
@@ -583,7 +593,7 @@ async def direct_sell(request: Request):
             }
             db_save_trade(sold_trade, device_id, broker)
             add_log(state, f"✅ MANUAL EXIT FILLED: Sold {sell_qty} {coin} at {get_curr_symbol(state)}{current_price} on {broker.upper()}!")
-            return {"status": "success", "message": f"Successfully Sold {sell_qty} {coin} on {broker.upper()}!"}
+            return {"status": "success", "message": f"Successfully Sold {sell_qty} {coin} on {broker.upper()}!", "history": db_get_all_trades(device_id, limit=500)}
         else:
             return {"status": "error", "message": f"{broker.upper()} Exit Failed: {res_data}"}
 
@@ -806,7 +816,7 @@ async def bot_control(request: Request):
         add_log(state, "🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
-# 🚀 100% MATHEMATICALLY EXACT MANUAL DEAL CLOSER WITH STRICT VERIFICATION
+# 🚀 100% MATHEMATICALLY EXACT MANUAL DEAL CLOSER WITH STRICT VERIFICATION & STATE SYNC
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -858,10 +868,17 @@ async def close_trade(request: Request):
         state["today_pnl"] += trade_to_close["pnl_val"]
         state["today_pnl"] = round(state["today_pnl"], 2)
 
-        state["active_trades"].remove(trade_to_close)
+        if trade_to_close in state["active_trades"]:
+            state["active_trades"].remove(trade_to_close)
+
         db_save_trade(trade_to_close, device_id, broker)
 
-        return {"status": "success", "message": f"Exit Confirmed! PNL: {trade_to_close['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade_to_close['pnl_val']})"}
+        return {
+            "status": "success", 
+            "message": f"Exit Confirmed! PNL: {trade_to_close['pnl_percent']}%",
+            "active": state["active_trades"],
+            "history": db_get_all_trades(device_id, limit=500)
+        }
     except Exception as e:
         return {"status": "error", "message": f"API Error: {str(e)}"}
 
