@@ -278,11 +278,10 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# ----------------- DYNAMIC NIFTY-STYLE TOP 100 MARKET SCANNER ENGINE -----------------
+# Universal market fetcher for all 31+ CCXT exchanges + CoinDCX
 def fetch_active_exchange_markets(state):
-    broker = state.get("active_broker", "coindcx")
+    broker = state.get("active_broker", "coindcx").lower()
     quote = state.get("quote_currency", "INR").upper()
-
     market_list = []
 
     if broker == "coindcx":
@@ -294,33 +293,15 @@ def fetch_active_exchange_markets(state):
                 price = float(item.get("last_price", 0.0))
                 vol = float(item.get("volume", 0.0))
                 change = float(item.get("change_24_hour", 0.0))
-                if price <= 0:
-                    continue
-
+                if price <= 0: continue
                 clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
-
                 if quote == "INR" and (m.endswith("_INR") or m.endswith("INR")) and not ("USDT" in m):
-                    market_list.append({
-                        "symbol": clean_coin + "INR",
-                        "base_coin": clean_coin,
-                        "raw_symbol": m,
-                        "price": price,
-                        "volume": vol,
-                        "change": change
-                    })
+                    market_list.append({"symbol": clean_coin + "INR", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
                 elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
-                    market_list.append({
-                        "symbol": clean_coin + "USDT",
-                        "base_coin": clean_coin,
-                        "raw_symbol": m,
-                        "price": price,
-                        "volume": vol,
-                        "change": change
-                    })
+                    market_list.append({"symbol": clean_coin + "USDT", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
         except Exception:
             pass
-
-    elif broker in ccxt.exchanges:
+    elif hasattr(ccxt, broker):
         try:
             exchange_class = getattr(ccxt, broker)
             inst = exchange_class({'enableRateLimit': True})
@@ -333,7 +314,7 @@ def fetch_active_exchange_markets(state):
                         "symbol": sym.replace("/", ""),
                         "base_coin": c_base,
                         "raw_symbol": sym,
-                        "price": float(t.get("last", 0.0)),
+                        "price": float(t.get("last", 0.0) or 0.0),
                         "volume": float(t.get("quoteVolume", 0.0) or 0.0),
                         "change": float(t.get("percentage", 0.0) or 0.0)
                     })
@@ -351,12 +332,8 @@ def fetch_active_exchange_markets(state):
                     clean_sym = c["symbol"].replace("USDT", "")
                     final_p = p * usd_to_inr if quote == "INR" else p
                     market_list.append({
-                        "symbol": clean_sym + quote,
-                        "base_coin": clean_sym,
-                        "raw_symbol": c["symbol"],
-                        "price": final_p,
-                        "volume": float(c["quoteVolume"]),
-                        "change": float(c["priceChangePercent"])
+                        "symbol": clean_sym + quote, "base_coin": clean_sym, "raw_symbol": c["symbol"],
+                        "price": final_p, "volume": float(c["quoteVolume"]), "change": float(c["priceChangePercent"])
                     })
         except:
             pass
@@ -364,9 +341,7 @@ def fetch_active_exchange_markets(state):
     if market_list:
         market_list.sort(key=lambda x: x.get("volume", 0.0), reverse=True)
         return market_list[:100]
-
     return []
-
 def get_coin_precision(clean_coin, current_price):
     if "BTC" in clean_coin:
         return 5
