@@ -119,18 +119,18 @@ def get_user_session(device_id: str):
     if device_id not in user_sessions:
         user_sessions[device_id] = {
             "is_running": False,
-            "active_broker": "coindcx",
+            "active_broker": "binance",
             "market_mode": "spot",
             "api_key": "",
             "secret_key": "",
-            "quote_currency": "INR",
-            "trade_amount": 500.0,
+            "quote_currency": "USDT",
+            "trade_amount": 10.0,
             "max_trades": 1,
             "trade_type": "intraday",
             "strategy": "volume",
             "deal_condition": "ASAP",
             "selected_coin": "AUTO",
-            "logs": ["🤖 Master AI Dual Engine Initialized. Ready for Real & Paper Trading."],
+            "logs": ["🤖 Master AI Dual Engine Initialized. CCXT Professional Mode Active."],
             "active_trades": [],
             "paper_balance": 500000.0,
             "today_pnl": 0.0,
@@ -278,9 +278,10 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
+# 100% CCXT & Official Supported Exchanges Market Fetcher
 def fetch_active_exchange_markets(state):
-    broker = state.get("active_broker", "coindcx").lower()
-    quote = state.get("quote_currency", "INR").upper()
+    broker = state.get("active_broker", "binance").lower()
+    quote = state.get("quote_currency", "USDT").upper()
     market_list = []
 
     if broker == "coindcx":
@@ -362,10 +363,10 @@ def get_coin_precision(clean_coin, current_price):
             return 4
 
 def fetch_real_cash_balance(state):
-    broker = state.get("active_broker", "coindcx").lower()
+    broker = state.get("active_broker", "binance").lower()
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
-    quote = state.get("quote_currency", "INR").upper()
+    quote = state.get("quote_currency", "USDT").upper()
 
     if broker == "paper":
         return float(state.get("paper_balance", 500000.0))
@@ -400,10 +401,8 @@ def fetch_real_cash_balance(state):
             balance = exchange.fetch_balance()
             total_bals = balance.get('total', {})
             return float(total_bals.get(quote, 0.0))
-            
-        else:
-            # 🚀 FIX: Default balance 0.0 for non-CCXT exchanges (no fake 5000)
-            return 0.0
+        
+        return 0.0
     except Exception as e:
         print(f"Balance Fetch Error ({broker}): {e}")
         return 0.0
@@ -662,7 +661,7 @@ async def direct_sell(request: Request):
 
         coin = data.get("symbol", "").strip().upper()
         quantity = float(data.get("quantity", 0))
-        broker = state.get("active_broker", "coindcx").lower()
+        broker = state.get("active_broker", "binance").lower()
 
         if quantity <= 0:
             return {"status": "error", "message": "Sell quantity must be greater than 0."}
@@ -684,7 +683,7 @@ async def direct_sell(request: Request):
                 state, coin, side="sell", exact_qty=quantity
             )
         else:
-            sold, exit_price, sell_qty = True, 100.0, quantity
+            return {"status": "error", "message": f"Broker '{broker}' execution not supported."}
 
         if not sold:
             add_log(state, f"⚠️ MANUAL EXIT NOT CONFIRMED: {coin} | {res_data}")
@@ -721,8 +720,8 @@ async def direct_sell(request: Request):
         else:
             sold_trade = {
                 "id": int(time.time() * 1000),
-                "symbol": f"{coin}{state.get('quote_currency', 'INR')}",
-                "currency": state.get("quote_currency", "INR"),
+                "symbol": f"{coin}{state.get('quote_currency', 'USDT')}",
+                "currency": state.get("quote_currency", "USDT"),
                 "type": "SELL",
                 "entry_price": float(exit_price),
                 "exit_price": float(exit_price),
@@ -754,16 +753,16 @@ async def execute_order(request: Request):
         device_id = data.get("device_id", "DEFAULT_DEVICE")
         state = get_user_session(device_id)
 
-        exchange = data.get("exchange", state.get("active_broker", "coindcx")).lower()
+        exchange = data.get("exchange", state.get("active_broker", "binance")).lower()
         api_key = data.get("api_key", state.get("api_key", "")).strip()
         secret_key = data.get("secret_key", state.get("secret_key", "")).strip()
         
         symbol = data.get("symbol", "").upper().strip()
         if not symbol:
-            symbol = "BTCINR" if state.get("quote_currency") == "INR" else "BTCUSDT"
+            symbol = "BTCUSDT"
 
-        currency = data.get("currency", state.get("quote_currency", "INR")).upper()
-        amount = float(data.get("amount", state.get("trade_amount", 500)))
+        currency = data.get("currency", state.get("quote_currency", "USDT")).upper()
+        amount = float(data.get("amount", state.get("trade_amount", 10)))
         side = data.get("side", "BUY").lower()
         mode = data.get("mode", state.get("market_mode", "spot")).lower()
 
@@ -778,15 +777,11 @@ async def execute_order(request: Request):
 
         curr_sym = get_curr_symbol(state)
 
-        available_cash = fetch_real_cash_balance(state)
-        if available_cash < amount and exchange != "paper":
-            pass
-
         if exchange == "paper":
             markets = fetch_active_exchange_markets(state)
             clean_coin = symbol.replace("INR", "").replace("USDT", "")
             match = next((m for m in markets if clean_coin in m["symbol"]), None)
-            sim_price = match["price"] if match else (8500000.0 if "BTC" in symbol else 150.0)
+            sim_price = match["price"] if match else (85000.0 if "BTC" in symbol else 1.5)
             calc_qty = int(amount / sim_price) if sim_price < 20 else round(amount / sim_price, 4)
             if calc_qty <= 0: calc_qty = 1
 
@@ -809,17 +804,13 @@ async def execute_order(request: Request):
             return {"status": "success", "message": f"Paper {side.upper()} order placed!", "price": sim_price, "qty": calc_qty}
 
         else:
-            success, price, qty, res = True, 8500000.0 if "BTC" in symbol else 150.0, 0.001, "Filled via Gateway"
+            success, price, qty, res = False, 0.0, 0.0, "Execution failed"
             if exchange == "coindcx":
                 success, price, qty, res = execute_coindcx_order(state, symbol, side=side, target_amount=amount)
             elif hasattr(ccxt, exchange):
                 success, price, qty, res = execute_ccxt_order(state, symbol, side=side, target_amount=amount)
             else:
-                markets = fetch_active_exchange_markets(state)
-                clean_coin = symbol.replace("INR", "").replace("USDT", "")
-                match = next((m for m in markets if clean_coin in m["symbol"]), None)
-                price = match["price"] if match else (8500000.0 if "BTC" in symbol else 150.0)
-                qty = round(amount / price, 4) if price > 0 else 1.0
+                return {"status": "error", "message": f"Exchange '{exchange}' is not supported for real trading."}
 
             if success:
                 new_trade = {
@@ -837,10 +828,10 @@ async def execute_order(request: Request):
                     "time": get_global_time()
                 }
                 state["active_trades"].insert(0, new_trade)
-                add_log(state, f"✅ USER ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
+                add_log(state, f"✅ REAL ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
                 return {"status": "success", "message": f"Real {side.upper()} order filled on {exchange.upper()}!", "price": price, "qty": qty}
             else:
-                add_log(state, f"❌ {exchange.upper()} Rejected: {res}")
+                add_log(state, f"❌ {exchange.upper()} Order Rejected: {res}")
                 return {"status": "error", "message": str(res)}
 
     except Exception as e:
@@ -865,7 +856,7 @@ async def set_broker_mode(request: Request):
     if mode == "paper":
         state["active_broker"] = "paper"
     elif mode == "real" and state.get("active_broker") == "paper":
-        state["active_broker"] = "coindcx"
+        state["active_broker"] = "binance"
     add_log(state, f"⚡ Broker Mode: {mode.upper()} | Exchange: {state['active_broker'].upper()}")
     return {"status": "success", "active_broker": state["active_broker"]}
 
@@ -873,12 +864,12 @@ async def set_broker_mode(request: Request):
 async def set_currency(request: Request):
     data = await request.json()
     state = get_user_session(data.get("device_id", ""))
-    currency = data.get("currency", "INR").upper()
+    currency = data.get("currency", "USDT").upper()
     if currency not in ["USDT", "INR"]:
         return {"status": "error", "message": "Only 'USDT' and 'INR' are supported"}
 
     state["quote_currency"] = currency
-    state["trade_amount"] = 500.0 if currency == "INR" else 5.0
+    state["trade_amount"] = 500.0 if currency == "INR" else 10.0
     add_log(state, f"💱 Currency switched to {currency} ({get_curr_symbol(state)})")
     return {
         "status": "success",
@@ -887,12 +878,12 @@ async def set_currency(request: Request):
         "trade_amount": state["trade_amount"]
     }
 
-# ----------------- UNIVERSAL 31-EXCHANGE SAFE-GATEWAY ENGINE -----------------
+# ----------------- CCXT 100% SUPPORTED EXCHANGES CONNECTION ROUTE -----------------
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
     state = get_user_session(data.get("device_id", ""))
-    exchange_id = data.get("exchange", "coindcx").lower()
+    exchange_id = data.get("exchange", "binance").lower()
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
 
@@ -941,27 +932,10 @@ async def connect_exchange(request: Request):
             return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
             
         else:
-            # 🚀 FIX: 0.0 default balance for non-CCXT exchanges so it doesn't show fake 5000
-            default_quote_amt = 0.0
-            state["session_start_fund"] = default_quote_amt
-            add_log(state, f"🔗 Connected to {exchange_id.upper()} via Universal Secure Gateway!")
-            return {
-                "status": "success", 
-                "message": f"Successfully connected to {exchange_id.upper()} via Universal Secure Gateway!",
-                "balances": {
-                    state["quote_currency"]: default_quote_amt
-                }
-            }
+            return {"status": "error", "message": f"Exchange '{exchange_id}' is not supported by CCXT engine."}
             
     except Exception as e:
-        fallback_amt = 0.0
-        state["session_start_fund"] = fallback_amt
-        add_log(state, f"⚠️ {exchange_id.upper()} API Connected via Safe-Session Gateway.")
-        return {
-            "status": "success",
-            "message": f"{exchange_id.upper()} Connected Successfully!",
-            "balances": {state["quote_currency"]: fallback_amt}
-        }
+        return {"status": "error", "message": f"Connection Failed: {str(e)}"}
 
 @app.post("/api/bot-control")
 async def bot_control(request: Request):
@@ -1006,7 +980,7 @@ async def close_trade(request: Request):
 
     try:
         side_to_exit = "sell" if trade_to_close["type"] in ["LONG", "BUY"] else "buy"
-        broker = state.get("active_broker", "coindcx").lower()
+        broker = state.get("active_broker", "binance").lower()
 
         if broker == "coindcx":
             sold, exit_price, filled_qty, msg = execute_coindcx_order(
@@ -1028,12 +1002,7 @@ async def close_trade(request: Request):
             if not sold:
                 return {"status": "error", "message": f"{broker.upper()} Exit Failed: {msg}"}
         else:
-            markets = fetch_active_exchange_markets(state)
-            exit_price = next(
-                (m["price"] for m in markets if m["symbol"] == trade_to_close["symbol"]),
-                trade_to_close["entry_price"],
-            )
-            filled_qty = float(trade_to_close.get("quantity", 0))
+            return {"status": "error", "message": f"Broker '{broker}' exit not supported."}
 
         entry = float(trade_to_close.get("entry_price", 1.0) or 1.0)
         exit_p = float(exit_price)
@@ -1173,7 +1142,7 @@ async def market_scanner_loop():
                     for trade in trades_to_close:
                         exit_p = live_prices.get(trade["symbol"], trade["entry_price"])
                         side_to_exit = "sell" if trade["type"] in ["LONG", "BUY"] else "buy"
-                        broker = state.get("active_broker", "coindcx").lower()
+                        broker = state.get("active_broker", "binance").lower()
                         sell_success = True
                         filled_qty = float(trade.get("quantity", 0.0))
                         msg = ""
@@ -1229,7 +1198,7 @@ async def market_scanner_loop():
 
                     allowed_slots = int(state.get("max_trades", 1))
                     if len(state["active_trades"]) < allowed_slots:
-                        order_amount = float(state.get("trade_amount", 500.0))
+                        order_amount = float(state.get("trade_amount", 10.0))
                         curr_sym = get_curr_symbol(state)
 
                         valid = [c for c in all_coins if c.get('price', 0) > 0]
@@ -1262,7 +1231,7 @@ async def market_scanner_loop():
                                 pos_type = "LONG"
                                 coin_sym = target_coin['symbol']
                                 current_p = target_coin['price']
-                                quote = state.get("quote_currency", "INR")
+                                quote = state.get("quote_currency", "USDT")
                                 broker = state["active_broker"].lower()
 
                                 if broker == "paper":
@@ -1287,7 +1256,7 @@ async def market_scanner_loop():
 
                                 else:
                                     side = "buy" if pos_type == "LONG" else "sell"
-                                    success, buy_price, buy_qty, res = True, current_p, round(order_amount / current_p, 4), "Gateway Fill"
+                                    success, buy_price, buy_qty, res = False, current_p, 0.0, "Gateway Error"
                                     if broker == "coindcx":
                                         success, buy_price, buy_qty, res = execute_coindcx_order(state, coin_sym, side=side, target_amount=order_amount)
                                     elif hasattr(ccxt, broker):
@@ -1318,7 +1287,7 @@ async def market_scanner_loop():
 @app.get("/")
 def root():
     return {
-        "status": "HiTech Dual AI Engine Live (Universal 31-Exchange)!",
+        "status": "HiTech Dual AI Engine Live (CCXT Professional Verified)!",
         "database": "SQLite Trades Active",
         "total_vip_keys": len(keys_db)
     }
