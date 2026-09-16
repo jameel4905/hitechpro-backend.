@@ -278,7 +278,6 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# Universal market fetcher for all 31+ CCXT exchanges + CoinDCX
 def fetch_active_exchange_markets(state):
     broker = state.get("active_broker", "coindcx").lower()
     quote = state.get("quote_currency", "INR").upper()
@@ -403,14 +402,13 @@ def fetch_real_cash_balance(state):
             return float(total_bals.get(quote, 0.0))
             
         else:
-            # 🚀 DYNAMIC BALANCES FOR NON-CCXT EXCHANGES (CoinSwitch, WazirX, etc.)
-            return float(state.get("session_start_fund", 0.0) or (5000.0 if quote == "INR" else 100.0))
+            # 🚀 FIX: Default balance 0.0 for non-CCXT exchanges (no fake 5000)
+            return 0.0
     except Exception as e:
         print(f"Balance Fetch Error ({broker}): {e}")
         return 0.0
 
 def _extract_coindcx_order(data):
-    """Normalize CoinDCX create/status responses to one order dictionary."""
     if isinstance(data, dict):
         if isinstance(data.get("orders"), list) and data["orders"]:
             return data["orders"][0]
@@ -424,7 +422,6 @@ def _extract_coindcx_order(data):
     return {}
 
 def _coindcx_auth_post(state, endpoint, body, timeout=10):
-    """Authenticated CoinDCX private API POST."""
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
     if not api_key or not secret_key:
@@ -454,7 +451,6 @@ def _coindcx_auth_post(state, endpoint, body, timeout=10):
     return res, payload
 
 def get_coindcx_order_status(state, order_id):
-    """Fetch the real exchange status of a CoinDCX spot order."""
     body = {
         "id": int(str(order_id)),
         "timestamp": int(round(time.time() * 1000)),
@@ -470,7 +466,6 @@ def get_coindcx_order_status(state, order_id):
     return True, order, ""
 
 def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5):
-    """Wait until a spot order is fully filled or reaches a terminal failure state."""
     deadline = time.time() + float(timeout_seconds)
     last_order = {}
     last_error = ""
@@ -514,7 +509,6 @@ def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5
     return False, {}, 0.0, 0.0, f"Unable to confirm CoinDCX order fill. {last_error}"
 
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
-    """Place a CoinDCX spot market order and confirm the actual exchange fill."""
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
     quote = state.get("quote_currency", "INR").upper()
@@ -785,7 +779,7 @@ async def execute_order(request: Request):
         curr_sym = get_curr_symbol(state)
 
         available_cash = fetch_real_cash_balance(state)
-        if available_cash < amount:
+        if available_cash < amount and exchange != "paper":
             pass
 
         if exchange == "paper":
@@ -947,27 +941,26 @@ async def connect_exchange(request: Request):
             return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
             
         else:
-            # 🚀 UNIVERSAL SAFE-GATEWAY FOR NON-CCXT EXCHANGES
-            default_quote_amt = 5000.0 if state["quote_currency"] == "INR" else 100.0
+            # 🚀 FIX: 0.0 default balance for non-CCXT exchanges so it doesn't show fake 5000
+            default_quote_amt = 0.0
             state["session_start_fund"] = default_quote_amt
             add_log(state, f"🔗 Connected to {exchange_id.upper()} via Universal Secure Gateway!")
             return {
                 "status": "success", 
                 "message": f"Successfully connected to {exchange_id.upper()} via Universal Secure Gateway!",
                 "balances": {
-                    state["quote_currency"]: default_quote_amt,
-                    "BTC": 0.001
+                    state["quote_currency"]: default_quote_amt
                 }
             }
             
     except Exception as e:
-        fallback_amt = 5000.0 if state["quote_currency"] == "INR" else 100.0
+        fallback_amt = 0.0
         state["session_start_fund"] = fallback_amt
         add_log(state, f"⚠️ {exchange_id.upper()} API Connected via Safe-Session Gateway.")
         return {
             "status": "success",
             "message": f"{exchange_id.upper()} Connected Successfully!",
-            "balances": {state["quote_currency"]: fallback_amt, "BTC": 0.001}
+            "balances": {state["quote_currency"]: fallback_amt}
         }
 
 @app.post("/api/bot-control")
@@ -1110,7 +1103,6 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "today_pnl": state["today_pnl"]
     }
 
-# 🚀 NIFTY-STYLE DYNAMIC TOP 100 SCANNER, LOW BALANCE PROTECTION & STRICT CONFIRMATION ENGINE
 async def market_scanner_loop():
     while True:
         try:
@@ -1155,7 +1147,6 @@ async def market_scanner_loop():
 
                     live_prices = {c['symbol']: c['price'] for c in all_coins}
 
-                    # SL & TARGET TRACKING WITH INDEPENDENT TRAILING
                     trades_to_close = []
                     for trade in list(state["active_trades"]):
                         sym = trade["symbol"]
