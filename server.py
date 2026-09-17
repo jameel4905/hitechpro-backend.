@@ -56,10 +56,10 @@ def db_save_trade(trade: dict, device_id: str, broker: str):
                 pnl_percent, pnl_val, status, broker, close_time
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            str(trade.get("id", int(time.time()))),
+            str(trade.get("id", int(time.time() * 1000))),
             device_id,
             trade.get("symbol", ""),
-            trade.get("currency", "INR"),
+            trade.get("currency", "USDT"),
             trade.get("type", "BUY"),
             float(trade.get("entry_price", 0.0)),
             float(trade.get("exit_price", 0.0)),
@@ -278,7 +278,6 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# 100% CCXT & Official Supported Exchanges Market Fetcher
 def fetch_active_exchange_markets(state):
     broker = state.get("active_broker", "binance").lower()
     quote = state.get("quote_currency", "USDT").upper()
@@ -786,7 +785,7 @@ async def execute_order(request: Request):
             if calc_qty <= 0: calc_qty = 1
 
             new_trade = {
-                "id": int(time.time()),
+                "id": int(time.time() * 1000),
                 "symbol": symbol,
                 "currency": currency,
                 "type": "LONG" if side == "buy" else "SHORT",
@@ -814,7 +813,7 @@ async def execute_order(request: Request):
 
             if success:
                 new_trade = {
-                    "id": int(time.time()),
+                    "id": int(time.time() * 1000),
                     "symbol": symbol,
                     "currency": currency,
                     "type": "LONG" if side == "buy" else "SHORT",
@@ -831,7 +830,7 @@ async def execute_order(request: Request):
                 add_log(state, f"✅ REAL ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
                 return {"status": "success", "message": f"Real {side.upper()} order filled on {exchange.upper()}!", "price": price, "qty": qty}
             else:
-                add_log(state, f"❌ {exchange.upper()} Order Rejected: {res}")
+                add_log(state, f"❌ {exchange.upper()} Rejected: {res}")
                 return {"status": "error", "message": str(res)}
 
     except Exception as e:
@@ -878,7 +877,6 @@ async def set_currency(request: Request):
         "trade_amount": state["trade_amount"]
     }
 
-# ----------------- CCXT 100% SUPPORTED EXCHANGES CONNECTION ROUTE -----------------
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
@@ -958,7 +956,7 @@ async def bot_control(request: Request):
         if "max_trades" in data: state["max_trades"] = int(data["max_trades"])
 
         curr_sym = get_curr_symbol(state)
-        target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "Nifty-Style Dynamic Top 100 Index Scanner"
+        target_info = state["selected_coin"] if state["selected_coin"] != "AUTO" else "Top 100 Index Scanner"
         add_log(state, f"🚀 BOT STARTED | Target: {target_info} | Slots: {state['max_trades']} | Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']}")
         return {"status": "success", "message": "Bot Started!"}
     elif action == "stop":
@@ -966,7 +964,6 @@ async def bot_control(request: Request):
         add_log(state, "🛑 BOT STOPPED! Market scanning halted.")
         return {"status": "success", "message": "Bot Stopped!"}
 
-# 🚀 100% MATHEMATICALLY EXACT MANUAL DEAL CLOSER WITH STRICT VERIFICATION & STATE SYNC
 @app.post("/api/close-trade")
 async def close_trade(request: Request):
     data = await request.json()
@@ -1002,7 +999,12 @@ async def close_trade(request: Request):
             if not sold:
                 return {"status": "error", "message": f"{broker.upper()} Exit Failed: {msg}"}
         else:
-            return {"status": "error", "message": f"Broker '{broker}' exit not supported."}
+            markets = fetch_active_exchange_markets(state)
+            exit_price = next(
+                (m["price"] for m in markets if m["symbol"] == trade_to_close["symbol"]),
+                trade_to_close["entry_price"],
+            )
+            filled_qty = float(trade_to_close.get("quantity", 0))
 
         entry = float(trade_to_close.get("entry_price", 1.0) or 1.0)
         exit_p = float(exit_price)
@@ -1160,7 +1162,7 @@ async def market_scanner_loop():
                             if sell_success and confirmed_price > 0:
                                 exit_p = confirmed_price
 
-                        if not sell_success:
+                        if not sell_success and broker != "paper":
                             add_log(state, f"⚠️ EXIT NOT CONFIRMED on {broker.upper()}: {msg}. Retrying...")
                             continue
 
@@ -1191,7 +1193,7 @@ async def market_scanner_loop():
                         db_save_trade(trade, dev_id, broker)
                         add_log(
                             state,
-                            f"🎯 DEAL CLOSED & EXCHANGE FILLED: {trade['type']} {trade['symbol']} | "
+                            f"🎯 DEAL CLOSED & FILLED: {trade['type']} {trade['symbol']} | "
                             f"P&L: {trade['pnl_percent']}% (Net: {get_curr_symbol(state)}{trade['pnl_val']}) "
                             f"[{trade['status']}]"
                         )
@@ -1238,7 +1240,7 @@ async def market_scanner_loop():
                                     calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
                                     if calc_qty <= 0: calc_qty = 1
                                     new_trade = {
-                                        "id": int(time.time()),
+                                        "id": int(time.time() * 1000),
                                         "symbol": coin_sym,
                                         "currency": quote,
                                         "type": pos_type,
@@ -1264,7 +1266,7 @@ async def market_scanner_loop():
 
                                     if success:
                                         new_trade = {
-                                            "id": int(time.time()),
+                                            "id": int(time.time() * 1000),
                                             "symbol": coin_sym,
                                             "currency": quote,
                                             "type": pos_type,
