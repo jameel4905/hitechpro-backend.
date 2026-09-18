@@ -1245,34 +1245,38 @@ async def market_scanner_loop():
                         order_amount = float(state.get("trade_amount", 500.0))
                         curr_sym = get_curr_symbol(state)
 
-                        # FIX: Yeh check karega ki coin pehle se active trades mein na ho
                         active_symbols = [t['symbol'] for t in state["active_trades"]]
                         valid = [c for c in all_coins if c.get('price', 0) > 0 and c['symbol'] not in active_symbols]
 
                         if valid:
                             selected = state.get("selected_coin", "AUTO")
+                            deal_cond = state.get("deal_condition", "ASAP")
                             target_coin = None
 
                             if selected != "AUTO":
                                 target_coin = next((c for c in valid if selected in c['symbol']), None)
                             else:
-                                min_volume = 150000.0 if state.get("quote_currency") == "INR" else 20000.0
-                                breakout_candidates = []
-
-                                for c in valid:
-                                    vol = float(c.get("volume", 0.0))
-                                    chg = float(c.get("change", 0.0))
-                                    if vol >= min_volume and 2.2 <= chg <= 8.8:
-                                        breakout_candidates.append(c)
-
-                                if breakout_candidates:
-                                    breakout_candidates.sort(key=lambda x: x.get('volume', 0.0) * x.get('change', 0.0), reverse=True)
-                                    target_coin = breakout_candidates[0]
-                                    add_log(state, f"⚡ BREAKOUT SIGNAL: {target_coin['symbol']} (+{target_coin['change']:.2f}%, Vol: {target_coin['volume']:.0f})")
+                                # FIXED: Agar deal condition ASAP hai toh bina kisi strict filter ke foran top coin utha lo!
+                                if deal_cond == "ASAP":
+                                    target_coin = valid[0] if valid else None
+                                    add_log(state, f"⚡ [ASAP MODE] Immediate Target Selected: {target_coin['symbol'] if target_coin else 'None'}")
                                 else:
-                                    positive_coins = [c for c in valid if c.get('change', 0.0) > 0.5]
-                                    if positive_coins:
-                                        target_coin = sorted(positive_coins, key=lambda x: x.get('volume', 0.0), reverse=True)[0]
+                                    min_volume = 150000.0 if state.get("quote_currency") == "INR" else 20000.0
+                                    breakout_candidates = []
+
+                                    for c in valid:
+                                        vol = float(c.get("volume", 0.0))
+                                        chg = float(c.get("change", 0.0))
+                                        if vol >= min_volume and 2.2 <= chg <= 8.8:
+                                            breakout_candidates.append(c)
+
+                                    if breakout_candidates:
+                                        breakout_candidates.sort(key=lambda x: x.get('volume', 0.0) * x.get('change', 0.0), reverse=True)
+                                        target_coin = breakout_candidates[0]
+                                    else:
+                                        positive_coins = [c for c in valid if c.get('change', 0.0) > 0.5]
+                                        if positive_coins:
+                                            target_coin = sorted(positive_coins, key=lambda x: x.get('volume', 0.0), reverse=True)[0]
 
                             if target_coin:
                                 pos_type = "LONG"
