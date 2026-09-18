@@ -130,7 +130,7 @@ def get_user_session(device_id: str):
             "strategy": "volume",
             "deal_condition": "ASAP",
             "selected_coin": "AUTO",
-            "logs": ["🤖 Master AI Dual Engine Initialized. Ready for Real & Paper Trading."],
+            "logs": ["🤖 Master AI Dual Engine Initialized. Background Persistence Active."],
             "active_trades": [],
             "paper_balance": 500000.0,
             "today_pnl": 0.0,
@@ -1245,7 +1245,10 @@ async def market_scanner_loop():
                         order_amount = float(state.get("trade_amount", 500.0))
                         curr_sym = get_curr_symbol(state)
 
-                        valid = [c for c in all_coins if c.get('price', 0) > 0]
+                        # FIX: Yeh check karega ki coin pehle se active trades mein na ho
+                        active_symbols = [t['symbol'] for t in state["active_trades"]]
+                        valid = [c for c in all_coins if c.get('price', 0) > 0 and c['symbol'] not in active_symbols]
+
                         if valid:
                             selected = state.get("selected_coin", "AUTO")
                             target_coin = None
