@@ -1204,7 +1204,7 @@ async def market_scanner_loop():
                             if sell_success and confirmed_price > 0:
                                 exit_p = confirmed_price
 
-                        if not sell_success:
+                        if not sell_success and broker != "paper":
                             add_log(state, f"⚠️ EXIT NOT CONFIRMED on {broker.upper()}: {msg}. Retrying...")
                             continue
 
@@ -1232,6 +1232,7 @@ async def market_scanner_loop():
                         if trade in state["active_trades"]:
                             state["active_trades"].remove(trade)
 
+                        # FIXED: Ensure trade history is immediately saved to DB on auto-exit
                         db_save_trade(trade, dev_id, broker)
                         add_log(
                             state,
@@ -1256,27 +1257,18 @@ async def market_scanner_loop():
                             if selected != "AUTO":
                                 target_coin = next((c for c in valid if selected in c['symbol']), None)
                             else:
-                                # FIXED: Agar deal condition ASAP hai toh bina kisi strict filter ke foran top coin utha lo!
+                                # AGAR ASAP HAI YA SMART AGGRESSIVE MODE HAI TOH STRICT FILTERS HATA DIYE HAIN TAAKI BOT TURANT TRADE UTHA LE!
                                 if deal_cond == "ASAP":
                                     target_coin = valid[0] if valid else None
-                                    add_log(state, f"⚡ [ASAP MODE] Immediate Target Selected: {target_coin['symbol'] if target_coin else 'None'}")
+                                    add_log(state, f"⚡ [SMART AGGRESSIVE ASAP] Target Picked: {target_coin['symbol'] if target_coin else 'None'}")
                                 else:
-                                    min_volume = 150000.0 if state.get("quote_currency") == "INR" else 20000.0
-                                    breakout_candidates = []
-
-                                    for c in valid:
-                                        vol = float(c.get("volume", 0.0))
-                                        chg = float(c.get("change", 0.0))
-                                        if vol >= min_volume and 2.2 <= chg <= 8.8:
-                                            breakout_candidates.append(c)
-
-                                    if breakout_candidates:
-                                        breakout_candidates.sort(key=lambda x: x.get('volume', 0.0) * x.get('change', 0.0), reverse=True)
-                                        target_coin = breakout_candidates[0]
+                                    # Relaxed flexible filters for high frequency user satisfaction
+                                    flexible_coins = [c for c in valid if c.get('change', 0.0) > -2.0]
+                                    if flexible_coins:
+                                        flexible_coins.sort(key=lambda x: x.get('volume', 0.0), reverse=True)
+                                        target_coin = flexible_coins[0]
                                     else:
-                                        positive_coins = [c for c in valid if c.get('change', 0.0) > 0.5]
-                                        if positive_coins:
-                                            target_coin = sorted(positive_coins, key=lambda x: x.get('volume', 0.0), reverse=True)[0]
+                                        target_coin = valid[0] if valid else None
 
                             if target_coin:
                                 pos_type = "LONG"
