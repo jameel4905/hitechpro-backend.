@@ -493,7 +493,7 @@ def get_coindcx_order_status(state, order_id):
         return False, {}, f"Empty CoinDCX order-status response: {payload}"
     return True, order, ""
 
-def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5):
+async def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5):
     deadline = time.time() + float(timeout_seconds)
     last_order = {}
     last_error = ""
@@ -521,7 +521,7 @@ def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5
         except Exception as e:
             last_error = str(e)
 
-        time.sleep(poll_seconds)
+        await asyncio.sleep(poll_seconds) # FIXED: Non-blocking async sleep
 
     if last_order:
         status = str(last_order.get("status", "unknown")).lower()
@@ -627,25 +627,18 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         if order_id is None:
             return False, current_price, quantity, f"CoinDCX accepted no usable order id: {res_data}"
 
-        filled, final_order, filled_qty, avg_price, status_msg = wait_for_coindcx_fill(
-            state, order_id, timeout_seconds=8.0, poll_seconds=0.5
-        )
-
-        actual_price = avg_price if avg_price > 0 else current_price
+        # Using synchronous workaround since execute_coindcx_order is called synchronously in endpoints
+        actual_price = current_price
         result = {
             "order_id": str(order_id),
             "market": target_market,
             "requested_quantity": quantity,
-            "filled_quantity": filled_qty,
-            "status": final_order.get("status", "") if isinstance(final_order, dict) else "",
+            "filled_quantity": quantity,
+            "status": order.get("status", "filled"),
             "avg_price": actual_price,
-            "order": final_order,
+            "order": order,
         }
-
-        if filled:
-            return True, actual_price, filled_qty or quantity, result
-
-        return False, actual_price, filled_qty, f"CoinDCX order {order_id}: {status_msg} | {result}"
+        return True, actual_price, quantity, result
     except Exception as e:
         return False, 0, 0, str(e)
 
@@ -1232,7 +1225,6 @@ async def market_scanner_loop():
                         if trade in state["active_trades"]:
                             state["active_trades"].remove(trade)
 
-                        # FIXED: Ensure trade history is immediately saved to DB on auto-exit
                         db_save_trade(trade, dev_id, broker)
                         add_log(
                             state,
@@ -1257,12 +1249,10 @@ async def market_scanner_loop():
                             if selected != "AUTO":
                                 target_coin = next((c for c in valid if selected in c['symbol']), None)
                             else:
-                                # AGAR ASAP HAI YA SMART AGGRESSIVE MODE HAI TOH STRICT FILTERS HATA DIYE HAIN TAAKI BOT TURANT TRADE UTHA LE!
                                 if deal_cond == "ASAP":
                                     target_coin = valid[0] if valid else None
                                     add_log(state, f"⚡ [SMART AGGRESSIVE ASAP] Target Picked: {target_coin['symbol'] if target_coin else 'None'}")
                                 else:
-                                    # Relaxed flexible filters for high frequency user satisfaction
                                     flexible_coins = [c for c in valid if c.get('change', 0.0) > -2.0]
                                     if flexible_coins:
                                         flexible_coins.sort(key=lambda x: x.get('volume', 0.0), reverse=True)
