@@ -278,7 +278,6 @@ async def verify_vip_key(request: Request):
         "expires_at": record["expires_at"]
     }
 
-# ----------------- NEW BACKTESTING & SENTIMENT APIS -----------------
 @app.post("/api/backtest")
 async def run_backtest(request: Request):
     data = await request.json()
@@ -312,9 +311,10 @@ def fetch_active_exchange_markets(state):
     quote = state.get("quote_currency", "INR").upper()
     market_list = []
 
-    if broker == "coindcx":
-        try:
-            res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
+    try:
+        if broker == "coindcx":
+            # FIXED: Reduced timeout to 4s to prevent thread blocking
+            res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=4)
             data = res.json()
             for item in data:
                 m = item.get("market", "")
@@ -327,12 +327,9 @@ def fetch_active_exchange_markets(state):
                     market_list.append({"symbol": clean_coin + "INR", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
                 elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
                     market_list.append({"symbol": clean_coin + "USDT", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
-        except Exception:
-            pass
-    elif hasattr(ccxt, broker):
-        try:
+        elif hasattr(ccxt, broker):
             exchange_class = getattr(ccxt, broker)
-            inst = exchange_class({'enableRateLimit': True})
+            inst = exchange_class({'enableRateLimit': True, 'timeout': 4000})
             tickers = inst.fetch_tickers()
             target_suffix = f"/{quote}"
             for sym, t in tickers.items():
@@ -346,12 +343,12 @@ def fetch_active_exchange_markets(state):
                         "volume": float(t.get("quoteVolume", 0.0) or 0.0),
                         "change": float(t.get("percentage", 0.0) or 0.0)
                     })
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     if not market_list:
         try:
-            res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=8)
+            res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=4)
             data = res.json()
             usd_to_inr = 89.5
             for c in data:
@@ -409,7 +406,7 @@ def fetch_real_cash_balance(state):
             json_body = json.dumps(body, separators=(',', ':'))
             signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
             headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
-            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=8)
+            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=5)
             res_data = res.json()
             if isinstance(res_data, list):
                 total_quote_bal = 0.0
@@ -425,7 +422,7 @@ def fetch_real_cash_balance(state):
 
         elif hasattr(ccxt, broker):
             exchange_class = getattr(ccxt, broker)
-            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True, 'timeout': 5000})
             balance = exchange.fetch_balance()
             total_bals = balance.get('total', {})
             return float(total_bals.get(quote, 0.0))
@@ -449,7 +446,7 @@ def _extract_coindcx_order(data):
             return data[0]
     return {}
 
-def _coindcx_auth_post(state, endpoint, body, timeout=10):
+def _coindcx_auth_post(state, endpoint, body, timeout=6):
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
     if not api_key or not secret_key:
@@ -483,7 +480,7 @@ def get_coindcx_order_status(state, order_id):
         "id": int(str(order_id)),
         "timestamp": int(round(time.time() * 1000)),
     }
-    res, payload = _coindcx_auth_post(state, "/exchange/v1/orders/status", body, timeout=8)
+    res, payload = _coindcx_auth_post(state, "/exchange/v1/orders/status", body, timeout=5)
     if res.status_code != 200:
         msg = payload.get("message", str(payload)) if isinstance(payload, dict) else str(payload)
         return False, {}, f"Order status HTTP {res.status_code}: {msg}"
@@ -493,7 +490,7 @@ def get_coindcx_order_status(state, order_id):
         return False, {}, f"Empty CoinDCX order-status response: {payload}"
     return True, order, ""
 
-async def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_seconds=0.5):
+async def wait_for_coindcx_fill(state, order_id, timeout_seconds=5.0, poll_seconds=0.5):
     deadline = time.time() + float(timeout_seconds)
     last_order = {}
     last_error = ""
@@ -521,7 +518,7 @@ async def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_secon
         except Exception as e:
             last_error = str(e)
 
-        await asyncio.sleep(poll_seconds) # FIXED: Non-blocking async sleep instead of time.sleep
+        await asyncio.sleep(poll_seconds)
 
     if last_order:
         status = str(last_order.get("status", "unknown")).lower()
@@ -551,7 +548,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
             .replace("_", "").strip().upper()
         )
 
-        ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=8)
+        ticker_res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=5)
         ticker_res.raise_for_status()
         tickers = ticker_res.json()
 
@@ -617,7 +614,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
             "timestamp": int(round(time.time() * 1000)),
         }
 
-        res, res_data = _coindcx_auth_post(state, "/exchange/v1/orders/create", body, timeout=10)
+        res, res_data = _coindcx_auth_post(state, "/exchange/v1/orders/create", body, timeout=6)
         if res.status_code != 200:
             err_msg = res_data.get("message", str(res_data)) if isinstance(res_data, dict) else str(res_data)
             return False, current_price, quantity, f"HTTP {res.status_code}: {err_msg}"
@@ -652,7 +649,7 @@ def execute_ccxt_order(state, raw_symbol, side="buy", target_amount=100.0, exact
 
     try:
         exchange_class = getattr(ccxt, broker)
-        inst = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+        inst = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True, 'timeout': 5000})
         clean_coin = raw_symbol.replace("USDT", "").replace("INR", "").replace("/", "").strip().upper()
         symbol_pair = f"{clean_coin}/{quote}"
         ticker = inst.fetch_ticker(symbol_pair)
@@ -925,7 +922,7 @@ async def connect_exchange(request: Request):
             json_body = json.dumps(body, separators=(',', ':'))
             signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
             headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
-            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=10)
+            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=5)
             res_data = res.json()
             
             if isinstance(res_data, list):
@@ -947,7 +944,7 @@ async def connect_exchange(request: Request):
         
         elif hasattr(ccxt, exchange_id):
             exchange_class = getattr(ccxt, exchange_id)
-            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True})
+            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True, 'timeout': 5000})
             balance = exchange.fetch_balance()
             dynamic_balances = {coin: float(amt) for coin, amt in balance.get('total', {}).items() if isinstance(amt, (int, float)) and amt > 0.00000001}
             cash_fund = dynamic_balances.get(state["quote_currency"], 0.0)
@@ -1314,7 +1311,7 @@ async def market_scanner_loop():
         except Exception as e:
             print(f"[SCANNER ERROR] {type(e).__name__}: {e}")
 
-        await asyncio.sleep(3.5)
+        await asyncio.sleep(5.0) # FIXED: Increased scanner interval from 3.5s to 5s to reduce load
 
 @app.get("/")
 def root():
