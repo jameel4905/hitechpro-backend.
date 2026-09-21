@@ -521,7 +521,7 @@ async def wait_for_coindcx_fill(state, order_id, timeout_seconds=8.0, poll_secon
         except Exception as e:
             last_error = str(e)
 
-        await asyncio.sleep(poll_seconds) # FIXED: Non-blocking async sleep
+        await asyncio.sleep(poll_seconds) # FIXED: Non-blocking async sleep instead of time.sleep
 
     if last_order:
         status = str(last_order.get("status", "unknown")).lower()
@@ -627,7 +627,6 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         if order_id is None:
             return False, current_price, quantity, f"CoinDCX accepted no usable order id: {res_data}"
 
-        # Using synchronous workaround since execute_coindcx_order is called synchronously in endpoints
         actual_price = current_price
         result = {
             "order_id": str(order_id),
