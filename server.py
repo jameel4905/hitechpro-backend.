@@ -60,7 +60,7 @@ def db_save_trade(trade: dict, device_id: str, broker: str):
             device_id,
             trade.get("symbol", ""),
             trade.get("currency", "INR"),
-            trade.get("type", "BUY"),
+            trade.get("type", trade.get("side", "BUY")),
             float(trade.get("entry_price", 0.0)),
             float(trade.get("exit_price", 0.0)),
             float(trade.get("quantity", 0.0)),
@@ -320,7 +320,6 @@ def fetch_active_exchange_markets(state):
 
     try:
         if broker == "coindcx":
-            # FIXED: Reduced timeout to 4s to prevent thread blocking
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=4)
             data = res.json()
             for item in data:
@@ -697,7 +696,6 @@ def _pnl_for_trade(trade, exit_price, qty):
 
 def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
                            broker, reason="MANUAL EXIT"):
-    """Single close path used by manual, target, SL and panic exits."""
     exit_p = float(exit_price or trade.get("entry_price", 0.0) or 0.0)
     qty = float(filled_qty or trade.get("quantity", 0.0) or 0.0)
     pnl_pct, pnl_val = _pnl_for_trade(trade, exit_p, qty)
@@ -742,7 +740,6 @@ def _find_live_price(state, symbol, fallback=0.0):
 
 def _close_trade_at_market(state, device_id, trade, reason="MANUAL EXIT",
                            preferred_price=None):
-    """Execute an exit for real brokers; paper mode closes against live market price."""
     trade_key = str(trade.get("id"))
     closing_ids = state.setdefault("_closing_ids", set())
     if trade_key in closing_ids:
@@ -840,7 +837,6 @@ async def direct_sell(request: Request):
                 f"{get_curr_symbol(state)}{exit_price} on {broker.upper()}!"
             )
         else:
-            # Direct asset sell without a tracked position is retained as a portfolio action.
             if broker == "paper":
                 exit_price = _find_live_price(state, coin, 0.0)
                 if exit_price <= 0:
@@ -908,8 +904,8 @@ async def execute_order(request: Request):
         side = data.get("side", "BUY").lower()
         mode = data.get("mode", state.get("market_mode", "spot")).lower()
 
-        sl_pct = float(data.get("sl_percent", 2.0)) / 100.0
-        target_pct = float(data.get("target_percent", 1.5)) / 100.0
+        sl_pct = float(data.get("sl_percent", state.get("sl_percent", 2.0))) / 100.0
+        target_pct = float(data.get("target_percent", state.get("target_percent", 1.5))) / 100.0
 
         state["active_broker"] = exchange
         state["quote_currency"] = currency
@@ -1257,9 +1253,6 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
     }
 
 def _get_ai_sentiment_scores():
-    # Existing sentiment endpoint is the app's current AI-sentiment source.
-    # It is intentionally kept local here so the scanner does not create an HTTP
-    # self-request every 5 seconds.
     return {
         "BTC": 84,
         "ETH": 79,
@@ -1275,9 +1268,6 @@ def _select_top20_ai_news(valid_coins):
     if not top20:
         return None
 
-    # Volume is the primary ranking. AI sentiment is a secondary tie-breaker.
-    # This keeps the "Top 20" requirement explicit while using the existing
-    # sentiment feed for the AI-News signal.
     max_volume = max(float(c.get("volume", 0.0) or 0.0) for c in top20) or 1.0
     max_change = max(abs(float(c.get("change", 0.0) or 0.0)) for c in top20) or 1.0
 
@@ -1288,7 +1278,6 @@ def _select_top20_ai_news(valid_coins):
         momentum = max(0.0, min(1.0, (change + max_change) / (2.0 * max_change)))
         news_score = float(sentiment.get(str(coin.get("base_coin", "")).upper(), 50)) / 100.0
 
-        # 60% volume + 25% momentum + 15% AI sentiment.
         score = (0.60 * base_volume) + (0.25 * momentum) + (0.15 * news_score)
         scored.append((score, coin))
 
@@ -1304,10 +1293,8 @@ async def market_scanner_loop():
             for dev_id, state in list(user_sessions.items()):
                 check_midnight_settlement(state)
 
-                # Cooldown is still allowed to stop opening NEW deals.
                 if state.get("sleep_until"):
                     if now_ts < state["sleep_until"]:
-                        # Existing positions must still be monitored/closed.
                         pass
                     else:
                         state["sleep_until"] = None
@@ -1316,7 +1303,6 @@ async def market_scanner_loop():
                         state["is_running"] = True
                         add_log(state, "⏰ 12-Hour Cooldown Completed! Bot Engine Resumed.")
 
-                # Session limits stop new deals, but do not disable exit monitoring.
                 base_fund = state.get("session_start_fund", 0.0)
                 if base_fund > 0 and state.get("is_running"):
                     profit_limit_15 = base_fund * 0.15
@@ -1343,9 +1329,6 @@ async def market_scanner_loop():
                             "New deals sleeping for 12 Hours."
                         )
 
-                # We need market data whenever there are active trades, even if
-                # the user stopped the bot. This is what makes manual 1.5% target
-                # and SL work independently of the START/STOP button.
                 needs_prices = bool(state.get("active_trades")) or bool(state.get("is_running"))
                 if not needs_prices:
                     continue
@@ -1376,7 +1359,6 @@ async def market_scanner_loop():
                     target_p = float(trade.get("target_price", 0) or 0)
                     sl_p = float(trade.get("sl_price", 0) or 0)
 
-                    # Legacy trades get correct configurable defaults.
                     target_pct = float(state.get("target_percent", 1.5)) / 100.0
                     sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
 
@@ -1394,8 +1376,6 @@ async def market_scanner_loop():
                     if trade.get("type") in ["LONG", "BUY"]:
                         if curr_p > float(trade.get("highest_price", entry) or entry):
                             trade["highest_price"] = curr_p
-                            # Preserve the original fixed target while allowing
-                            # a trailing SL to move only in the profitable direction.
                             trail_sl = curr_p * (1.0 - sl_pct)
                             trade["sl_price"] = max(float(trade.get("sl_price", sl_p)), trail_sl)
 
@@ -1438,7 +1418,6 @@ async def market_scanner_loop():
                             )
 
                 # ---------- NEW DEAL OPENING ----------
-                # Opening is controlled by is_running + cooldown + session limits.
                 if not state.get("is_running"):
                     continue
                 if state.get("sleep_until") and now_ts < state["sleep_until"]:
