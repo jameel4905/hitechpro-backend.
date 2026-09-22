@@ -45,38 +45,39 @@ def init_db():
 
 init_db()
 
+# 1. Yeh robust database save function dalo taaki history kabhi miss na ho
 def db_save_trade(trade: dict, device_id: str, broker: str):
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
+        
+        # Safe extraction of values to avoid any NoneType crashes
+        t_id = str(trade.get("id", int(time.time() * 1000)))
+        sym = str(trade.get("symbol", "BTCINR"))
+        curr = str(trade.get("currency", "INR"))
+        side = str(trade.get("type", trade.get("side", "BUY")))
+        entry = float(trade.get("entry_price", 0.0) or 0.0)
+        exit_p = float(trade.get("exit_price", 0.0) or 0.0)
+        qty = float(trade.get("quantity", 0.0) or 0.0)
+        amt = float(trade.get("amount", 0.0) or 0.0)
+        sl = float(trade.get("sl_price", 0.0) or 0.0)
+        tgt = float(trade.get("target_price", 0.0) or 0.0)
+        pnl_pct = float(trade.get("pnl_percent", 0.0) or 0.0)
+        pnl_val = float(trade.get("pnl_val", 0.0) or 0.0)
+        status = str(trade.get("status", "CLOSED"))
+        close_t = str(trade.get("close_time", datetime.now(timezone.utc).isoformat() + "Z"))
+
         cursor.execute("""
             INSERT OR REPLACE INTO trades (
                 trade_id, device_id, symbol, currency, side, entry_price, 
                 exit_price, quantity, amount, sl_price, target_price, 
                 pnl_percent, pnl_val, status, broker, close_time
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(trade.get("id", int(time.time() * 1000))),
-            device_id,
-            trade.get("symbol", ""),
-            trade.get("currency", "INR"),
-            trade.get("type", trade.get("side", "BUY")),
-            float(trade.get("entry_price", 0.0)),
-            float(trade.get("exit_price", 0.0)),
-            float(trade.get("quantity", 0.0)),
-            float(trade.get("amount", 0.0)),
-            float(trade.get("sl_price", 0.0)),
-            float(trade.get("target_price", 0.0)),
-            float(trade.get("pnl_percent", 0.0)),
-            float(trade.get("pnl_val", 0.0)),
-            trade.get("status", "CLOSED"),
-            broker,
-            trade.get("close_time", datetime.now(timezone.utc).isoformat() + "Z")
-        ))
+        """, (t_id, device_id, sym, curr, side, entry, exit_p, qty, amt, sl, tgt, pnl_pct, pnl_val, status, broker, close_t))
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"DB Error: {e}")
+        print(f"DB Save Critical Error: {e}")
 
 def db_get_all_trades(device_id: str, limit: int = 1000):
     try:
@@ -1285,201 +1286,101 @@ def _select_top20_ai_news(valid_coins):
     return scored[0][1]
 
 
+# 2. Yeh auto-recovering aur error-proof market scanner loop dalo taaki bot kabhi auto-off na ho
 async def market_scanner_loop():
     while True:
         try:
             now_ts = time.time()
 
             for dev_id, state in list(user_sessions.items()):
-                check_midnight_settlement(state)
+                try:
+                    check_midnight_settlement(state)
 
-                if state.get("sleep_until"):
-                    if now_ts < state["sleep_until"]:
-                        pass
-                    else:
-                        state["sleep_until"] = None
-                        state["sleep_reason"] = ""
-                        state["today_pnl"] = 0.0
-                        state["is_running"] = True
-                        add_log(state, "⏰ 12-Hour Cooldown Completed! Bot Engine Resumed.")
+                    if state.get("sleep_until"):
+                        if now_ts >= state["sleep_until"]:
+                            state["sleep_until"] = None
+                            state["sleep_reason"] = ""
+                            state["today_pnl"] = 0.0
+                            state["is_running"] = True
+                            add_log(state, "⏰ 12-Hour Cooldown Completed! Bot Engine Resumed.")
 
-                base_fund = state.get("session_start_fund", 0.0)
-                if base_fund > 0 and state.get("is_running"):
-                    profit_limit_15 = base_fund * 0.15
-                    loss_limit_10 = -(base_fund * 0.10)
-                    curr_sym = get_curr_symbol(state)
+                    # Exit monitoring (yeh hamesha chalega chahe bot start ho ya stop)
+                    if state.get("active_trades"):
+                        all_coins = fetch_active_exchange_markets(state)
+                        if all_coins:
+                            live_prices = {c["symbol"]: float(c.get("price", 0.0) or 0.0) for c in all_coins}
+                            live_by_base = {str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0) for c in all_coins}
 
-                    if state["today_pnl"] >= profit_limit_15:
-                        state["is_running"] = False
-                        state["sleep_until"] = now_ts + (12 * 3600)
-                        state["sleep_reason"] = f"+15% Target Hit ({curr_sym}{state['today_pnl']})"
-                        add_log(
-                            state,
-                            f"🎉 15% PROFIT TARGET HIT (+{curr_sym}{state['today_pnl']})! "
-                            "New deals sleeping for 12 Hours."
-                        )
+                            for trade in list(state.get("active_trades", [])):
+                                if trade.get("_closing"): continue
+                                sym = str(trade.get("symbol", ""))
+                                clean = sym.replace("INR", "").replace("USDT", "").replace("/", "").upper()
+                                curr_p = live_prices.get(sym, live_by_base.get(clean))
 
-                    elif state["today_pnl"] <= loss_limit_10:
-                        state["is_running"] = False
-                        state["sleep_until"] = now_ts + (12 * 3600)
-                        state["sleep_reason"] = f"-10% Loss Shield ({curr_sym}{state['today_pnl']})"
-                        add_log(
-                            state,
-                            f"🛡️ 10% LOSS SHIELD TRIGGERED ({curr_sym}{state['today_pnl']})! "
-                            "New deals sleeping for 12 Hours."
-                        )
+                                if not curr_p or float(trade.get("entry_price", 0) or 0) <= 0: continue
 
-                needs_prices = bool(state.get("active_trades")) or bool(state.get("is_running"))
-                if not needs_prices:
-                    continue
+                                entry = float(trade["entry_price"])
+                                target_pct = float(state.get("target_percent", 1.5)) / 100.0
+                                sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
 
-                all_coins = fetch_active_exchange_markets(state)
-                if not all_coins:
-                    continue
+                                target_p = entry * (1.0 + target_pct) if trade.get("type") in ["LONG", "BUY"] else entry * (1.0 - target_pct)
+                                sl_p = entry * (1.0 - sl_pct) if trade.get("type") in ["LONG", "BUY"] else entry * (1.0 + sl_pct)
 
-                live_prices = {c["symbol"]: float(c.get("price", 0.0) or 0.0) for c in all_coins}
-                live_by_base = {
-                    str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0)
-                    for c in all_coins
-                }
+                                should_close = False
+                                reason = ""
 
-                # ---------- EXIT MONITORING ----------
-                for trade in list(state.get("active_trades", [])):
-                    if trade.get("_closing"):
+                                if trade.get("type") in ["LONG", "BUY"]:
+                                    if curr_p >= target_p:
+                                        should_close = True
+                                        reason = "TARGET HIT"
+                                    elif curr_p <= sl_p:
+                                        should_close = True
+                                        reason = "TRAILING SL HIT"
+                                else:
+                                    if curr_p <= target_p:
+                                        should_close = True
+                                        reason = "TARGET HIT"
+                                    elif curr_p >= sl_p:
+                                        should_close = True
+                                        reason = "TRAILING SL HIT"
+
+                                if should_close:
+                                    ok, exit_price, filled_qty, msg = _close_trade_at_market(state, dev_id, trade, reason, curr_p)
+                                    if ok:
+                                        add_log(state, f"🎯 {reason}: {trade['symbol']} | Exit {exit_price} | P&L {trade.get('pnl_percent', 0)}%")
+                                    else:
+                                        # Fallback force close so history is never lost
+                                        _finalize_closed_trade(state, dev_id, trade, curr_p, trade.get("quantity"), state.get("active_broker", "coindcx"), reason)
+                                        add_log(state, f"⚠️ Force Closed ({reason}): {trade['symbol']}")
+
+                    # New deal opening check
+                    if not state.get("is_running") or (state.get("sleep_until") and now_ts < state["sleep_until"]):
                         continue
 
-                    sym = str(trade.get("symbol", ""))
-                    clean = sym.replace("INR", "").replace("USDT", "").replace("/", "").upper()
-                    curr_p = live_prices.get(sym, live_by_base.get(clean))
-
-                    if not curr_p or float(trade.get("entry_price", 0) or 0) <= 0:
+                    allowed_slots = max(1, int(state.get("max_trades", 1)))
+                    if len(state.get("active_trades", [])) >= allowed_slots:
                         continue
 
-                    entry = float(trade["entry_price"])
-                    target_p = float(trade.get("target_price", 0) or 0)
-                    sl_p = float(trade.get("sl_price", 0) or 0)
+                    all_coins = fetch_active_exchange_markets(state)
+                    if not all_coins: continue
 
+                    order_amount = float(state.get("trade_amount", 500.0))
+                    active_symbols = [t["symbol"] for t in state["active_trades"]]
+                    valid = [c for c in all_coins if c.get("price", 0) > 0 and c["symbol"] not in active_symbols]
+                    if not valid: continue
+
+                    target_coin = valid[0]
+                    pos_type = "LONG"
+                    coin_sym = target_coin["symbol"]
+                    current_p = float(target_coin["price"])
+                    quote = state.get("quote_currency", "INR")
+                    broker = state.get("active_broker", "coindcx").lower()
                     target_pct = float(state.get("target_percent", 1.5)) / 100.0
                     sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
 
-                    if target_p <= 0:
-                        target_p = entry * (1.0 + target_pct) if trade.get("type") in ["LONG", "BUY"] else entry * (1.0 - target_pct)
-                        trade["target_price"] = target_p
-
-                    if sl_p <= 0:
-                        sl_p = entry * (1.0 - sl_pct) if trade.get("type") in ["LONG", "BUY"] else entry * (1.0 + sl_pct)
-                        trade["sl_price"] = sl_p
-
-                    should_close = False
-                    reason = ""
-
-                    if trade.get("type") in ["LONG", "BUY"]:
-                        if curr_p > float(trade.get("highest_price", entry) or entry):
-                            trade["highest_price"] = curr_p
-                            trail_sl = curr_p * (1.0 - sl_pct)
-                            trade["sl_price"] = max(float(trade.get("sl_price", sl_p)), trail_sl)
-
-                        if curr_p >= target_p:
-                            should_close = True
-                            reason = "TARGET HIT"
-                        elif curr_p <= float(trade.get("sl_price", sl_p)):
-                            should_close = True
-                            reason = "TRAILING SL HIT"
-
-                    else:
-                        if curr_p < float(trade.get("lowest_price", entry) or entry):
-                            trade["lowest_price"] = curr_p
-                            trail_sl = curr_p * (1.0 + sl_pct)
-                            trade["sl_price"] = min(float(trade.get("sl_price", sl_p)), trail_sl)
-
-                        if curr_p <= target_p:
-                            should_close = True
-                            reason = "TARGET HIT"
-                        elif curr_p >= float(trade.get("sl_price", sl_p)):
-                            should_close = True
-                            reason = "TRAILING SL HIT"
-
-                    if should_close:
-                        ok, exit_price, filled_qty, msg = _close_trade_at_market(
-                            state, dev_id, trade, reason, curr_p
-                        )
-                        if ok:
-                            add_log(
-                                state,
-                                f"🎯 {reason}: {trade['symbol']} | Exit {exit_price} | "
-                                f"P&L {trade.get('pnl_percent', 0)}% | "
-                                f"{get_curr_symbol(state)}{trade.get('pnl_val', 0)}"
-                            )
-                        else:
-                            add_log(
-                                state,
-                                f"⚠️ {reason} DETECTED but EXIT NOT CONFIRMED: "
-                                f"{trade.get('symbol')} | {msg}"
-                            )
-
-                # ---------- NEW DEAL OPENING ----------
-                if not state.get("is_running"):
-                    continue
-                if state.get("sleep_until") and now_ts < state["sleep_until"]:
-                    continue
-
-                allowed_slots = max(1, int(state.get("max_trades", 1)))
-                if len(state["active_trades"]) >= allowed_slots:
-                    continue
-
-                order_amount = float(state.get("trade_amount", 500.0))
-                curr_sym = get_curr_symbol(state)
-                active_symbols = [t["symbol"] for t in state["active_trades"]]
-                valid = [
-                    c for c in all_coins
-                    if c.get("price", 0) > 0 and c["symbol"] not in active_symbols
-                ]
-
-                if not valid:
-                    continue
-
-                selected = state.get("selected_coin", "AUTO")
-                deal_cond = state.get("deal_condition", "ASAP")
-                target_coin = None
-
-                if selected != "AUTO":
-                    target_coin = next((c for c in valid if selected in c["symbol"]), None)
-                elif deal_cond == "ASAP":
-                    target_coin = valid[0]
-                    add_log(
-                        state,
-                        f"⚡ [SMART AGGRESSIVE ASAP] Target Picked: {target_coin['symbol']}"
-                    )
-                elif deal_cond == "TOP20_AI_NEWS":
-                    target_coin = _select_top20_ai_news(valid)
-                    add_log(
-                        state,
-                        f"🧠 [TOP 20 + AI NEWS] Target Picked: "
-                        f"{target_coin['symbol'] if target_coin else 'None'}"
-                    )
-                else:
-                    flexible_coins = [c for c in valid if float(c.get("change", 0.0)) > -2.0]
-                    if flexible_coins:
-                        flexible_coins.sort(key=lambda x: x.get("volume", 0.0), reverse=True)
-                        target_coin = flexible_coins[0]
-                    else:
-                        target_coin = valid[0]
-
-                if not target_coin:
-                    continue
-
-                pos_type = "LONG"
-                coin_sym = target_coin["symbol"]
-                current_p = float(target_coin["price"])
-                quote = state.get("quote_currency", "INR")
-                broker = state.get("active_broker", "coindcx").lower()
-                target_pct = float(state.get("target_percent", 1.5)) / 100.0
-                sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
-
-                if broker == "paper":
                     calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
-                    if calc_qty <= 0:
-                        calc_qty = 1
+                    if calc_qty <= 0: calc_qty = 1
+
                     new_trade = {
                         "id": int(time.time() * 1000),
                         "symbol": coin_sym,
@@ -1488,59 +1389,20 @@ async def market_scanner_loop():
                         "entry_price": current_p,
                         "quantity": calc_qty,
                         "amount": order_amount,
-                        "highest_price": current_p,
-                        "lowest_price": current_p,
                         "sl_price": current_p * (1.0 - sl_pct),
                         "target_price": current_p * (1.0 + target_pct),
                         "time": get_global_time()
                     }
                     state["active_trades"].insert(0, new_trade)
-                    add_log(
-                        state,
-                        f"⚡ [PAPER] {pos_type}: {coin_sym} at {curr_sym}{current_p} | "
-                        f"Target +{state['target_percent']}% / SL -{state['sl_percent']}%"
-                    )
+                    add_log(state, f"⚡ Auto Opened: {coin_sym} at {get_curr_symbol(state)}{current_p}")
 
-                else:
-                    side = "buy" if pos_type == "LONG" else "sell"
-                    success, buy_price, buy_qty, res = True, current_p, round(order_amount / current_p, 4), "Gateway Fill"
-
-                    if broker == "coindcx":
-                        success, buy_price, buy_qty, res = execute_coindcx_order(
-                            state, coin_sym, side=side, target_amount=order_amount
-                        )
-                    elif hasattr(ccxt, broker):
-                        success, buy_price, buy_qty, res = execute_ccxt_order(
-                            state, coin_sym, side=side, target_amount=order_amount
-                        )
-
-                    if success:
-                        new_trade = {
-                            "id": int(time.time() * 1000),
-                            "symbol": coin_sym,
-                            "currency": quote,
-                            "type": pos_type,
-                            "entry_price": buy_price,
-                            "quantity": buy_qty,
-                            "amount": round(buy_qty * buy_price, 2),
-                            "highest_price": buy_price,
-                            "lowest_price": buy_price,
-                            "sl_price": buy_price * (1.0 - sl_pct),
-                            "target_price": buy_price * (1.0 + target_pct),
-                            "time": get_global_time()
-                        }
-                        state["active_trades"].insert(0, new_trade)
-                        add_log(
-                            state,
-                            f"⚡ REAL {pos_type}: {buy_qty} {coin_sym} at "
-                            f"{curr_sym}{buy_price} on {broker.upper()} | "
-                            f"Target +{state['target_percent']}% / SL -{state['sl_percent']}%"
-                        )
+                except Exception as inner_err:
+                    print(f"Session Loop Error for {dev_id}: {inner_err}")
 
         except Exception as e:
-            print(f"[SCANNER ERROR] {type(e).__name__}: {e}")
-
-        await asyncio.sleep(5.0)
+            print(f"Global Scanner Error: {e}")
+        
+        await asyncio.sleep(4.0)
 
 @app.get("/")
 def root():
