@@ -8,6 +8,8 @@ import requests
 import ccxt
 import uvicorn
 import asyncio
+import threading
+import websocket
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
@@ -45,13 +47,12 @@ def init_db():
 
 init_db()
 
-# 1. Yeh robust database save function dalo taaki history kabhi miss na ho
+# Robust database save function to prevent missing history
 def db_save_trade(trade: dict, device_id: str, broker: str):
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         
-        # Safe extraction of values to avoid any NoneType crashes
         t_id = str(trade.get("id", int(time.time() * 1000)))
         sym = str(trade.get("symbol", "BTCINR"))
         curr = str(trade.get("currency", "INR"))
@@ -95,9 +96,54 @@ def db_get_all_trades(device_id: str, limit: int = 1000):
     except Exception:
         return []
 
+# ----------------- REAL-TIME WEBSOCKET PRICE STREAMING (ZERO DELAY) -----------------
+live_price_cache = {}
+
+def on_ws_message(ws, message):
+    try:
+        data = json.loads(message)
+        if isinstance(data, list):
+            for tick in data:
+                sym = tick.get("s", "").upper()
+                price = float(tick.get("c", 0.0) or tick.get("p", 0.0) or 0.0)
+                if sym and price > 0:
+                    live_price_cache[sym] = price
+        elif isinstance(data, dict):
+            sym = data.get("s", "").upper()
+            price = float(data.get("c", 0.0) or data.get("p", 0.0) or 0.0)
+            if sym and price > 0:
+                live_price_cache[sym] = price
+    except:
+        pass
+
+def on_ws_error(ws, error):
+    pass
+
+def on_ws_close(ws, close_status_code, close_msg):
+    threading.Timer(3.0, start_binance_websocket).start()
+
+def on_ws_open(ws):
+    print("🟢 Binance WebSocket Connected for Zero-Delay Real-Time Prices!")
+
+def start_binance_websocket():
+    try:
+        ws_url = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
+        ws = websocket.WebSocketApp(
+            ws_url,
+            on_open=on_ws_open,
+            on_message=on_ws_message,
+            on_error=on_ws_error,
+            on_close=on_ws_close
+        )
+        wst = threading.Thread(target=ws.run_forever, daemon=True)
+        wst.start()
+    except Exception as e:
+        print(f"WS Init Error: {e}")
+
 # ----------------- APP LIFECYCLE & STATE -----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    start_binance_websocket()
     scanner_task = asyncio.create_task(market_scanner_loop())
     yield
     scanner_task.cancel()
@@ -318,6 +364,7 @@ def fetch_active_exchange_markets(state):
     broker = state.get("active_broker", "coindcx").lower()
     quote = state.get("quote_currency", "INR").upper()
     market_list = []
+    usd_to_inr = 89.5
 
     try:
         if broker == "coindcx":
@@ -330,6 +377,13 @@ def fetch_active_exchange_markets(state):
                 change = float(item.get("change_24_hour", 0.0))
                 if price <= 0: continue
                 clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
+                
+                # Zero-delay WebSocket price override
+                ws_key = clean_coin + "USDT"
+                if ws_key in live_price_cache:
+                    p_live = live_price_cache[ws_key]
+                    price = p_live * usd_to_inr if quote == "INR" else p_live
+
                 if quote == "INR" and (m.endswith("_INR") or m.endswith("INR")) and not ("USDT" in m):
                     market_list.append({"symbol": clean_coin + "INR", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
                 elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
@@ -357,10 +411,9 @@ def fetch_active_exchange_markets(state):
         try:
             res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=4)
             data = res.json()
-            usd_to_inr = 89.5
             for c in data:
                 if c["symbol"].endswith("USDT") and not any(x in c["symbol"] for x in ["CREAM", "UP", "DOWN"]):
-                    p = float(c["lastPrice"])
+                    p = live_price_cache.get(c["symbol"], float(c["lastPrice"]))
                     clean_sym = c["symbol"].replace("USDT", "")
                     final_p = p * usd_to_inr if quote == "INR" else p
                     market_list.append({
@@ -1286,7 +1339,7 @@ def _select_top20_ai_news(valid_coins):
     return scored[0][1]
 
 
-# 2. Yeh auto-recovering aur error-proof market scanner loop dalo taaki bot kabhi auto-off na ho
+# Error-proof and auto-recovering market scanner loop with zero-delay WebSocket prices
 async def market_scanner_loop():
     while True:
         try:
@@ -1304,7 +1357,7 @@ async def market_scanner_loop():
                             state["is_running"] = True
                             add_log(state, "⏰ 12-Hour Cooldown Completed! Bot Engine Resumed.")
 
-                    # Exit monitoring (yeh hamesha chalega chahe bot start ho ya stop)
+                    # Exit monitoring (active even if bot is paused)
                     if state.get("active_trades"):
                         all_coins = fetch_active_exchange_markets(state)
                         if all_coins:
@@ -1349,11 +1402,10 @@ async def market_scanner_loop():
                                     if ok:
                                         add_log(state, f"🎯 {reason}: {trade['symbol']} | Exit {exit_price} | P&L {trade.get('pnl_percent', 0)}%")
                                     else:
-                                        # Fallback force close so history is never lost
                                         _finalize_closed_trade(state, dev_id, trade, curr_p, trade.get("quantity"), state.get("active_broker", "coindcx"), reason)
                                         add_log(state, f"⚠️ Force Closed ({reason}): {trade['symbol']}")
 
-                    # New deal opening check
+                    # New deal opening
                     if not state.get("is_running") or (state.get("sleep_until") and now_ts < state["sleep_until"]):
                         continue
 
@@ -1378,31 +1430,73 @@ async def market_scanner_loop():
                     target_pct = float(state.get("target_percent", 1.5)) / 100.0
                     sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
 
-                    calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
-                    if calc_qty <= 0: calc_qty = 1
+                    if broker == "paper":
+                        calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
+                        if calc_qty <= 0:
+                            calc_qty = 1
+                        new_trade = {
+                            "id": int(time.time() * 1000),
+                            "symbol": coin_sym,
+                            "currency": quote,
+                            "type": pos_type,
+                            "entry_price": current_p,
+                            "quantity": calc_qty,
+                            "amount": order_amount,
+                            "highest_price": current_p,
+                            "lowest_price": current_p,
+                            "sl_price": current_p * (1.0 - sl_pct),
+                            "target_price": current_p * (1.0 + target_pct),
+                            "time": get_global_time()
+                        }
+                        state["active_trades"].insert(0, new_trade)
+                        add_log(
+                            state,
+                            f"⚡ [PAPER] {pos_type}: {coin_sym} at {get_curr_symbol(state)}{current_p} | "
+                            f"Target +{state['target_percent']}% / SL -{state['sl_percent']}%"
+                        )
+                    else:
+                        side = "buy" if pos_type == "LONG" else "sell"
+                        success, buy_price, buy_qty, res = True, current_p, round(order_amount / current_p, 4), "Gateway Fill"
 
-                    new_trade = {
-                        "id": int(time.time() * 1000),
-                        "symbol": coin_sym,
-                        "currency": quote,
-                        "type": pos_type,
-                        "entry_price": current_p,
-                        "quantity": calc_qty,
-                        "amount": order_amount,
-                        "sl_price": current_p * (1.0 - sl_pct),
-                        "target_price": current_p * (1.0 + target_pct),
-                        "time": get_global_time()
-                    }
-                    state["active_trades"].insert(0, new_trade)
-                    add_log(state, f"⚡ Auto Opened: {coin_sym} at {get_curr_symbol(state)}{current_p}")
+                        if broker == "coindcx":
+                            success, buy_price, buy_qty, res = execute_coindcx_order(
+                                state, coin_sym, side=side, target_amount=order_amount
+                            )
+                        elif hasattr(ccxt, broker):
+                            success, buy_price, buy_qty, res = execute_ccxt_order(
+                                state, coin_sym, side=side, target_amount=order_amount
+                            )
+
+                        if success:
+                            new_trade = {
+                                "id": int(time.time() * 1000),
+                                "symbol": coin_sym,
+                                "currency": quote,
+                                "type": pos_type,
+                                "entry_price": buy_price,
+                                "quantity": buy_qty,
+                                "amount": round(buy_qty * buy_price, 2),
+                                "highest_price": buy_price,
+                                "lowest_price": buy_price,
+                                "sl_price": buy_price * (1.0 - sl_pct),
+                                "target_price": buy_price * (1.0 + target_pct),
+                                "time": get_global_time()
+                            }
+                            state["active_trades"].insert(0, new_trade)
+                            add_log(
+                                state,
+                                f"⚡ REAL {pos_type}: {buy_qty} {coin_sym} at "
+                                f"{get_curr_symbol(state)}{buy_price} on {broker.upper()} | "
+                                f"Target +{state['target_percent']}% / SL -{state['sl_percent']}%"
+                            )
 
                 except Exception as inner_err:
                     print(f"Session Loop Error for {dev_id}: {inner_err}")
 
         except Exception as e:
             print(f"Global Scanner Error: {e}")
-        
-        await asyncio.sleep(4.0)
+
+        await asyncio.sleep(2.0)
 
 @app.get("/")
 def root():
