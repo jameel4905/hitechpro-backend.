@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-ccxt
 requests
-pydantic
+ccxt
+websocket-client
