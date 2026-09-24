@@ -47,7 +47,6 @@ def init_db():
 
 init_db()
 
-# Robust database save function to prevent missing history
 def db_save_trade(trade: dict, device_id: str, broker: str):
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -378,7 +377,6 @@ def fetch_active_exchange_markets(state):
                 if price <= 0: continue
                 clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
                 
-                # Zero-delay WebSocket price override
                 ws_key = clean_coin + "USDT"
                 if ws_key in live_price_cache:
                     p_live = live_price_cache[ws_key]
@@ -1339,7 +1337,7 @@ def _select_top20_ai_news(valid_coins):
     return scored[0][1]
 
 
-# Error-proof and auto-recovering market scanner loop with zero-delay WebSocket prices
+# 100% CRASH-PROOF AUTO-RECOVERING MARKET SCANNER LOOP
 async def market_scanner_loop():
     while True:
         try:
@@ -1405,7 +1403,7 @@ async def market_scanner_loop():
                                         _finalize_closed_trade(state, dev_id, trade, curr_p, trade.get("quantity"), state.get("active_broker", "coindcx"), reason)
                                         add_log(state, f"⚠️ Force Closed ({reason}): {trade['symbol']}")
 
-                    # New deal opening
+                    # New deal opening check
                     if not state.get("is_running") or (state.get("sleep_until") and now_ts < state["sleep_until"]):
                         continue
 
@@ -1464,7 +1462,7 @@ async def market_scanner_loop():
                             )
                         elif hasattr(ccxt, broker):
                             success, buy_price, buy_qty, res = execute_ccxt_order(
-                                state, coin_sym, side=side, target_amount=order_amount
+                                state, coin_sim, side=side, target_amount=order_amount
                             )
 
                         if success:
@@ -1495,7 +1493,7 @@ async def market_scanner_loop():
 
         except Exception as e:
             print(f"Global Scanner Error: {e}")
-
+        
         await asyncio.sleep(2.0)
 
 @app.get("/")
