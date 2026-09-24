@@ -1341,75 +1341,53 @@ def _select_top20_ai_news(valid_coins):
 async def market_scanner_loop():
     while True:
         try:
-            now_ts = time.time()
-
             for dev_id, state in list(user_sessions.items()):
                 try:
-                    check_midnight_settlement(state)
-
-                    if state.get("sleep_until"):
-                        if now_ts >= state["sleep_until"]:
-                            state["sleep_until"] = None
-                            state["sleep_reason"] = ""
-                            state["today_pnl"] = 0.0
-                            state["is_running"] = True
-                            add_log(state, "⏰ 12-Hour Cooldown Completed! Bot Engine Resumed.")
-
-                    # Exit monitoring (active even if bot is paused)
+                    # Target & SL Auto-Exit monitoring loop with robust live price matching
                     if state.get("active_trades"):
                         all_coins = fetch_active_exchange_markets(state)
-                        if all_coins:
-                            live_prices = {c["symbol"]: float(c.get("price", 0.0) or 0.0) for c in all_coins}
-                            live_by_base = {str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0) for c in all_coins}
+                        live_prices = {c["symbol"].upper(): float(c.get("price", 0.0) or 0.0) for c in all_coins}
+                        live_by_base = {str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0) for c in all_coins}
 
-                            for trade in list(state.get("active_trades", [])):
-                                if trade.get("_closing"): continue
-                                sym = str(trade.get("symbol", ""))
-                                clean = sym.replace("INR", "").replace("USDT", "").replace("/", "").upper()
-                                curr_p = live_prices.get(sym, live_by_base.get(clean))
+                        for trade in list(state.get("active_trades", [])):
+                            if trade.get("_closing"): continue
+                            sym = str(trade.get("symbol", "")).upper()
+                            clean = sym.replace("INR", "").replace("USDT", "").replace("/", "").upper()
+                            
+                            curr_p = live_prices.get(sym, live_by_base.get(clean, 0.0))
+                            if curr_p <= 0:
+                                ws_key = clean + "USDT"
+                                if ws_key in live_price_cache:
+                                    p_raw = float(live_price_cache[ws_key])
+                                    curr_p = p_raw * 89.5 if state.get("quote_currency") == "INR" else p_raw
 
-                                if not curr_p or float(trade.get("entry_price", 0) or 0) <= 0: continue
+                            if not curr_p or curr_p <= 0 or float(trade.get("entry_price", 0) or 0) <= 0:
+                                continue
 
-                                entry = float(trade["entry_price"])
-                                target_pct = float(state.get("target_percent", 1.5)) / 100.0
-                                sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
+                            entry = float(trade["entry_price"])
+                            target_pct = float(state.get("target_percent", 1.5)) / 100.0
+                            sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
 
-                                target_p = entry * (1.0 + target_pct) if trade.get("type") in ["LONG", "BUY"] else entry * (1.0 - target_pct)
-                                sl_p = entry * (1.0 - sl_pct) if trade.get("type") in ["LONG", "BUY"] else entry * (1.0 + sl_pct)
+                            current_pct = ((curr_p - entry) / entry) * 100.0 if trade.get("type") in ["LONG", "BUY"] else ((entry - curr_p) / entry) * 100.0
 
-                                should_close = False
-                                reason = ""
+                            should_close = False
+                            reason = ""
 
-                                if trade.get("type") in ["LONG", "BUY"]:
-                                    if curr_p >= target_p:
-                                        should_close = True
-                                        reason = "TARGET HIT"
-                                    elif curr_p <= sl_p:
-                                        should_close = True
-                                        reason = "TRAILING SL HIT"
-                                else:
-                                    if curr_p <= target_p:
-                                        should_close = True
-                                        reason = "TARGET HIT"
-                                    elif curr_p >= sl_p:
-                                        should_close = True
-                                        reason = "TRAILING SL HIT"
+                            if current_pct >= (target_pct * 100.0):
+                                should_close = True
+                                reason = "TARGET HIT"
+                            elif current_pct <= -(sl_pct * 100.0):
+                                should_close = True
+                                reason = "SL HIT"
 
-                                if should_close:
-                                    ok, exit_price, filled_qty, msg = _close_trade_at_market(state, dev_id, trade, reason, curr_p)
-                                    if ok:
-                                        add_log(state, f"🎯 {reason}: {trade['symbol']} | Exit {exit_price} | P&L {trade.get('pnl_percent', 0)}%")
-                                    else:
-                                        _finalize_closed_trade(state, dev_id, trade, curr_p, trade.get("quantity"), state.get("active_broker", "coindcx"), reason)
-                                        add_log(state, f"⚠️ Force Closed ({reason}): {trade['symbol']}")
+                            if should_close:
+                                ok, exit_price, filled_qty, msg = _close_trade_at_market(state, dev_id, trade, reason, curr_p)
+                                add_log(state, f"🎯 {reason}: {trade['symbol']} | Exit {exit_price} | P&L {current_pct:.2f}%")
 
-                    # New deal opening check
-                    if not state.get("is_running") or (state.get("sleep_until") and now_ts < state["sleep_until"]):
-                        continue
-
+                    # New deal scanning
+                    if not state.get("is_running"): continue
                     allowed_slots = max(1, int(state.get("max_trades", 1)))
-                    if len(state.get("active_trades", [])) >= allowed_slots:
-                        continue
+                    if len(state.get("active_trades", [])) >= allowed_slots: continue
 
                     all_coins = fetch_active_exchange_markets(state)
                     if not all_coins: continue
@@ -1420,79 +1398,34 @@ async def market_scanner_loop():
                     if not valid: continue
 
                     target_coin = valid[0]
-                    pos_type = "LONG"
                     coin_sym = target_coin["symbol"]
                     current_p = float(target_coin["price"])
                     quote = state.get("quote_currency", "INR")
-                    broker = state.get("active_broker", "coindcx").lower()
                     target_pct = float(state.get("target_percent", 1.5)) / 100.0
                     sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
 
-                    if broker == "paper":
-                        calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
-                        if calc_qty <= 0:
-                            calc_qty = 1
-                        new_trade = {
-                            "id": int(time.time() * 1000),
-                            "symbol": coin_sym,
-                            "currency": quote,
-                            "type": pos_type,
-                            "entry_price": current_p,
-                            "quantity": calc_qty,
-                            "amount": order_amount,
-                            "highest_price": current_p,
-                            "lowest_price": current_p,
-                            "sl_price": current_p * (1.0 - sl_pct),
-                            "target_price": current_p * (1.0 + target_pct),
-                            "time": get_global_time()
-                        }
-                        state["active_trades"].insert(0, new_trade)
-                        add_log(
-                            state,
-                            f"⚡ [PAPER] {pos_type}: {coin_sym} at {get_curr_symbol(state)}{current_p} | "
-                            f"Target +{state['target_percent']}% / SL -{state['sl_percent']}%"
-                        )
-                    else:
-                        side = "buy" if pos_type == "LONG" else "sell"
-                        success, buy_price, buy_qty, res = True, current_p, round(order_amount / current_p, 4), "Gateway Fill"
+                    calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
+                    if calc_qty <= 0: calc_qty = 1
 
-                        if broker == "coindcx":
-                            success, buy_price, buy_qty, res = execute_coindcx_order(
-                                state, coin_sym, side=side, target_amount=order_amount
-                            )
-                        elif hasattr(ccxt, broker):
-                            success, buy_price, buy_qty, res = execute_ccxt_order(
-                                state, coin_sim, side=side, target_amount=order_amount
-                            )
-
-                        if success:
-                            new_trade = {
-                                "id": int(time.time() * 1000),
-                                "symbol": coin_sym,
-                                "currency": quote,
-                                "type": pos_type,
-                                "entry_price": buy_price,
-                                "quantity": buy_qty,
-                                "amount": round(buy_qty * buy_price, 2),
-                                "highest_price": buy_price,
-                                "lowest_price": buy_price,
-                                "sl_price": buy_price * (1.0 - sl_pct),
-                                "target_price": buy_price * (1.0 + target_pct),
-                                "time": get_global_time()
-                            }
-                            state["active_trades"].insert(0, new_trade)
-                            add_log(
-                                state,
-                                f"⚡ REAL {pos_type}: {buy_qty} {coin_sym} at "
-                                f"{get_curr_symbol(state)}{buy_price} on {broker.upper()} | "
-                                f"Target +{state['target_percent']}% / SL -{state['sl_percent']}%"
-                            )
+                    new_trade = {
+                        "id": int(time.time() * 1000),
+                        "symbol": coin_sym,
+                        "currency": quote,
+                        "type": "LONG",
+                        "entry_price": current_p,
+                        "quantity": calc_qty,
+                        "amount": order_amount,
+                        "sl_price": current_p * (1.0 - sl_pct),
+                        "target_price": current_p * (1.0 + target_pct),
+                        "time": get_global_time()
+                    }
+                    state["active_trades"].insert(0, new_trade)
+                    add_log(state, f"⚡ BOT OPENED LONG: {coin_sym} at {get_curr_symbol(state)}{current_p}")
 
                 except Exception as inner_err:
-                    print(f"Session Loop Error for {dev_id}: {inner_err}")
-
+                    print(f"Loop error: {inner_err}")
         except Exception as e:
-            print(f"Global Scanner Error: {e}")
+            print(f"Scanner error: {e}")
         
         await asyncio.sleep(2.0)
 
