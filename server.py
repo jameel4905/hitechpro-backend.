@@ -591,6 +591,51 @@ async def wait_for_coindcx_fill(state, order_id, timeout_seconds=5.0, poll_secon
 
     return False, {}, 0.0, 0.0, f"Unable to confirm CoinDCX order fill. {last_error}"
 
+def _wait_for_coindcx_fill_sync(state, order_id, timeout_seconds=6.0, poll_seconds=0.5):
+    """Synchronously confirm a CoinDCX market order before treating it as filled."""
+    deadline = time.time() + float(timeout_seconds)
+    last_order = {}
+    last_error = ""
+
+    while time.time() <= deadline:
+        try:
+            ok, order, err = get_coindcx_order_status(state, order_id)
+            if not ok:
+                last_error = err
+            else:
+                last_order = order
+                status = str(order.get("status", "")).lower()
+                total_qty = float(order.get("total_quantity", 0) or 0)
+                remaining_qty = float(order.get("remaining_quantity", 0) or 0)
+                avg_price = float(order.get("avg_price", 0) or 0)
+                filled_qty = max(0.0, total_qty - remaining_qty)
+
+                if status == "filled" and remaining_qty <= 1e-12:
+                    return True, filled_qty, avg_price, "FILLED"
+
+                if status in {"rejected", "cancelled", "partially_cancelled"}:
+                    return False, filled_qty, avg_price, status.upper()
+
+                last_error = f"Order still {status or 'unknown'} (remaining={remaining_qty:g})"
+        except Exception as exc:
+            last_error = str(exc)
+
+        time.sleep(poll_seconds)
+
+    if last_order:
+        status = str(last_order.get("status", "unknown")).lower()
+        total_qty = float(last_order.get("total_quantity", 0) or 0)
+        remaining_qty = float(last_order.get("remaining_quantity", 0) or 0)
+        avg_price = float(last_order.get("avg_price", 0) or 0)
+        filled_qty = max(0.0, total_qty - remaining_qty)
+        return False, filled_qty, avg_price, (
+            f"TIMEOUT: order is still {status}; remaining quantity={remaining_qty:g}. "
+            f"Local trade was NOT closed. {last_error}"
+        )
+
+    return False, 0.0, 0.0, f"Unable to confirm CoinDCX order fill. {last_error}"
+
+
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
     api_key = state.get("api_key", "").strip()
     secret_key = state.get("secret_key", "").strip()
@@ -640,6 +685,7 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
             return False, 0, 0, f"Valid CoinDCX pair for '{clean_coin}' not found! Please check symbol."
 
         precision = get_coin_precision(clean_coin, current_price)
+
         if exact_qty > 0:
             quantity = float(exact_qty) if precision == 0 else round(float(exact_qty), precision)
             if precision == 0:
@@ -672,7 +718,9 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
             "timestamp": int(round(time.time() * 1000)),
         }
 
-        res, res_data = _coindcx_auth_post(state, "/exchange/v1/orders/create", body, timeout=6)
+        res, res_data = _coindcx_auth_post(
+            state, "/exchange/v1/orders/create", body, timeout=6
+        )
         if res.status_code != 200:
             err_msg = res_data.get("message", str(res_data)) if isinstance(res_data, dict) else str(res_data)
             return False, current_price, quantity, f"HTTP {res.status_code}: {err_msg}"
@@ -680,19 +728,27 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         order = _extract_coindcx_order(res_data)
         order_id = order.get("id")
         if order_id is None:
-            return False, current_price, quantity, f"CoinDCX accepted no usable order id: {res_data}"
+            return False, current_price, quantity, f"CoinDCX returned no usable order id: {res_data}"
 
-        actual_price = current_price
-        result = {
+        # IMPORTANT: never mark the local trade as filled until CoinDCX confirms it.
+        filled_ok, filled_qty, avg_price, fill_msg = _wait_for_coindcx_fill_sync(
+            state, order_id
+        )
+        if not filled_ok or filled_qty <= 0:
+            return False, avg_price or current_price, filled_qty, (
+                f"Order {order_id} was not confirmed filled: {fill_msg}"
+            )
+
+        actual_price = float(avg_price or current_price)
+        return True, actual_price, float(filled_qty), {
             "order_id": str(order_id),
             "market": target_market,
             "requested_quantity": quantity,
-            "filled_quantity": quantity,
-            "status": order.get("status", "filled"),
+            "filled_quantity": float(filled_qty),
+            "status": "filled",
             "avg_price": actual_price,
             "order": order,
         }
-        return True, actual_price, quantity, result
     except Exception as e:
         return False, 0, 0, str(e)
 
@@ -724,7 +780,21 @@ def execute_ccxt_order(state, raw_symbol, side="buy", target_amount=100.0, exact
             quantity = int(round(calc_qty)) if precision == 0 else round(calc_qty, precision)
 
         order = inst.create_market_order(symbol_pair, side.lower(), quantity)
-        return True, current_price, quantity, order
+
+        # Prefer the exchange-reported fill values. Never invent a fill price/qty
+        # when the exchange response explicitly reports them.
+        filled = float(order.get("filled", 0) or 0)
+        average = float(order.get("average", 0) or 0)
+        if filled <= 0:
+            filled = float(order.get("amount", 0) or quantity)
+        if average <= 0:
+            average = current_price
+
+        status = str(order.get("status", "")).lower()
+        if status in {"rejected", "canceled", "cancelled"}:
+            return False, average, filled, f"Exchange order status: {status}"
+
+        return True, average, filled, order
     except Exception as e:
         return False, 0, 0, str(e)
 
@@ -1339,94 +1409,226 @@ def _select_top20_ai_news(valid_coins):
 
 # 100% CRASH-PROOF AUTO-RECOVERING MARKET SCANNER LOOP
 async def market_scanner_loop():
+    """
+    Single background loop:
+    - always monitors existing trades for target/SL
+    - only scans for new trades while is_running=True
+    - never removes a trade locally unless the exchange/paper exit succeeds
+    - never creates a fake real trade without a successful exchange order
+    """
     while True:
         try:
             for dev_id, state in list(user_sessions.items()):
                 try:
-                    # Target & SL Auto-Exit monitoring loop with robust live price matching
-                    if state.get("active_trades"):
+                    # ---------------------------------------------------------
+                    # 1) EXISTING TRADE: TARGET / SL MONITORING
+                    # ---------------------------------------------------------
+                    active = list(state.get("active_trades", []))
+                    if active:
                         all_coins = fetch_active_exchange_markets(state)
-                        live_prices = {c["symbol"].upper(): float(c.get("price", 0.0) or 0.0) for c in all_coins}
-                        live_by_base = {str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0) for c in all_coins}
+                        live_prices = {
+                            str(c.get("symbol", "")).upper(): float(c.get("price", 0.0) or 0.0)
+                            for c in all_coins
+                        }
+                        live_by_base = {
+                            str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0)
+                            for c in all_coins
+                        }
 
-                        for trade in list(state.get("active_trades", [])):
-                            if trade.get("_closing"): continue
+                        for trade in active:
+                            if trade.get("_closing"):
+                                continue
+
                             sym = str(trade.get("symbol", "")).upper()
-                            clean = sym.replace("INR", "").replace("USDT", "").replace("/", "").upper()
-                            
+                            clean = sym.replace("INR", "").replace("USDT", "").replace("/", "")
                             curr_p = live_prices.get(sym, live_by_base.get(clean, 0.0))
+
                             if curr_p <= 0:
                                 ws_key = clean + "USDT"
                                 if ws_key in live_price_cache:
                                     p_raw = float(live_price_cache[ws_key])
                                     curr_p = p_raw * 89.5 if state.get("quote_currency") == "INR" else p_raw
 
-                            if not curr_p or curr_p <= 0 or float(trade.get("entry_price", 0) or 0) <= 0:
+                            entry = float(trade.get("entry_price", 0.0) or 0.0)
+                            target_p = float(trade.get("target_price", 0.0) or 0.0)
+                            sl_p = float(trade.get("sl_price", 0.0) or 0.0)
+
+                            if curr_p <= 0 or entry <= 0 or target_p <= 0 or sl_p <= 0:
                                 continue
 
-                            entry = float(trade["entry_price"])
-                            target_pct = float(state.get("target_percent", 1.5)) / 100.0
-                            sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
+                            is_long = trade.get("type") in ["LONG", "BUY"]
+                            if is_long:
+                                current_pct = ((curr_p - entry) / entry) * 100.0
+                                target_hit = curr_p >= target_p
+                                sl_hit = curr_p <= sl_p
+                            else:
+                                current_pct = ((entry - curr_p) / entry) * 100.0
+                                target_hit = curr_p <= target_p
+                                sl_hit = curr_p >= sl_p
 
-                            current_pct = ((curr_p - entry) / entry) * 100.0 if trade.get("type") in ["LONG", "BUY"] else ((entry - curr_p) / entry) * 100.0
+                            if target_hit or sl_hit:
+                                reason = "TARGET HIT" if target_hit else "SL HIT"
+                                ok, exit_price, filled_qty, msg = _close_trade_at_market(
+                                    state, dev_id, trade, reason, curr_p
+                                )
 
-                            should_close = False
-                            reason = ""
+                                if ok:
+                                    add_log(
+                                        state,
+                                        f"🎯 {reason}: {sym} | Exit {exit_price} | "
+                                        f"P&L {trade.get('pnl_percent', current_pct)}%"
+                                    )
+                                else:
+                                    add_log(
+                                        state,
+                                        f"⚠️ {reason} DETECTED but EXIT NOT CONFIRMED: "
+                                        f"{sym} | {msg}"
+                                    )
 
-                            if current_pct >= (target_pct * 100.0):
-                                should_close = True
-                                reason = "TARGET HIT"
-                            elif current_pct <= -(sl_pct * 100.0):
-                                should_close = True
-                                reason = "SL HIT"
+                    # ---------------------------------------------------------
+                    # 2) NEW DEAL SCANNING
+                    # ---------------------------------------------------------
+                    if not state.get("is_running"):
+                        continue
 
-                            if should_close:
-                                ok, exit_price, filled_qty, msg = _close_trade_at_market(state, dev_id, trade, reason, curr_p)
-                                add_log(state, f"🎯 {reason}: {trade['symbol']} | Exit {exit_price} | P&L {current_pct:.2f}%")
-
-                    # New deal scanning
-                    if not state.get("is_running"): continue
                     allowed_slots = max(1, int(state.get("max_trades", 1)))
-                    if len(state.get("active_trades", [])) >= allowed_slots: continue
+                    if len(state.get("active_trades", [])) >= allowed_slots:
+                        continue
 
                     all_coins = fetch_active_exchange_markets(state)
-                    if not all_coins: continue
+                    if not all_coins:
+                        add_log(state, "⚠️ Market scanner: no market data available.")
+                        continue
 
                     order_amount = float(state.get("trade_amount", 500.0))
-                    active_symbols = [t["symbol"] for t in state["active_trades"]]
-                    valid = [c for c in all_coins if c.get("price", 0) > 0 and c["symbol"] not in active_symbols]
-                    if not valid: continue
+                    active_symbols = {
+                        str(t.get("symbol", "")).upper()
+                        for t in state.get("active_trades", [])
+                    }
 
-                    target_coin = valid[0]
-                    coin_sym = target_coin["symbol"]
+                    valid = [
+                        c for c in all_coins
+                        if float(c.get("price", 0) or 0) > 0
+                        and str(c.get("symbol", "")).upper() not in active_symbols
+                    ]
+                    if not valid:
+                        continue
+
+                    # Respect manually selected coin when one is selected.
+                    selected = str(state.get("selected_coin", "AUTO")).upper()
+                    if selected != "AUTO":
+                        selected_clean = selected.replace("INR", "").replace("USDT", "").replace("/", "")
+                        selected_match = next(
+                            (
+                                c for c in valid
+                                if str(c.get("base_coin", "")).upper() == selected_clean
+                                or str(c.get("symbol", "")).upper() == selected
+                            ),
+                            None,
+                        )
+                        if selected_match:
+                            target_coin = selected_match
+                        else:
+                            add_log(state, f"⚠️ Selected coin {selected} is not available in current market data.")
+                            continue
+                    else:
+                        target_coin = _select_top20_ai_news(valid) or valid[0]
+
+                    coin_sym = str(target_coin["symbol"])
                     current_p = float(target_coin["price"])
-                    quote = state.get("quote_currency", "INR")
-                    target_pct = float(state.get("target_percent", 1.5)) / 100.0
-                    sl_pct = float(state.get("sl_percent", 2.0)) / 100.0
+                    quote = state.get("quote_currency", "INR").upper()
+                    target_pct = max(0.001, float(state.get("target_percent", 1.5)) / 100.0)
+                    sl_pct = max(0.001, float(state.get("sl_percent", 2.0)) / 100.0)
 
-                    calc_qty = int(order_amount / current_p) if current_p < 20 else round(order_amount / current_p, 4)
-                    if calc_qty <= 0: calc_qty = 1
+                    # This bot opens LONG/BUY only. For spot markets, SELL is an
+                    # exit, not a new short position.
+                    side = "buy"
+                    broker = state.get("active_broker", "coindcx").lower()
+
+                    # PAPER: simulate a fill.
+                    if broker == "paper":
+                        sim_price = current_p
+                        calc_qty = (
+                            int(order_amount / sim_price)
+                            if sim_price < 20
+                            else round(order_amount / sim_price, 8)
+                        )
+                        if calc_qty <= 0:
+                            calc_qty = 1
+
+                        entry_price = sim_price
+                        filled_qty = float(calc_qty)
+
+                    # REAL: create the exchange order first; only then add it to active_trades.
+                    elif broker == "coindcx":
+                        ok, entry_price, filled_qty, result = execute_coindcx_order(
+                            state,
+                            coin_sym,
+                            side=side,
+                            target_amount=order_amount,
+                        )
+                        if not ok or filled_qty <= 0:
+                            add_log(
+                                state,
+                                f"⚠️ BOT ENTRY NOT CONFIRMED: {coin_sym} | {result}"
+                            )
+                            continue
+
+                    elif hasattr(ccxt, broker):
+                        ok, entry_price, filled_qty, result = execute_ccxt_order(
+                            state,
+                            coin_sym,
+                            side=side,
+                            target_amount=order_amount,
+                        )
+                        if not ok or filled_qty <= 0:
+                            add_log(
+                                state,
+                                f"⚠️ BOT ENTRY NOT CONFIRMED: {coin_sym} | {result}"
+                            )
+                            continue
+                    else:
+                        add_log(state, f"⚠️ Unsupported broker for bot: {broker}")
+                        continue
+
+                    entry_price = float(entry_price)
+                    filled_qty = float(filled_qty)
+                    if entry_price <= 0 or filled_qty <= 0:
+                        add_log(state, f"⚠️ Invalid filled order data for {coin_sym}; trade not added.")
+                        continue
 
                     new_trade = {
                         "id": int(time.time() * 1000),
                         "symbol": coin_sym,
                         "currency": quote,
                         "type": "LONG",
-                        "entry_price": current_p,
-                        "quantity": calc_qty,
-                        "amount": order_amount,
-                        "sl_price": current_p * (1.0 - sl_pct),
-                        "target_price": current_p * (1.0 + target_pct),
-                        "time": get_global_time()
+                        "entry_price": entry_price,
+                        "quantity": filled_qty,
+                        "amount": round(entry_price * filled_qty, 2),
+                        "highest_price": entry_price,
+                        "lowest_price": entry_price,
+                        "sl_price": entry_price * (1.0 - sl_pct),
+                        "target_price": entry_price * (1.0 + target_pct),
+                        "time": get_global_time(),
                     }
+
                     state["active_trades"].insert(0, new_trade)
-                    add_log(state, f"⚡ BOT OPENED LONG: {coin_sym} at {get_curr_symbol(state)}{current_p}")
+                    add_log(
+                        state,
+                        f"⚡ BOT OPENED LONG: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
+                        f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']}"
+                    )
 
                 except Exception as inner_err:
-                    print(f"Loop error: {inner_err}")
+                    print(f"Loop error for {dev_id}: {inner_err}")
+                    try:
+                        add_log(state, f"⚠️ Scanner recovered from error: {inner_err}")
+                    except Exception:
+                        pass
+
         except Exception as e:
             print(f"Scanner error: {e}")
-        
+
         await asyncio.sleep(2.0)
 
 @app.get("/")
