@@ -816,6 +816,91 @@ def _pnl_for_trade(trade, exit_price, qty):
     return round(pct, 2), round(value, 2)
 
 
+def _update_trade_unrealized_pnl(trade, current_price):
+    """Attach live/unrealized PNL fields to an active trade."""
+    try:
+        entry = float(trade.get("entry_price", 0.0) or 0.0)
+        qty = float(trade.get("quantity", 0.0) or 0.0)
+        current = float(current_price or 0.0)
+        is_long = str(trade.get("type", "LONG")).upper() in {"LONG", "BUY"}
+
+        if entry <= 0 or qty <= 0 or current <= 0:
+            trade["current_price"] = current
+            trade["current_pnl_percent"] = 0.0
+            trade["current_pnl_val"] = 0.0
+            trade["unrealized_pnl"] = 0.0
+            trade["unrealized_pnl_percent"] = 0.0
+            return False
+
+        if is_long:
+            pnl_val = (current - entry) * qty
+            pnl_pct = ((current - entry) / entry) * 100.0
+        else:
+            pnl_val = (entry - current) * qty
+            pnl_pct = ((entry - current) / entry) * 100.0
+
+        trade["current_price"] = round(current, 8 if current < 1 else 2)
+        trade["current_pnl_percent"] = round(pnl_pct, 4)
+        trade["current_pnl_val"] = round(pnl_val, 2)
+        trade["unrealized_pnl"] = round(pnl_val, 2)
+        trade["unrealized_pnl_percent"] = round(pnl_pct, 4)
+        return True
+    except Exception:
+        return False
+
+
+def _build_live_price_maps(state):
+    """Fetch one market snapshot and build exact/base symbol lookup maps."""
+    live_prices = {}
+    live_by_base = {}
+    try:
+        all_coins = fetch_active_exchange_markets(state)
+        for coin in all_coins:
+            symbol = str(coin.get("symbol", "")).upper()
+            base = str(coin.get("base_coin", "")).upper()
+            price = float(coin.get("price", 0.0) or 0.0)
+            if price > 0:
+                if symbol:
+                    live_prices[symbol] = price
+                if base:
+                    live_by_base[base] = price
+    except Exception:
+        pass
+    return live_prices, live_by_base
+
+
+def _resolve_trade_live_price(state, trade, live_prices=None, live_by_base=None):
+    sym = str(trade.get("symbol", "")).upper()
+    clean = sym.replace("INR", "").replace("USDT", "").replace("/", "")
+
+    current = 0.0
+    if live_prices is not None:
+        current = float(live_prices.get(sym, 0.0) or 0.0)
+    if current <= 0 and live_by_base is not None:
+        current = float(live_by_base.get(clean, 0.0) or 0.0)
+
+    if current <= 0:
+        ws_key = clean + "USDT"
+        if ws_key in live_price_cache:
+            raw = float(live_price_cache[ws_key] or 0.0)
+            current = raw * 89.5 if state.get("quote_currency") == "INR" else raw
+
+    return current
+
+
+def _refresh_active_trade_pnl(state):
+    """Refresh unrealized PNL for all active trades from one live snapshot."""
+    active = list(state.get("active_trades", []))
+    if not active:
+        return
+
+    live_prices, live_by_base = _build_live_price_maps(state)
+    for trade in active:
+        current_price = _resolve_trade_live_price(state, trade, live_prices, live_by_base)
+        if current_price > 0:
+            _update_trade_unrealized_pnl(trade, current_price)
+
+
 def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
                            broker, reason="MANUAL EXIT"):
     exit_p = float(exit_price or trade.get("entry_price", 0.0) or 0.0)
@@ -828,6 +913,9 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
     trade["exit_price"] = round(exit_p, 6 if exit_p < 1 else 2)
     trade["close_time"] = get_global_time()
     trade["status"] = reason
+    trade["current_price"] = trade["exit_price"]
+    trade["current_pnl_percent"] = pnl_pct
+    trade["current_pnl_val"] = pnl_val
     trade.pop("_closing", None)
 
     state["today_pnl"] = round(float(state.get("today_pnl", 0.0)) + pnl_val, 2)
@@ -1057,6 +1145,9 @@ async def execute_order(request: Request):
                 "lowest_price": sim_price,
                 "sl_price": sim_price * (1.0 - sl_pct) if side == "buy" else sim_price * (1.0 + sl_pct),
                 "target_price": sim_price * (1.0 + target_pct) if side == "buy" else sim_price * (1.0 - target_pct),
+                "current_price": sim_price,
+                "current_pnl_percent": 0.0,
+                "current_pnl_val": 0.0,
                 "time": get_global_time()
             }
             state["active_trades"].insert(0, new_trade)
@@ -1089,6 +1180,9 @@ async def execute_order(request: Request):
                     "lowest_price": price,
                     "sl_price": price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct),
                     "target_price": price * (1.0 + target_pct) if side == "buy" else price * (1.0 - target_pct),
+                    "current_price": price,
+                    "current_pnl_percent": 0.0,
+                    "current_pnl_val": 0.0,
                     "time": get_global_time()
                 }
                 state["active_trades"].insert(0, new_trade)
@@ -1357,6 +1451,13 @@ def get_bot_logs(device_id: str = "DEFAULT_DEVICE"):
 @app.get("/api/get-trades")
 def get_trades(device_id: str = "DEFAULT_DEVICE"):
     state = get_user_session(device_id)
+    check_midnight_settlement(state)
+
+    # Refresh live unrealized PNL before sending active positions to the UI.
+    # This makes the endpoint self-sufficient even between scanner iterations.
+    if state.get("active_trades"):
+        _refresh_active_trade_pnl(state)
+
     history_records = db_get_all_trades(device_id, limit=500)
     return {
         "status": "success",
@@ -1412,6 +1513,7 @@ async def market_scanner_loop():
     """
     Single background loop:
     - always monitors existing trades for target/SL
+    - continuously updates unrealized PNL and current price
     - only scans for new trades while is_running=True
     - never removes a trade locally unless the exchange/paper exit succeeds
     - never creates a fake real trade without a successful exchange order
@@ -1421,7 +1523,7 @@ async def market_scanner_loop():
             for dev_id, state in list(user_sessions.items()):
                 try:
                     # ---------------------------------------------------------
-                    # 1) EXISTING TRADE: TARGET / SL MONITORING
+                    # 1) EXISTING TRADE: TARGET / SL + LIVE PNL MONITORING
                     # ---------------------------------------------------------
                     active = list(state.get("active_trades", []))
                     if active:
@@ -1452,6 +1554,10 @@ async def market_scanner_loop():
                             entry = float(trade.get("entry_price", 0.0) or 0.0)
                             target_p = float(trade.get("target_price", 0.0) or 0.0)
                             sl_p = float(trade.get("sl_price", 0.0) or 0.0)
+
+                            # Even if target/SL values are missing, keep live PNL visible.
+                            if curr_p > 0 and entry > 0:
+                                _update_trade_unrealized_pnl(trade, curr_p)
 
                             if curr_p <= 0 or entry <= 0 or target_p <= 0 or sl_p <= 0:
                                 continue
@@ -1609,6 +1715,11 @@ async def market_scanner_loop():
                         "lowest_price": entry_price,
                         "sl_price": entry_price * (1.0 - sl_pct),
                         "target_price": entry_price * (1.0 + target_pct),
+                        "current_price": entry_price,
+                        "current_pnl_percent": 0.0,
+                        "current_pnl_val": 0.0,
+                        "unrealized_pnl": 0.0,
+                        "unrealized_pnl_percent": 0.0,
                         "time": get_global_time(),
                     }
 
