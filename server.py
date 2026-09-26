@@ -548,51 +548,7 @@ def get_coindcx_order_status(state, order_id):
         return False, {}, f"Empty CoinDCX order-status response: {payload}"
     return True, order, ""
 
-async def wait_for_coindcx_fill(state, order_id, timeout_seconds=5.0, poll_seconds=0.5):
-    deadline = time.time() + float(timeout_seconds)
-    last_order = {}
-    last_error = ""
-
-    while time.time() <= deadline:
-        try:
-            ok, order, err = get_coindcx_order_status(state, order_id)
-            if not ok:
-                last_error = err
-            else:
-                last_order = order
-                status = str(order.get("status", "")).lower()
-                total_qty = float(order.get("total_quantity", 0) or 0)
-                remaining_qty = float(order.get("remaining_quantity", 0) or 0)
-                avg_price = float(order.get("avg_price", 0) or 0)
-
-                if status == "filled" and remaining_qty <= 1e-12:
-                    filled_qty = max(0.0, total_qty - remaining_qty)
-                    return True, order, filled_qty, avg_price, "FILLED"
-
-                if status in {"rejected", "cancelled", "partially_cancelled"}:
-                    return False, order, max(0.0, total_qty - remaining_qty), avg_price, status.upper()
-
-                last_error = f"Order still {status or 'unknown'} (remaining={remaining_qty:g})"
-        except Exception as e:
-            last_error = str(e)
-
-        await asyncio.sleep(poll_seconds)
-
-    if last_order:
-        status = str(last_order.get("status", "unknown")).lower()
-        total_qty = float(last_order.get("total_quantity", 0) or 0)
-        remaining_qty = float(last_order.get("remaining_quantity", 0) or 0)
-        avg_price = float(last_order.get("avg_price", 0) or 0)
-        filled_qty = max(0.0, total_qty - remaining_qty)
-        return False, last_order, filled_qty, avg_price, (
-            f"TIMEOUT: order is still {status}; remaining quantity={remaining_qty:g}. "
-            f"Local position was NOT closed. {last_error}"
-        )
-
-    return False, {}, 0.0, 0.0, f"Unable to confirm CoinDCX order fill. {last_error}"
-
 def _wait_for_coindcx_fill_sync(state, order_id, timeout_seconds=6.0, poll_seconds=0.5):
-    """Synchronously confirm a CoinDCX market order before treating it as filled."""
     deadline = time.time() + float(timeout_seconds)
     last_order = {}
     last_error = ""
@@ -634,7 +590,6 @@ def _wait_for_coindcx_fill_sync(state, order_id, timeout_seconds=6.0, poll_secon
         )
 
     return False, 0.0, 0.0, f"Unable to confirm CoinDCX order fill. {last_error}"
-
 
 def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, exact_qty=0):
     api_key = state.get("api_key", "").strip()
@@ -730,7 +685,6 @@ def execute_coindcx_order(state, raw_symbol, side="buy", target_amount=100.0, ex
         if order_id is None:
             return False, current_price, quantity, f"CoinDCX returned no usable order id: {res_data}"
 
-        # IMPORTANT: never mark the local trade as filled until CoinDCX confirms it.
         filled_ok, filled_qty, avg_price, fill_msg = _wait_for_coindcx_fill_sync(
             state, order_id
         )
@@ -781,8 +735,6 @@ def execute_ccxt_order(state, raw_symbol, side="buy", target_amount=100.0, exact
 
         order = inst.create_market_order(symbol_pair, side.lower(), quantity)
 
-        # Prefer the exchange-reported fill values. Never invent a fill price/qty
-        # when the exchange response explicitly reports them.
         filled = float(order.get("filled", 0) or 0)
         average = float(order.get("average", 0) or 0)
         if filled <= 0:
@@ -815,9 +767,7 @@ def _pnl_for_trade(trade, exit_price, qty):
         value = (entry - exit_p) * quantity if quantity > 0 else amount * pct / 100.0
     return round(pct, 2), round(value, 2)
 
-
 def _update_trade_unrealized_pnl(trade, current_price):
-    """Attach live/unrealized PNL fields to an active trade."""
     try:
         entry = float(trade.get("entry_price", 0.0) or 0.0)
         qty = float(trade.get("quantity", 0.0) or 0.0)
@@ -848,9 +798,7 @@ def _update_trade_unrealized_pnl(trade, current_price):
     except Exception:
         return False
 
-
 def _build_live_price_maps(state):
-    """Fetch one market snapshot and build exact/base symbol lookup maps."""
     live_prices = {}
     live_by_base = {}
     try:
@@ -867,7 +815,6 @@ def _build_live_price_maps(state):
     except Exception:
         pass
     return live_prices, live_by_base
-
 
 def _resolve_trade_live_price(state, trade, live_prices=None, live_by_base=None):
     sym = str(trade.get("symbol", "")).upper()
@@ -887,19 +834,15 @@ def _resolve_trade_live_price(state, trade, live_prices=None, live_by_base=None)
 
     return current
 
-
 def _refresh_active_trade_pnl(state):
-    """Refresh unrealized PNL for all active trades from one live snapshot."""
     active = list(state.get("active_trades", []))
     if not active:
         return
-
     live_prices, live_by_base = _build_live_price_maps(state)
     for trade in active:
         current_price = _resolve_trade_live_price(state, trade, live_prices, live_by_base)
         if current_price > 0:
             _update_trade_unrealized_pnl(trade, current_price)
-
 
 def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
                            broker, reason="MANUAL EXIT"):
@@ -932,7 +875,6 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
 
     return trade
 
-
 def _find_live_price(state, symbol, fallback=0.0):
     try:
         markets = fetch_active_exchange_markets(state)
@@ -946,7 +888,6 @@ def _find_live_price(state, symbol, fallback=0.0):
     except Exception:
         pass
     return float(fallback or 0.0)
-
 
 def _close_trade_at_market(state, device_id, trade, reason="MANUAL EXIT",
                            preferred_price=None):
@@ -998,7 +939,6 @@ def _close_trade_at_market(state, device_id, trade, reason="MANUAL EXIT",
         trade.pop("_closing", None)
         closing_ids.discard(trade_key)
         return False, None, 0.0, str(exc)
-
 
 @app.post("/api/direct-sell")
 async def direct_sell(request: Request):
@@ -1363,7 +1303,6 @@ async def bot_control(request: Request):
 
     return {"status": "error", "message": "Unknown bot action."}
 
-
 @app.get("/api/bot-status")
 def get_bot_status(device_id: str = "DEFAULT_DEVICE"):
     state = get_user_session(device_id)
@@ -1453,8 +1392,6 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
     state = get_user_session(device_id)
     check_midnight_settlement(state)
 
-    # Refresh live unrealized PNL before sending active positions to the UI.
-    # This makes the endpoint self-sufficient even between scanner iterations.
     if state.get("active_trades"):
         _refresh_active_trade_pnl(state)
 
@@ -1483,7 +1420,6 @@ def _get_ai_sentiment_scores():
         "XRP": 52,
     }
 
-
 def _select_top20_ai_news(valid_coins):
     top20 = list(valid_coins[:20])
     sentiment = _get_ai_sentiment_scores()
@@ -1507,35 +1443,15 @@ def _select_top20_ai_news(valid_coins):
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
-
-# 100% CRASH-PROOF AUTO-RECOVERING MARKET SCANNER LOOP
 async def market_scanner_loop():
-    """
-    Single background loop:
-    - always monitors existing trades for target/SL
-    - continuously updates unrealized PNL and current price
-    - only scans for new trades while is_running=True
-    - never removes a trade locally unless the exchange/paper exit succeeds
-    - never creates a fake real trade without a successful exchange order
-    """
     while True:
         try:
             for dev_id, state in list(user_sessions.items()):
                 try:
-                    # ---------------------------------------------------------
-                    # 1) EXISTING TRADE: TARGET / SL + LIVE PNL MONITORING
-                    # ---------------------------------------------------------
+                    # 1) ALWAYS REFRESH PNL & MONITOR TARGET / SL FOR ACTIVE TRADES
                     active = list(state.get("active_trades", []))
                     if active:
-                        all_coins = fetch_active_exchange_markets(state)
-                        live_prices = {
-                            str(c.get("symbol", "")).upper(): float(c.get("price", 0.0) or 0.0)
-                            for c in all_coins
-                        }
-                        live_by_base = {
-                            str(c.get("base_coin", "")).upper(): float(c.get("price", 0.0) or 0.0)
-                            for c in all_coins
-                        }
+                        live_prices, live_by_base = _build_live_price_maps(state)
 
                         for trade in active:
                             if trade.get("_closing"):
@@ -1543,19 +1459,12 @@ async def market_scanner_loop():
 
                             sym = str(trade.get("symbol", "")).upper()
                             clean = sym.replace("INR", "").replace("USDT", "").replace("/", "")
-                            curr_p = live_prices.get(sym, live_by_base.get(clean, 0.0))
-
-                            if curr_p <= 0:
-                                ws_key = clean + "USDT"
-                                if ws_key in live_price_cache:
-                                    p_raw = float(live_price_cache[ws_key])
-                                    curr_p = p_raw * 89.5 if state.get("quote_currency") == "INR" else p_raw
+                            curr_p = _resolve_trade_live_price(state, trade, live_prices, live_by_base)
 
                             entry = float(trade.get("entry_price", 0.0) or 0.0)
                             target_p = float(trade.get("target_price", 0.0) or 0.0)
                             sl_p = float(trade.get("sl_price", 0.0) or 0.0)
 
-                            # Even if target/SL values are missing, keep live PNL visible.
                             if curr_p > 0 and entry > 0:
                                 _update_trade_unrealized_pnl(trade, curr_p)
 
@@ -1576,7 +1485,7 @@ async def market_scanner_loop():
                                 reason = "TARGET HIT" if target_hit else "SL HIT"
                                 ok, exit_price, filled_qty, msg = _close_trade_at_market(
                                     state, dev_id, trade, reason, curr_p
-                                )
+                               ]
 
                                 if ok:
                                     add_log(
@@ -1591,9 +1500,7 @@ async def market_scanner_loop():
                                         f"{sym} | {msg}"
                                     )
 
-                    # ---------------------------------------------------------
                     # 2) NEW DEAL SCANNING
-                    # ---------------------------------------------------------
                     if not state.get("is_running"):
                         continue
 
@@ -1603,7 +1510,6 @@ async def market_scanner_loop():
 
                     all_coins = fetch_active_exchange_markets(state)
                     if not all_coins:
-                        add_log(state, "⚠️ Market scanner: no market data available.")
                         continue
 
                     order_amount = float(state.get("trade_amount", 500.0))
@@ -1620,7 +1526,6 @@ async def market_scanner_loop():
                     if not valid:
                         continue
 
-                    # Respect manually selected coin when one is selected.
                     selected = str(state.get("selected_coin", "AUTO")).upper()
                     if selected != "AUTO":
                         selected_clean = selected.replace("INR", "").replace("USDT", "").replace("/", "")
@@ -1635,7 +1540,6 @@ async def market_scanner_loop():
                         if selected_match:
                             target_coin = selected_match
                         else:
-                            add_log(state, f"⚠️ Selected coin {selected} is not available in current market data.")
                             continue
                     else:
                         target_coin = _select_top20_ai_news(valid) or valid[0]
@@ -1646,12 +1550,9 @@ async def market_scanner_loop():
                     target_pct = max(0.001, float(state.get("target_percent", 1.5)) / 100.0)
                     sl_pct = max(0.001, float(state.get("sl_percent", 2.0)) / 100.0)
 
-                    # This bot opens LONG/BUY only. For spot markets, SELL is an
-                    # exit, not a new short position.
                     side = "buy"
                     broker = state.get("active_broker", "coindcx").lower()
 
-                    # PAPER: simulate a fill.
                     if broker == "paper":
                         sim_price = current_p
                         calc_qty = (
@@ -1665,7 +1566,6 @@ async def market_scanner_loop():
                         entry_price = sim_price
                         filled_qty = float(calc_qty)
 
-                    # REAL: create the exchange order first; only then add it to active_trades.
                     elif broker == "coindcx":
                         ok, entry_price, filled_qty, result = execute_coindcx_order(
                             state,
@@ -1674,10 +1574,6 @@ async def market_scanner_loop():
                             target_amount=order_amount,
                         )
                         if not ok or filled_qty <= 0:
-                            add_log(
-                                state,
-                                f"⚠️ BOT ENTRY NOT CONFIRMED: {coin_sym} | {result}"
-                            )
                             continue
 
                     elif hasattr(ccxt, broker):
@@ -1688,19 +1584,13 @@ async def market_scanner_loop():
                             target_amount=order_amount,
                         )
                         if not ok or filled_qty <= 0:
-                            add_log(
-                                state,
-                                f"⚠️ BOT ENTRY NOT CONFIRMED: {coin_sym} | {result}"
-                            )
                             continue
                     else:
-                        add_log(state, f"⚠️ Unsupported broker for bot: {broker}")
                         continue
 
                     entry_price = float(entry_price)
                     filled_qty = float(filled_qty)
                     if entry_price <= 0 or filled_qty <= 0:
-                        add_log(state, f"⚠️ Invalid filled order data for {coin_sym}; trade not added.")
                         continue
 
                     new_trade = {
@@ -1732,10 +1622,6 @@ async def market_scanner_loop():
 
                 except Exception as inner_err:
                     print(f"Loop error for {dev_id}: {inner_err}")
-                    try:
-                        add_log(state, f"⚠️ Scanner recovered from error: {inner_err}")
-                    except Exception:
-                        pass
 
         except Exception as e:
             print(f"Scanner error: {e}")
