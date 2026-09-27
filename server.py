@@ -176,8 +176,8 @@ def get_user_session(device_id: str):
             "strategy": "volume",
             "deal_condition": "ASAP",
             "selected_coin": "AUTO",
-            "target_percent": 1.5,
-            "sl_percent": 2.0,
+            "target_percent": 2.5,
+            "sl_percent": 1.5,
             "logs": ["🤖 Master AI Dual Engine Initialized. Target/SL monitoring ready."],
             "active_trades": [],
             "paper_balance": 500000.0,
@@ -189,8 +189,8 @@ def get_user_session(device_id: str):
             "_closing_ids": set()
         }
     state = user_sessions[device_id]
-    state.setdefault("target_percent", 1.5)
-    state.setdefault("sl_percent", 2.0)
+    state.setdefault("target_percent", 2.5)
+    state.setdefault("sl_percent", 1.5)
     state.setdefault("_closing_ids", set())
     return state
 
@@ -340,7 +340,7 @@ async def run_backtest(request: Request):
     simulated_deals = days * 12
     wins = int(simulated_deals * (base_win_rate / 100.0))
     losses = simulated_deals - wins
-    net_profit_pct = (wins * 1.5) - (losses * 2.0)
+    net_profit_pct = (wins * 2.5) - (losses * 1.5)
     return {
         "status": "success", "strategy": strategy, "period_days": days,
         "total_deals": simulated_deals, "win_rate": base_win_rate,
@@ -452,7 +452,9 @@ def fetch_real_cash_balance(state):
     quote = state.get("quote_currency", "INR").upper()
 
     if broker == "paper":
-        return float(state.get("paper_balance", 500000.0))
+        base_bal = float(state.get("paper_balance", 500000.0))
+        active_amt = sum(float(t.get("amount", 0.0) or 0.0) for t in state.get("active_trades", []))
+        return max(0.0, base_bal - active_amt)
 
     if not api_key or not secret_key:
         return 0.0
@@ -862,6 +864,10 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
     trade.pop("_closing", None)
 
     state["today_pnl"] = round(float(state.get("today_pnl", 0.0)) + pnl_val, 2)
+    
+    if broker == "paper":
+        trade_amt = float(trade.get("amount", 0.0) or 0.0)
+        state["paper_balance"] = round(float(state.get("paper_balance", 500000.0)) + trade_amt + pnl_val, 2)
 
     if trade in state["active_trades"]:
         state["active_trades"].remove(trade)
@@ -1054,8 +1060,8 @@ async def execute_order(request: Request):
         side = data.get("side", "BUY").lower()
         mode = data.get("mode", state.get("market_mode", "spot")).lower()
 
-        sl_pct = float(data.get("sl_percent", state.get("sl_percent", 2.0))) / 100.0
-        target_pct = float(data.get("target_percent", state.get("target_percent", 1.5))) / 100.0
+        sl_pct = float(data.get("sl_percent", state.get("sl_percent", 1.5))) / 100.0
+        target_pct = float(data.get("target_percent", state.get("target_percent", 2.5))) / 100.0
 
         state["active_broker"] = exchange
         state["quote_currency"] = currency
@@ -1072,6 +1078,10 @@ async def execute_order(request: Request):
             sim_price = match["price"] if match else (8500000.0 if "BTC" in symbol else 150.0)
             calc_qty = int(amount / sim_price) if sim_price < 20 else round(amount / sim_price, 4)
             if calc_qty <= 0: calc_qty = 1
+
+            if state.get("paper_balance", 500000.0) < amount:
+                return {"status": "error", "message": "Insufficient Paper Trading Balance!"}
+            state["paper_balance"] = round(state["paper_balance"] - amount, 2)
 
             new_trade = {
                 "id": int(time.time() * 1000),
@@ -1190,7 +1200,7 @@ async def connect_exchange(request: Request):
 
     try:
         if exchange_id == "paper":
-            return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {state["quote_currency"]: state["paper_balance"]}}
+            return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {state["quote_currency"]: fetch_real_cash_balance(state)}}
         
         elif exchange_id == "coindcx":
             timeStamp = int(round(time.time() * 1000))
@@ -1320,8 +1330,8 @@ def get_bot_status(device_id: str = "DEFAULT_DEVICE"):
         "max_trades": state.get("max_trades", 1),
         "deal_condition": state.get("deal_condition", "ASAP"),
         "selected_coin": state.get("selected_coin", "AUTO"),
-        "target_percent": state.get("target_percent", 1.5),
-        "sl_percent": state.get("sl_percent", 2.0),
+        "target_percent": state.get("target_percent", 2.5),
+        "sl_percent": state.get("sl_percent", 1.5),
     }
 
 @app.post("/api/close-trade")
@@ -1383,8 +1393,8 @@ def get_bot_logs(device_id: str = "DEFAULT_DEVICE"):
         "max_trades": state.get("max_trades", 1),
         "deal_condition": state.get("deal_condition", "ASAP"),
         "selected_coin": state.get("selected_coin", "AUTO"),
-        "target_percent": state.get("target_percent", 1.5),
-        "sl_percent": state.get("sl_percent", 2.0)
+        "target_percent": state.get("target_percent", 2.5),
+        "sl_percent": state.get("sl_percent", 1.5)
     }
 
 @app.get("/api/get-trades")
@@ -1400,7 +1410,7 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "status": "success",
         "active": state["active_trades"],
         "history": history_records,
-        "paper_balance": state["paper_balance"],
+        "paper_balance": fetch_real_cash_balance(state),
         "market_mode": state["market_mode"],
         "quote_currency": state["quote_currency"],
         "currency_symbol": get_curr_symbol(state),
@@ -1408,8 +1418,8 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "is_running": bool(state.get("is_running")),
         "deal_condition": state.get("deal_condition", "ASAP"),
         "selected_coin": state.get("selected_coin", "AUTO"),
-        "target_percent": state.get("target_percent", 1.5),
-        "sl_percent": state.get("sl_percent", 2.0)
+        "target_percent": state.get("target_percent", 2.5),
+        "sl_percent": state.get("sl_percent", 1.5)
     }
 
 def _get_ai_sentiment_scores():
@@ -1485,7 +1495,7 @@ async def market_scanner_loop():
                                 reason = "TARGET HIT" if target_hit else "SL HIT"
                                 ok, exit_price, filled_qty, msg = _close_trade_at_market(
                                     state, dev_id, trade, reason, curr_p
-                               ]
+                                )
 
                                 if ok:
                                     add_log(
@@ -1547,13 +1557,15 @@ async def market_scanner_loop():
                     coin_sym = str(target_coin["symbol"])
                     current_p = float(target_coin["price"])
                     quote = state.get("quote_currency", "INR").upper()
-                    target_pct = max(0.001, float(state.get("target_percent", 1.5)) / 100.0)
-                    sl_pct = max(0.001, float(state.get("sl_percent", 2.0)) / 100.0)
+                    target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
+                    sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
 
                     side = "buy"
                     broker = state.get("active_broker", "coindcx").lower()
 
                     if broker == "paper":
+                        if state.get("paper_balance", 500000.0) < order_amount:
+                            continue
                         sim_price = current_p
                         calc_qty = (
                             int(order_amount / sim_price)
@@ -1563,6 +1575,7 @@ async def market_scanner_loop():
                         if calc_qty <= 0:
                             calc_qty = 1
 
+                        state["paper_balance"] = round(state["paper_balance"] - order_amount, 2)
                         entry_price = sim_price
                         filled_qty = float(calc_qty)
 
