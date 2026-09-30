@@ -42,6 +42,21 @@ def init_db():
             close_time TEXT
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            device_id TEXT PRIMARY KEY,
+            is_running INTEGER,
+            active_broker TEXT,
+            market_mode TEXT,
+            quote_currency TEXT,
+            trade_amount REAL,
+            max_trades INTEGER,
+            target_percent REAL,
+            sl_percent REAL,
+            selected_coin TEXT,
+            deal_condition TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -94,6 +109,31 @@ def db_get_all_trades(device_id: str, limit: int = 1000):
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+def save_state_to_db(device_id: str, state: dict):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO bot_state (device_id, is_running, active_broker, market_mode, quote_currency, trade_amount, max_trades, target_percent, sl_percent, selected_coin, deal_condition)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            device_id,
+            1 if state.get("is_running") else 0,
+            state.get("active_broker", "coindcx"),
+            state.get("market_mode", "spot"),
+            state.get("quote_currency", "INR"),
+            state.get("trade_amount", 500.0),
+            state.get("max_trades", 1),
+            state.get("target_percent", 2.5),
+            state.get("sl_percent", 1.5),
+            state.get("selected_coin", "AUTO"),
+            state.get("deal_condition", "ASAP")
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB State Save Error: {e}")
 
 # ----------------- REAL-TIME WEBSOCKET PRICE STREAMING (ZERO DELAY) -----------------
 live_price_cache = {}
@@ -163,31 +203,65 @@ def get_user_session(device_id: str):
     if not device_id:
         device_id = "DEFAULT_DEVICE"
     if device_id not in user_sessions:
-        user_sessions[device_id] = {
-            "is_running": False,
-            "active_broker": "coindcx",
-            "market_mode": "spot",
-            "api_key": "",
-            "secret_key": "",
-            "quote_currency": "INR",
-            "trade_amount": 500.0,
-            "max_trades": 1,
-            "trade_type": "intraday",
-            "strategy": "volume",
-            "deal_condition": "ASAP",
-            "selected_coin": "AUTO",
-            "target_percent": 2.5,
-            "sl_percent": 1.5,
-            "logs": ["🤖 Master AI Dual Engine Initialized. Target/SL monitoring ready."],
-            "active_trades": [],
-            "paper_balance": 500000.0,
-            "today_pnl": 0.0,
-            "session_start_fund": 0.0,
-            "sleep_until": None,
-            "sleep_reason": "",
-            "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-            "_closing_ids": set()
-        }
+        # Check DB for persisted bot state
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT is_running, active_broker, market_mode, quote_currency, trade_amount, max_trades, target_percent, sl_percent, selected_coin, deal_condition FROM bot_state WHERE device_id = ?", (device_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if row:
+            user_sessions[device_id] = {
+                "is_running": bool(row[0]),
+                "active_broker": row[1] or "coindcx",
+                "market_mode": row[2] or "spot",
+                "api_key": "",
+                "secret_key": "",
+                "quote_currency": row[3] or "INR",
+                "trade_amount": float(row[4] or 500.0),
+                "max_trades": int(row[5] or 1),
+                "target_percent": float(row[6] or 2.5),
+                "sl_percent": float(row[7] or 1.5),
+                "selected_coin": row[8] or "AUTO",
+                "deal_condition": row[9] or "ASAP",
+                "trade_type": "intraday",
+                "strategy": "volume",
+                "logs": ["🤖 Bot session recovered from database successfully."],
+                "active_trades": [],
+                "paper_balance": 500000.0,
+                "today_pnl": 0.0,
+                "session_start_fund": 0.0,
+                "sleep_until": None,
+                "sleep_reason": "",
+                "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "_closing_ids": set()
+            }
+        else:
+            user_sessions[device_id] = {
+                "is_running": False,
+                "active_broker": "coindcx",
+                "market_mode": "spot",
+                "api_key": "",
+                "secret_key": "",
+                "quote_currency": "INR",
+                "trade_amount": 500.0,
+                "max_trades": 1,
+                "trade_type": "intraday",
+                "strategy": "volume",
+                "deal_condition": "ASAP",
+                "selected_coin": "AUTO",
+                "target_percent": 2.5,
+                "sl_percent": 1.5,
+                "logs": ["🤖 Master AI Dual Engine Initialized. Target/SL monitoring ready."],
+                "active_trades": [],
+                "paper_balance": 500000.0,
+                "today_pnl": 0.0,
+                "session_start_fund": 0.0,
+                "sleep_until": None,
+                "sleep_reason": "",
+                "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "_closing_ids": set()
+            }
     state = user_sessions[device_id]
     state.setdefault("target_percent", 2.5)
     state.setdefault("sl_percent", 1.5)
@@ -1133,7 +1207,9 @@ async def execute_order(request: Request):
                     "current_price": price,
                     "current_pnl_percent": 0.0,
                     "current_pnl_val": 0.0,
-                    "time": get_global_time()
+                    "unrealized_pnl": 0.0,
+                    "unrealized_pnl_percent": 0.0,
+                    "time": get_global_time(),
                 }
                 state["active_trades"].insert(0, new_trade)
                 add_log(state, f"✅ REAL ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
@@ -1148,10 +1224,12 @@ async def execute_order(request: Request):
 @app.post("/api/set-market-mode")
 async def set_market_mode(request: Request):
     data = await request.json()
-    state = get_user_session(data.get("device_id", ""))
+    device_id = data.get("device_id", "")
+    state = get_user_session(device_id)
     mode = data.get("mode", "spot").lower()
     if mode in ["spot", "futures"]:
         state["market_mode"] = mode
+        save_state_to_db(device_id, state)
         add_log(state, f"🎯 Market Mode Changed to: {mode.upper()}")
         return {"status": "success", "market_mode": mode}
     return {"status": "error", "message": "Mode must be 'spot' or 'futures'"}
@@ -1159,25 +1237,29 @@ async def set_market_mode(request: Request):
 @app.post("/api/set-broker-mode")
 async def set_broker_mode(request: Request):
     data = await request.json()
-    state = get_user_session(data.get("device_id", ""))
+    device_id = data.get("device_id", "")
+    state = get_user_session(device_id)
     mode = data.get("mode", "real").lower()
     if mode == "paper":
         state["active_broker"] = "paper"
     elif mode == "real" and state.get("active_broker") == "paper":
         state["active_broker"] = "coindcx"
+    save_state_to_db(device_id, state)
     add_log(state, f"⚡ Broker Mode: {mode.upper()} | Exchange: {state['active_broker'].upper()}")
     return {"status": "success", "active_broker": state["active_broker"]}
 
 @app.post("/api/set-currency")
 async def set_currency(request: Request):
     data = await request.json()
-    state = get_user_session(data.get("device_id", ""))
+    device_id = data.get("device_id", "")
+    state = get_user_session(device_id)
     currency = data.get("currency", "INR").upper()
     if currency not in ["USDT", "INR"]:
         return {"status": "error", "message": "Only 'USDT' and 'INR' are supported"}
 
     state["quote_currency"] = currency
     state["trade_amount"] = 500.0 if currency == "INR" else 5.0
+    save_state_to_db(device_id, state)
     add_log(state, f"💱 Currency switched to {currency} ({get_curr_symbol(state)})")
     return {
         "status": "success",
@@ -1189,7 +1271,8 @@ async def set_currency(request: Request):
 @app.post("/api/connect-exchange")
 async def connect_exchange(request: Request):
     data = await request.json()
-    state = get_user_session(data.get("device_id", ""))
+    device_id = data.get("device_id", "")
+    state = get_user_session(device_id)
     exchange_id = data.get("exchange", "coindcx").lower()
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
@@ -1197,6 +1280,7 @@ async def connect_exchange(request: Request):
     state["active_broker"] = exchange_id
     state["api_key"] = api_key
     state["secret_key"] = secret_key
+    save_state_to_db(device_id, state)
 
     try:
         if exchange_id == "paper":
@@ -1237,7 +1321,7 @@ async def connect_exchange(request: Request):
             state["session_start_fund"] = cash_fund
             add_log(state, f"🔗 Connected to {exchange_id.upper()}! Cash: {get_curr_symbol(state)}{cash_fund}")
             return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
-            
+        
         else:
             return {
                 "status": "success", 
@@ -1286,6 +1370,8 @@ async def bot_control(request: Request):
         if "sl_percent" in data:
             state["sl_percent"] = max(0.1, float(data["sl_percent"]))
 
+        save_state_to_db(device_id, state)
+
         curr_sym = get_curr_symbol(state)
         target_info = (
             state["selected_coin"]
@@ -1303,11 +1389,13 @@ async def bot_control(request: Request):
             "message": "Bot Started!",
             "is_running": True,
             "target_percent": state["target_percent"],
-            "sl_percent": state["sl_percent"]
+            "sl_percent": state["sl_percent"],
+            "active_broker": state["active_broker"]
         }
 
     if action == "stop":
         state["is_running"] = False
+        save_state_to_db(device_id, state)
         add_log(state, "🛑 BOT STOPPED! New deal scanning halted; existing target/SL monitoring remains active.")
         return {"status": "success", "message": "Bot Stopped!", "is_running": False}
 
@@ -1419,7 +1507,8 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "deal_condition": state.get("deal_condition", "ASAP"),
         "selected_coin": state.get("selected_coin", "AUTO"),
         "target_percent": state.get("target_percent", 2.5),
-        "sl_percent": state.get("sl_percent", 1.5)
+        "sl_percent": state.get("sl_percent", 1.5),
+        "active_broker": state.get("active_broker", "coindcx")
     }
 
 def _get_ai_sentiment_scores():
