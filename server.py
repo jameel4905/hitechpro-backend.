@@ -203,7 +203,6 @@ def get_user_session(device_id: str):
     if not device_id:
         device_id = "DEFAULT_DEVICE"
     if device_id not in user_sessions:
-        # Check DB for persisted bot state
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("SELECT is_running, active_broker, market_mode, quote_currency, trade_amount, max_trades, target_percent, sl_percent, selected_coin, deal_condition FROM bot_state WHERE device_id = ?", (device_id,))
@@ -1134,6 +1133,10 @@ async def execute_order(request: Request):
         side = data.get("side", "BUY").lower()
         mode = data.get("mode", state.get("market_mode", "spot")).lower()
 
+        # Futures Short-Selling Check: If spot mode and sell side requested
+        if mode == "spot" and side == "sell":
+            return {"status": "error", "message": "Spot mode only supports BUY/LONG. Switch to Futures for SHORT/SELL."}
+
         sl_pct = float(data.get("sl_percent", state.get("sl_percent", 1.5))) / 100.0
         target_pct = float(data.get("target_percent", state.get("target_percent", 2.5))) / 100.0
 
@@ -1157,26 +1160,34 @@ async def execute_order(request: Request):
                 return {"status": "error", "message": "Insufficient Paper Trading Balance!"}
             state["paper_balance"] = round(state["paper_balance"] - amount, 2)
 
+            trade_type = "LONG" if side == "buy" else "SHORT"
+            if trade_type == "SHORT":
+                target_price = sim_price * (1.0 - target_pct)
+                sl_price = sim_price * (1.0 + sl_pct)
+            else:
+                target_price = sim_price * (1.0 + target_pct)
+                sl_price = sim_price * (1.0 - sl_pct)
+
             new_trade = {
                 "id": int(time.time() * 1000),
                 "symbol": symbol,
                 "currency": currency,
-                "type": "LONG" if side == "buy" else "SHORT",
+                "type": trade_type,
                 "entry_price": sim_price,
                 "quantity": calc_qty,
                 "amount": amount,
                 "highest_price": sim_price,
                 "lowest_price": sim_price,
-                "sl_price": sim_price * (1.0 - sl_pct) if side == "buy" else sim_price * (1.0 + sl_pct),
-                "target_price": sim_price * (1.0 + target_pct) if side == "buy" else sim_price * (1.0 - target_pct),
+                "sl_price": sl_price,
+                "target_price": target_price,
                 "current_price": sim_price,
                 "current_pnl_percent": 0.0,
                 "current_pnl_val": 0.0,
                 "time": get_global_time()
             }
             state["active_trades"].insert(0, new_trade)
-            add_log(state, f"⚡ [PAPER] {side.upper()}: {calc_qty} {symbol} at {curr_sym}{sim_price}")
-            return {"status": "success", "message": f"Paper {side.upper()} order placed!", "price": sim_price, "qty": calc_qty}
+            add_log(state, f"⚡ [PAPER] {trade_type}: {calc_qty} {symbol} at {curr_sym}{sim_price}")
+            return {"status": "success", "message": f"Paper {trade_type} order placed!", "price": sim_price, "qty": calc_qty}
 
         else:
             success, price, qty, res = True, 8500000.0 if "BTC" in symbol else 150.0, 0.001, "Filled via Gateway"
@@ -1192,18 +1203,26 @@ async def execute_order(request: Request):
                 qty = round(amount / price, 4) if price > 0 else 1.0
 
             if success:
+                trade_type = "LONG" if side == "buy" else "SHORT"
+                if trade_type == "SHORT":
+                    target_price = price * (1.0 - target_pct)
+                    sl_price = price * (1.0 + sl_pct)
+                else:
+                    target_price = price * (1.0 + target_pct)
+                    sl_price = price * (1.0 - sl_pct)
+
                 new_trade = {
                     "id": int(time.time() * 1000),
                     "symbol": symbol,
                     "currency": currency,
-                    "type": "LONG" if side == "buy" else "SHORT",
+                    "type": trade_type,
                     "entry_price": price,
                     "quantity": qty,
                     "amount": round(qty * price, 2),
                     "highest_price": price,
                     "lowest_price": price,
-                    "sl_price": price * (1.0 - sl_pct) if side == "buy" else price * (1.0 + sl_pct),
-                    "target_price": price * (1.0 + target_pct) if side == "buy" else price * (1.0 - target_pct),
+                    "sl_price": sl_price,
+                    "target_price": target_price,
                     "current_price": price,
                     "current_pnl_percent": 0.0,
                     "current_pnl_val": 0.0,
@@ -1212,8 +1231,8 @@ async def execute_order(request: Request):
                     "time": get_global_time(),
                 }
                 state["active_trades"].insert(0, new_trade)
-                add_log(state, f"✅ REAL ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
-                return {"status": "success", "message": f"Real {side.upper()} order filled on {exchange.upper()}!", "price": price, "qty": qty}
+                add_log(state, f"✅ REAL {trade_type} ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
+                return {"status": "success", "message": f"Real {trade_type} order filled on {exchange.upper()}!", "price": price, "qty": qty}
             else:
                 add_log(state, f"❌ {exchange.upper()} Rejected: {res}")
                 return {"status": "error", "message": str(res)}
@@ -1649,7 +1668,15 @@ async def market_scanner_loop():
                     target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
                     sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
 
-                    side = "buy"
+                    # Futures Short-Selling Check during automated scan
+                    market_mode = state.get("market_mode", "spot").lower()
+                    if market_mode == "futures" and target_coin.get("change", 0.0) < -2.0:
+                        side = "sell" # Open Short if market is in downtrend
+                        trade_type = "SHORT"
+                    else:
+                        side = "buy"  # Open Long otherwise
+                        trade_type = "LONG"
+
                     broker = state.get("active_broker", "coindcx").lower()
 
                     if broker == "paper":
@@ -1695,18 +1722,25 @@ async def market_scanner_loop():
                     if entry_price <= 0 or filled_qty <= 0:
                         continue
 
+                    if trade_type == "SHORT":
+                        target_price = entry_price * (1.0 - target_pct)
+                        sl_price = entry_price * (1.0 + sl_pct)
+                    else:
+                        target_price = entry_price * (1.0 + target_pct)
+                        sl_price = entry_price * (1.0 - sl_pct)
+
                     new_trade = {
                         "id": int(time.time() * 1000),
                         "symbol": coin_sym,
                         "currency": quote,
-                        "type": "LONG",
+                        "type": trade_type,
                         "entry_price": entry_price,
                         "quantity": filled_qty,
                         "amount": round(entry_price * filled_qty, 2),
                         "highest_price": entry_price,
                         "lowest_price": entry_price,
-                        "sl_price": entry_price * (1.0 - sl_pct),
-                        "target_price": entry_price * (1.0 + target_pct),
+                        "sl_price": sl_price,
+                        "target_price": target_price,
                         "current_price": entry_price,
                         "current_pnl_percent": 0.0,
                         "current_pnl_val": 0.0,
@@ -1718,7 +1752,7 @@ async def market_scanner_loop():
                     state["active_trades"].insert(0, new_trade)
                     add_log(
                         state,
-                        f"⚡ BOT OPENED LONG: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
+                        f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
                         f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']}"
                     )
 
