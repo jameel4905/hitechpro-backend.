@@ -1133,7 +1133,6 @@ async def execute_order(request: Request):
         side = data.get("side", "BUY").lower()
         mode = data.get("mode", state.get("market_mode", "spot")).lower()
 
-        # Futures Short-Selling Check: If spot mode and sell side requested
         if mode == "spot" and side == "sell":
             return {"status": "error", "message": "Spot mode only supports BUY/LONG. Switch to Futures for SHORT/SELL."}
 
@@ -1566,7 +1565,7 @@ async def market_scanner_loop():
         try:
             for dev_id, state in list(user_sessions.items()):
                 try:
-                    # 1) ALWAYS REFRESH PNL & MONITOR TARGET / SL FOR ACTIVE TRADES
+                    # 1) ALWAYS REFRESH PNL & MONITOR TARGET / SL / TRAILING STOP LOSS FOR ACTIVE TRADES
                     active = list(state.get("active_trades", []))
                     if active:
                         live_prices, live_by_base = _build_live_price_maps(state)
@@ -1585,6 +1584,29 @@ async def market_scanner_loop():
 
                             if curr_p > 0 and entry > 0:
                                 _update_trade_unrealized_pnl(trade, curr_p)
+                                
+                                # --- TRAILING STOP LOSS (TSL) LOGIC ---
+                                is_long = trade.get("type") in ["LONG", "BUY"]
+                                sl_pct_val = float(state.get("sl_percent", 1.5)) / 100.0
+                                
+                                if is_long:
+                                    highest = float(trade.get("highest_price", entry) or entry)
+                                    if curr_p > highest:
+                                        trade["highest_price"] = curr_p
+                                        # Trail SL upwards if price goes up
+                                        new_sl = curr_p * (1.0 - sl_pct_val)
+                                        if new_sl > sl_p:
+                                            trade["sl_price"] = new_sl
+                                            sl_p = new_sl
+                                else:
+                                    lowest = float(trade.get("lowest_price", entry) or entry)
+                                    if curr_p < lowest:
+                                        trade["lowest_price"] = curr_p
+                                        # Trail SL downwards if price goes down for short
+                                        new_sl = curr_p * (1.0 + sl_pct_val)
+                                        if new_sl < sl_p:
+                                            trade["sl_price"] = new_sl
+                                            sl_p = new_sl
 
                             if curr_p <= 0 or entry <= 0 or target_p <= 0 or sl_p <= 0:
                                 continue
@@ -1600,7 +1622,7 @@ async def market_scanner_loop():
                                 sl_hit = curr_p >= sl_p
 
                             if target_hit or sl_hit:
-                                reason = "TARGET HIT" if target_hit else "SL HIT"
+                                reason = "TARGET HIT" if target_hit else "SL/TSL HIT"
                                 ok, exit_price, filled_qty, msg = _close_trade_at_market(
                                     state, dev_id, trade, reason, curr_p
                                 )
@@ -1668,13 +1690,12 @@ async def market_scanner_loop():
                     target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
                     sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
 
-                    # Futures Short-Selling Check during automated scan
                     market_mode = state.get("market_mode", "spot").lower()
                     if market_mode == "futures" and target_coin.get("change", 0.0) < -2.0:
-                        side = "sell" # Open Short if market is in downtrend
+                        side = "sell"
                         trade_type = "SHORT"
                     else:
-                        side = "buy"  # Open Long otherwise
+                        side = "buy"
                         trade_type = "LONG"
 
                     broker = state.get("active_broker", "coindcx").lower()
