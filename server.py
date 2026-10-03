@@ -2155,14 +2155,55 @@ async def market_scanner_loop():
                     deal_cond = str(state.get("deal_condition", "ASAP")).upper()
                     market_mode = state.get("market_mode", "spot").lower()
 
-                    selected_result = _select_analyzed_candidate(
-                        valid, deal_cond, market_mode, selected
+                    # REAL LIVE SCANNER: analyze the same market pool used by the
+                    # trade engine and publish each result to the server log.
+                    # The UI only displays these server-authoritative results; it
+                    # never invents/randomizes scan data.
+                    scan_pool = valid
+                    if selected != "AUTO":
+                        clean_selected = selected.replace("INR", "").replace("USDT", "").replace("/", "")
+                        scan_pool = [c for c in valid if str(c.get("base_coin", "")).upper() == clean_selected]
+                    else:
+                        scan_pool = sorted(
+                            valid,
+                            key=lambda x: float(x.get("volume", 0) or 0),
+                            reverse=True
+                        )[:20]
+
+                    add_log(
+                        state,
+                        f"🔎 SCAN START | {len(scan_pool)} coin(s) | {deal_cond} | "
+                        f"{market_mode.upper()} | Top-20 volume ranking"
                     )
-                    if not selected_result:
-                        add_log(state, f"🔎 NO TRADE: {deal_cond} | No confirmed market-analysis signal (score >= 65).")
+
+                    best_scan = None
+                    for scan_idx, scan_coin in enumerate(scan_pool, 1):
+                        try:
+                            scan_analysis = _analyze_coin(scan_coin)
+                            scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
+                            scan_status = "PASS" if scan_pass else "NO TRADE"
+                            rsi_text = f"{scan_analysis['rsi']:.1f}" if scan_analysis.get("rsi") is not None else "N/A"
+                            vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
+                            add_log(
+                                state,
+                                f"🔍 SCAN {scan_idx:02d}/{len(scan_pool):02d} | "
+                                f"{scan_coin.get('symbol')} | {scan_analysis.get('direction')} | "
+                                f"Score {scan_analysis.get('score', 0)}/100 | RSI {rsi_text} | "
+                                f"Vol {vol_text} | {scan_status}"
+                            )
+                            if scan_pass and (best_scan is None or scan_analysis["score"] > best_scan[1]["score"]):
+                                best_scan = (scan_coin, scan_analysis)
+                        except Exception as scan_exc:
+                            add_log(state, f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}")
+
+                    if best_scan is None:
+                        add_log(
+                            state,
+                            f"🔎 NO TRADE: {deal_cond} | All scanned coins failed the confirmed market-analysis rules."
+                        )
                         continue
 
-                    target_coin, analysis = selected_result
+                    target_coin, analysis = best_scan
                     coin_sym = str(target_coin["symbol"])
                     current_p = float(target_coin["price"])
                     add_log(
