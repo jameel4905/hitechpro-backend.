@@ -1652,6 +1652,13 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         _refresh_active_trade_pnl(state)
 
     history_records = db_get_all_trades(device_id, limit=500)
+    # P&L is currency-specific. Never add INR and USDT/USD amounts together.
+    current_currency = str(state.get("quote_currency", "INR")).upper()
+    display_today_pnl = round(sum(
+        float(t.get("pnl_val", 0.0) or 0.0)
+        for t in history_records
+        if str(t.get("currency", current_currency)).upper() == current_currency
+    ), 2)
     return {
         "status": "success",
         "active": state["active_trades"],
@@ -1660,7 +1667,7 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "market_mode": state["market_mode"],
         "quote_currency": state["quote_currency"],
         "currency_symbol": get_curr_symbol(state),
-        "today_pnl": state["today_pnl"],
+        "today_pnl": display_today_pnl,
         "is_running": bool(state.get("is_running")),
         "deal_condition": state.get("deal_condition", "ASAP"),
         "selected_coin": state.get("selected_coin", "AUTO"),
