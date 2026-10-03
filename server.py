@@ -54,9 +54,49 @@ def init_db():
             target_percent REAL,
             sl_percent REAL,
             selected_coin TEXT,
-            deal_condition TEXT
+            deal_condition TEXT,
+            paper_balance REAL DEFAULT 500000.0,
+            today_pnl REAL DEFAULT 0.0,
+            last_settlement_date TEXT
         )
     """)
+    # Backward-compatible schema upgrades for existing installations.
+    for ddl in [
+        "ALTER TABLE bot_state ADD COLUMN paper_balance REAL DEFAULT 500000.0",
+        "ALTER TABLE bot_state ADD COLUMN today_pnl REAL DEFAULT 0.0",
+        "ALTER TABLE bot_state ADD COLUMN last_settlement_date TEXT"
+    ]:
+        try:
+            cursor.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS active_trades (
+            trade_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            symbol TEXT,
+            currency TEXT,
+            side TEXT,
+            entry_price REAL,
+            quantity REAL,
+            amount REAL,
+            sl_price REAL,
+            target_price REAL,
+            highest_price REAL,
+            lowest_price REAL,
+            current_price REAL,
+            current_pnl_percent REAL DEFAULT 0,
+            current_pnl_val REAL DEFAULT 0,
+            unrealized_pnl REAL DEFAULT 0,
+            unrealized_pnl_percent REAL DEFAULT 0,
+            broker TEXT,
+            opened_at TEXT,
+            updated_at TEXT,
+            status TEXT DEFAULT 'OPEN'
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -94,6 +134,85 @@ def db_save_trade(trade: dict, device_id: str, broker: str):
     except Exception as e:
         print(f"DB Save Critical Error: {e}")
 
+
+def db_save_active_trade(trade: dict, device_id: str, broker: str):
+    """Persist an OPEN trade immediately. This prevents loss on server restart."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        t_id = str(trade.get("id"))
+        if not t_id or t_id == "None":
+            raise ValueError("Active trade has no id")
+
+        now = get_global_time()
+        conn.execute("""
+            INSERT OR REPLACE INTO active_trades (
+                trade_id, device_id, symbol, currency, side, entry_price, quantity,
+                amount, sl_price, target_price, highest_price, lowest_price,
+                current_price, current_pnl_percent, current_pnl_val,
+                unrealized_pnl, unrealized_pnl_percent, broker, opened_at,
+                updated_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
+        """, (
+            t_id, device_id,
+            str(trade.get("symbol", "")),
+            str(trade.get("currency", "INR")),
+            str(trade.get("type", trade.get("side", "LONG"))),
+            float(trade.get("entry_price", 0) or 0),
+            float(trade.get("quantity", 0) or 0),
+            float(trade.get("amount", 0) or 0),
+            float(trade.get("sl_price", 0) or 0),
+            float(trade.get("target_price", 0) or 0),
+            float(trade.get("highest_price", trade.get("entry_price", 0)) or 0),
+            float(trade.get("lowest_price", trade.get("entry_price", 0)) or 0),
+            float(trade.get("current_price", trade.get("entry_price", 0)) or 0),
+            float(trade.get("current_pnl_percent", 0) or 0),
+            float(trade.get("current_pnl_val", 0) or 0),
+            float(trade.get("unrealized_pnl", 0) or 0),
+            float(trade.get("unrealized_pnl_percent", 0) or 0),
+            broker, str(trade.get("time", now)), now
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_update_active_trade(trade: dict, device_id: str, broker: str):
+    db_save_active_trade(trade, device_id, broker)
+
+
+def db_delete_active_trade(trade_id):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conn.execute("DELETE FROM active_trades WHERE trade_id = ?", (str(trade_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def db_load_active_trades(device_id: str):
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("""
+            SELECT * FROM active_trades
+            WHERE device_id = ? AND status = 'OPEN'
+            ORDER BY rowid DESC
+        """, (device_id,)).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["id"] = d.pop("trade_id")
+            d["time"] = d.get("opened_at") or get_global_time()
+            result.append(d)
+        return result
+    finally:
+        conn.close()
+
+
+def db_save_wallet_state(device_id: str, state: dict):
+    save_state_to_db(device_id, state)
+
+
 def db_get_all_trades(device_id: str, limit: int = 1000):
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -115,8 +234,12 @@ def save_state_to_db(device_id: str, state: dict):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO bot_state (device_id, is_running, active_broker, market_mode, quote_currency, trade_amount, max_trades, target_percent, sl_percent, selected_coin, deal_condition)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO bot_state (
+            device_id, is_running, active_broker, market_mode, quote_currency,
+            trade_amount, max_trades, target_percent, sl_percent, selected_coin,
+            deal_condition, paper_balance, today_pnl, last_settlement_date
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             device_id,
             1 if state.get("is_running") else 0,
@@ -128,7 +251,10 @@ def save_state_to_db(device_id: str, state: dict):
             state.get("target_percent", 2.5),
             state.get("sl_percent", 1.5),
             state.get("selected_coin", "AUTO"),
-            state.get("deal_condition", "ASAP")
+            state.get("deal_condition", "ASAP"),
+            float(state.get("paper_balance", 500000.0) or 0.0),
+            float(state.get("today_pnl", 0.0) or 0.0),
+            state.get("last_settlement_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         ))
         conn.commit()
         conn.close()
@@ -205,7 +331,12 @@ def get_user_session(device_id: str):
     if device_id not in user_sessions:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute("SELECT is_running, active_broker, market_mode, quote_currency, trade_amount, max_trades, target_percent, sl_percent, selected_coin, deal_condition FROM bot_state WHERE device_id = ?", (device_id,))
+        cursor.execute("""
+            SELECT is_running, active_broker, market_mode, quote_currency, trade_amount,
+                   max_trades, target_percent, sl_percent, selected_coin, deal_condition,
+                   paper_balance, today_pnl, last_settlement_date
+            FROM bot_state WHERE device_id = ?
+        """, (device_id,))
         row = cursor.fetchone()
         conn.close()
 
@@ -226,9 +357,9 @@ def get_user_session(device_id: str):
                 "trade_type": "intraday",
                 "strategy": "volume",
                 "logs": ["🤖 Bot session recovered from database successfully."],
-                "active_trades": [],
-                "paper_balance": 500000.0,
-                "today_pnl": 0.0,
+                "active_trades": db_load_active_trades(device_id),
+                "paper_balance": float(row[10] if row[10] is not None else 500000.0),
+                "today_pnl": float(row[11] if row[11] is not None else 0.0),
                 "session_start_fund": 0.0,
                 "sleep_until": None,
                 "sleep_reason": "",
@@ -341,6 +472,7 @@ def check_midnight_settlement(state):
         settled_amount = state["today_pnl"]
         state["today_pnl"] = 0.0
         state["last_settlement_date"] = current_date
+        save_state_to_db(next((k for k, v in user_sessions.items() if v is state), "DEFAULT_DEVICE"), state)
         add_log(state, f"🏦 Midnight Settlement: {curr_sym}{settled_amount} moved to Wallet.")
 
 @app.post("/api/verify-vip-key")
@@ -525,9 +657,10 @@ def fetch_real_cash_balance(state):
     quote = state.get("quote_currency", "INR").upper()
 
     if broker == "paper":
-        base_bal = float(state.get("paper_balance", 500000.0))
-        active_amt = sum(float(t.get("amount", 0.0) or 0.0) for t in state.get("active_trades", []))
-        return max(0.0, base_bal - active_amt)
+        # paper_balance is the actual AVAILABLE cash balance.
+        # Trade entry deducts the order amount immediately; closing adds
+        # the returned principal plus realized P&L.
+        return round(max(0.0, float(state.get("paper_balance", 500000.0))), 2)
 
     if not api_key or not secret_key:
         return 0.0
@@ -945,7 +1078,9 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
     if trade in state["active_trades"]:
         state["active_trades"].remove(trade)
 
+    db_delete_active_trade(trade.get("id"))
     db_save_trade(trade, device_id, broker)
+    save_state_to_db(device_id, state)
 
     try:
         state.get("_closing_ids", set()).discard(str(trade.get("id")))
@@ -1185,6 +1320,8 @@ async def execute_order(request: Request):
                 "time": get_global_time()
             }
             state["active_trades"].insert(0, new_trade)
+            db_save_active_trade(new_trade, device_id, "paper")
+            save_state_to_db(device_id, state)
             add_log(state, f"⚡ [PAPER] {trade_type}: {calc_qty} {symbol} at {curr_sym}{sim_price}")
             return {"status": "success", "message": f"Paper {trade_type} order placed!", "price": sim_price, "qty": calc_qty}
 
@@ -1230,6 +1367,8 @@ async def execute_order(request: Request):
                     "time": get_global_time(),
                 }
                 state["active_trades"].insert(0, new_trade)
+                db_save_active_trade(new_trade, device_id, exchange)
+                save_state_to_db(device_id, state)
                 add_log(state, f"✅ REAL {trade_type} ORDER FILLED: {qty} {symbol} at {curr_sym}{price} on {exchange.upper()}")
                 return {"status": "success", "message": f"Real {trade_type} order filled on {exchange.upper()}!", "price": price, "qty": qty}
             else:
@@ -1608,6 +1747,9 @@ async def market_scanner_loop():
                                             trade["sl_price"] = new_sl
                                             sl_p = new_sl
 
+                            # Keep the persistent active-trade record synchronized.
+                            db_update_active_trade(trade, dev_id, state.get("active_broker", "paper"))
+
                             if curr_p <= 0 or entry <= 0 or target_p <= 0 or sl_p <= 0:
                                 continue
 
@@ -1771,6 +1913,8 @@ async def market_scanner_loop():
                     }
 
                     state["active_trades"].insert(0, new_trade)
+                    db_save_active_trade(new_trade, dev_id, broker)
+                    save_state_to_db(dev_id, state)
                     add_log(
                         state,
                         f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
