@@ -9,7 +9,6 @@ import ccxt
 import uvicorn
 import asyncio
 import threading
-import websocket
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
@@ -39,6 +38,7 @@ def init_db():
             pnl_val REAL,
             status TEXT,
             broker TEXT,
+            exchange TEXT,
             close_time TEXT
         )
     """)
@@ -57,14 +57,18 @@ def init_db():
             deal_condition TEXT,
             paper_balance REAL DEFAULT 500000.0,
             today_pnl REAL DEFAULT 0.0,
-            last_settlement_date TEXT
+            last_settlement_date TEXT,
+            market_data_exchange TEXT DEFAULT 'coindcx'
         )
     """)
     # Backward-compatible schema upgrades for existing installations.
     for ddl in [
         "ALTER TABLE bot_state ADD COLUMN paper_balance REAL DEFAULT 500000.0",
         "ALTER TABLE bot_state ADD COLUMN today_pnl REAL DEFAULT 0.0",
-        "ALTER TABLE bot_state ADD COLUMN last_settlement_date TEXT"
+        "ALTER TABLE bot_state ADD COLUMN last_settlement_date TEXT",
+        "ALTER TABLE bot_state ADD COLUMN market_data_exchange TEXT DEFAULT 'coindcx'",
+        "ALTER TABLE trades ADD COLUMN exchange TEXT",
+        "ALTER TABLE active_trades ADD COLUMN exchange TEXT"
     ]:
         try:
             cursor.execute(ddl)
@@ -93,7 +97,8 @@ def init_db():
             broker TEXT,
             opened_at TEXT,
             updated_at TEXT,
-            status TEXT DEFAULT 'OPEN'
+            status TEXT DEFAULT 'OPEN',
+            exchange TEXT
         )
     """)
 
@@ -120,15 +125,16 @@ def db_save_trade(trade: dict, device_id: str, broker: str):
         pnl_pct = float(trade.get("pnl_percent", 0.0) or 0.0)
         pnl_val = float(trade.get("pnl_val", 0.0) or 0.0)
         status = str(trade.get("status", "CLOSED"))
+        exchange = str(trade.get("exchange", trade.get("market_data_exchange", broker)) or broker)
         close_t = str(trade.get("close_time", datetime.now(timezone.utc).isoformat() + "Z"))
 
         cursor.execute("""
             INSERT OR REPLACE INTO trades (
                 trade_id, device_id, symbol, currency, side, entry_price, 
                 exit_price, quantity, amount, sl_price, target_price, 
-                pnl_percent, pnl_val, status, broker, close_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (t_id, device_id, sym, curr, side, entry, exit_p, qty, amt, sl, tgt, pnl_pct, pnl_val, status, broker, close_t))
+                pnl_percent, pnl_val, status, broker, exchange, close_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (t_id, device_id, sym, curr, side, entry, exit_p, qty, amt, sl, tgt, pnl_pct, pnl_val, status, broker, exchange, close_t))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -149,7 +155,7 @@ def db_save_active_trade(trade: dict, device_id: str, broker: str):
                 trade_id, device_id, symbol, currency, side, entry_price, quantity,
                 amount, sl_price, target_price, highest_price, lowest_price,
                 current_price, current_pnl_percent, current_pnl_val,
-                unrealized_pnl, unrealized_pnl_percent, broker, opened_at,
+                unrealized_pnl, unrealized_pnl_percent, broker, exchange, opened_at,
                 updated_at, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN')
         """, (
@@ -169,7 +175,9 @@ def db_save_active_trade(trade: dict, device_id: str, broker: str):
             float(trade.get("current_pnl_val", 0) or 0),
             float(trade.get("unrealized_pnl", 0) or 0),
             float(trade.get("unrealized_pnl_percent", 0) or 0),
-            broker, str(trade.get("time", now)), now
+            broker,
+            str(trade.get("exchange", trade.get("market_data_exchange", broker)) or broker),
+            str(trade.get("time", now)), now
         ))
         conn.commit()
     finally:
@@ -237,9 +245,9 @@ def save_state_to_db(device_id: str, state: dict):
             INSERT OR REPLACE INTO bot_state (
             device_id, is_running, active_broker, market_mode, quote_currency,
             trade_amount, max_trades, target_percent, sl_percent, selected_coin,
-            deal_condition, paper_balance, today_pnl, last_settlement_date
+            deal_condition, paper_balance, today_pnl, last_settlement_date, market_data_exchange
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             device_id,
             1 if state.get("is_running") else 0,
@@ -254,61 +262,17 @@ def save_state_to_db(device_id: str, state: dict):
             state.get("deal_condition", "ASAP"),
             float(state.get("paper_balance", 500000.0) or 0.0),
             float(state.get("today_pnl", 0.0) or 0.0),
-            state.get("last_settlement_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            state.get("last_settlement_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            state.get("market_data_exchange", "coindcx")
         ))
         conn.commit()
         conn.close()
     except Exception as e:
         print(f"DB State Save Error: {e}")
 
-# ----------------- REAL-TIME WEBSOCKET PRICE STREAMING (ZERO DELAY) -----------------
-live_price_cache = {}
-
-def on_ws_message(ws, message):
-    try:
-        data = json.loads(message)
-        if isinstance(data, list):
-            for tick in data:
-                sym = tick.get("s", "").upper()
-                price = float(tick.get("c", 0.0) or tick.get("p", 0.0) or 0.0)
-                if sym and price > 0:
-                    live_price_cache[sym] = price
-        elif isinstance(data, dict):
-            sym = data.get("s", "").upper()
-            price = float(data.get("c", 0.0) or data.get("p", 0.0) or 0.0)
-            if sym and price > 0:
-                live_price_cache[sym] = price
-    except:
-        pass
-
-def on_ws_error(ws, error):
-    pass
-
-def on_ws_close(ws, close_status_code, close_msg):
-    threading.Timer(3.0, start_binance_websocket).start()
-
-def on_ws_open(ws):
-    print("🟢 Binance WebSocket Connected for Zero-Delay Real-Time Prices!")
-
-def start_binance_websocket():
-    try:
-        ws_url = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
-        ws = websocket.WebSocketApp(
-            ws_url,
-            on_open=on_ws_open,
-            on_message=on_ws_message,
-            on_error=on_ws_error,
-            on_close=on_ws_close
-        )
-        wst = threading.Thread(target=ws.run_forever, daemon=True)
-        wst.start()
-    except Exception as e:
-        print(f"WS Init Error: {e}")
-
 # ----------------- APP LIFECYCLE & STATE -----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    start_binance_websocket()
     scanner_task = asyncio.create_task(market_scanner_loop())
     yield
     scanner_task.cancel()
@@ -335,7 +299,7 @@ def get_user_session(device_id: str):
         cursor.execute("""
             SELECT is_running, active_broker, market_mode, quote_currency, trade_amount,
                    max_trades, target_percent, sl_percent, selected_coin, deal_condition,
-                   paper_balance, today_pnl, last_settlement_date
+                   paper_balance, today_pnl, last_settlement_date, market_data_exchange
             FROM bot_state WHERE device_id = ?
         """, (device_id,))
         row = cursor.fetchone()
@@ -345,6 +309,7 @@ def get_user_session(device_id: str):
             user_sessions[device_id] = {
                 "is_running": bool(row[0]),
                 "active_broker": row[1] or "coindcx",
+                "market_data_exchange": row[13] or (row[1] if row[1] and row[1] != "paper" else "coindcx"),
                 "market_mode": row[2] or "spot",
                 "api_key": "",
                 "secret_key": "",
@@ -371,6 +336,7 @@ def get_user_session(device_id: str):
             user_sessions[device_id] = {
                 "is_running": False,
                 "active_broker": "coindcx",
+                "market_data_exchange": "coindcx",
                 "market_mode": "spot",
                 "api_key": "",
                 "secret_key": "",
@@ -565,72 +531,82 @@ def get_ai_sentiment():
     ]
     return {"status": "success", "market_mood": "Greed (74/100)", "top_sentiments": sentiments}
 
+def get_market_data_exchange(state):
+    broker = str(state.get("active_broker", "coindcx") or "coindcx").lower()
+    if broker == "paper":
+        return str(state.get("market_data_exchange", "coindcx") or "coindcx").lower()
+    return broker
+
+
 def fetch_active_exchange_markets(state):
-    broker = state.get("active_broker", "coindcx").lower()
+    """Return ONLY markets from the exchange selected for this user/session.
+    There is deliberately no Binance fallback: cross-exchange leakage would make
+    the scanner, price, P&L and execution inconsistent with the selected broker.
+    """
+    broker = get_market_data_exchange(state)
     quote = state.get("quote_currency", "INR").upper()
     market_list = []
-    usd_to_inr = 89.5
 
     try:
         if broker == "coindcx":
-            res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=4)
+            res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=5)
+            res.raise_for_status()
             data = res.json()
             for item in data:
-                m = item.get("market", "")
-                price = float(item.get("last_price", 0.0))
-                vol = float(item.get("volume", 0.0))
-                change = float(item.get("change_24_hour", 0.0))
-                if price <= 0: continue
-                clean_coin = m.replace("B-", "").replace("I-", "").replace("_", "").replace("INR", "").replace("USDT", "").upper()
-                
-                ws_key = clean_coin + "USDT"
-                if ws_key in live_price_cache:
-                    p_live = live_price_cache[ws_key]
-                    price = p_live * usd_to_inr if quote == "INR" else p_live
-
-                if quote == "INR" and (m.endswith("_INR") or m.endswith("INR")) and not ("USDT" in m):
-                    market_list.append({"symbol": clean_coin + "INR", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
-                elif quote == "USDT" and (m.endswith("_USDT") or m.endswith("USDT")) and not ("INR" in m):
-                    market_list.append({"symbol": clean_coin + "USDT", "base_coin": clean_coin, "raw_symbol": m, "price": price, "volume": vol, "change": change})
+                m = str(item.get("market", "") or "")
+                price = float(item.get("last_price", 0.0) or 0.0)
+                vol = float(item.get("volume", 0.0) or 0.0)
+                change = float(item.get("change_24_hour", 0.0) or 0.0)
+                if price <= 0:
+                    continue
+                is_inr = m.endswith("_INR") or m.endswith("INR")
+                is_usdt = m.endswith("_USDT") or m.endswith("USDT")
+                if quote == "INR" and not is_inr:
+                    continue
+                if quote == "USDT" and not is_usdt:
+                    continue
+                clean_coin = (m.replace("B-", "").replace("I-", "")
+                               .replace("_", "").replace("INR", "")
+                               .replace("USDT", "").upper())
+                market_list.append({
+                    "symbol": clean_coin + quote,
+                    "base_coin": clean_coin,
+                    "raw_symbol": m,
+                    "price": price,
+                    "volume": vol,
+                    "change": change,
+                    "exchange": "coindcx"
+                })
         elif hasattr(ccxt, broker):
             exchange_class = getattr(ccxt, broker)
-            inst = exchange_class({'enableRateLimit': True, 'timeout': 4000})
+            inst = exchange_class({'enableRateLimit': True, 'timeout': 5000})
             tickers = inst.fetch_tickers()
             target_suffix = f"/{quote}"
             for sym, t in tickers.items():
-                if sym.endswith(target_suffix):
-                    c_base = sym.split("/")[0]
-                    market_list.append({
-                        "symbol": sym.replace("/", ""),
-                        "base_coin": c_base,
-                        "raw_symbol": sym,
-                        "price": float(t.get("last", 0.0) or 0.0),
-                        "volume": float(t.get("quoteVolume", 0.0) or 0.0),
-                        "change": float(t.get("percentage", 0.0) or 0.0)
-                    })
-    except Exception:
-        pass
+                if not sym.endswith(target_suffix):
+                    continue
+                c_base = sym.split("/")[0]
+                price = float(t.get("last", 0.0) or 0.0)
+                if price <= 0:
+                    continue
+                market_list.append({
+                    "symbol": sym.replace("/", ""),
+                    "base_coin": c_base,
+                    "raw_symbol": sym,
+                    "price": price,
+                    "volume": float(t.get("quoteVolume", 0.0) or 0.0),
+                    "change": float(t.get("percentage", 0.0) or 0.0),
+                    "exchange": broker
+                })
+        else:
+            add_log(state, f"⚠️ EXCHANGE UNSUPPORTED: {broker.upper()} has no market-data adapter installed.")
+            return []
+    except Exception as exc:
+        add_log(state, f"⚠️ {broker.upper()} MARKET DATA ERROR: {exc}")
+        return []
 
-    if not market_list:
-        try:
-            res = requests.get("https://data-api.binance.vision/api/v3/ticker/24hr", timeout=4)
-            data = res.json()
-            for c in data:
-                if c["symbol"].endswith("USDT") and not any(x in c["symbol"] for x in ["CREAM", "UP", "DOWN"]):
-                    p = live_price_cache.get(c["symbol"], float(c["lastPrice"]))
-                    clean_sym = c["symbol"].replace("USDT", "")
-                    final_p = p * usd_to_inr if quote == "INR" else p
-                    market_list.append({
-                        "symbol": clean_sym + quote, "base_coin": clean_sym, "raw_symbol": c["symbol"],
-                        "price": final_p, "volume": float(c["quoteVolume"]), "change": float(c["priceChangePercent"])
-                    })
-        except:
-            pass
-
-    if market_list:
-        market_list.sort(key=lambda x: x.get("volume", 0.0), reverse=True)
-        return market_list[:100]
-    return []
+    market_list.sort(key=lambda x: float(x.get("volume", 0.0) or 0.0), reverse=True)
+    return market_list[:100]
 
 def get_coin_precision(clean_coin, current_price):
     if "BTC" in clean_coin:
@@ -1035,12 +1011,8 @@ def _resolve_trade_live_price(state, trade, live_prices=None, live_by_base=None)
     if current <= 0 and live_by_base is not None:
         current = float(live_by_base.get(clean, 0.0) or 0.0)
 
-    if current <= 0:
-        ws_key = clean + "USDT"
-        if ws_key in live_price_cache:
-            raw = float(live_price_cache[ws_key] or 0.0)
-            current = raw * 89.5 if state.get("quote_currency") == "INR" else raw
-
+    # Never fall back to Binance here. The active trade must be marked to market
+    # using the same exchange that supplied its entry price.
     return current
 
 def _refresh_active_trade_pnl(state):
@@ -1307,6 +1279,7 @@ async def execute_order(request: Request):
                 "id": int(time.time() * 1000),
                 "symbol": symbol,
                 "currency": currency,
+                "exchange": state.get("market_data_exchange", "coindcx"),
                 "type": trade_type,
                 "entry_price": sim_price,
                 "quantity": calc_qty,
@@ -1333,11 +1306,7 @@ async def execute_order(request: Request):
             elif hasattr(ccxt, exchange):
                 success, price, qty, res = execute_ccxt_order(state, symbol, side=side, target_amount=amount)
             else:
-                markets = fetch_active_exchange_markets(state)
-                clean_coin = symbol.replace("INR", "").replace("USDT", "")
-                match = next((m for m in markets if clean_coin in m["symbol"]), None)
-                price = match["price"] if match else (8500000.0 if "BTC" in symbol else 150.0)
-                qty = round(amount / price, 4) if price > 0 else 1.0
+                return {"status": "error", "message": f"Exchange '{exchange.upper()}' has no execution adapter. No simulated order was created."}
 
             if success:
                 trade_type = "LONG" if side == "buy" else "SHORT"
@@ -1399,9 +1368,11 @@ async def set_broker_mode(request: Request):
     state = get_user_session(device_id)
     mode = data.get("mode", "real").lower()
     if mode == "paper":
+        if state.get("active_broker") != "paper":
+            state["market_data_exchange"] = state.get("active_broker", "coindcx")
         state["active_broker"] = "paper"
-    elif mode == "real" and state.get("active_broker") == "paper":
-        state["active_broker"] = "coindcx"
+    elif mode == "real":
+        state["active_broker"] = state.get("market_data_exchange", "coindcx")
     save_state_to_db(device_id, state)
     add_log(state, f"⚡ Broker Mode: {mode.upper()} | Exchange: {state['active_broker'].upper()}")
     return {"status": "success", "active_broker": state["active_broker"]}
@@ -1435,6 +1406,8 @@ async def connect_exchange(request: Request):
     api_key = data.get("api_key", "").strip()
     secret_key = data.get("secret_key", "").strip()
 
+    if exchange_id != "paper":
+        state["market_data_exchange"] = exchange_id
     state["active_broker"] = exchange_id
     state["api_key"] = api_key
     state["secret_key"] = secret_key
@@ -1481,18 +1454,10 @@ async def connect_exchange(request: Request):
             return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
         
         else:
-            return {
-                "status": "success", 
-                "message": f"Successfully connected to {exchange_id.upper()} via Universal Secure Gateway!",
-                "balances": {state["quote_currency"]: 0.0}
-            }
+            return {"status": "error", "message": f"Exchange '{exchange_id.upper()}' is not supported by the current adapter. No fake connection is allowed."}
             
     except Exception as e:
-        return {
-            "status": "success",
-            "message": f"{exchange_id.upper()} Connected Successfully via Safe-Session.",
-            "balances": {state["quote_currency"]: 0.0}
-        }
+        return {"status": "error", "message": f"{exchange_id.upper()} connection failed: {e}"}
 
 @app.post("/api/bot-control")
 async def bot_control(request: Request):
@@ -1515,8 +1480,14 @@ async def bot_control(request: Request):
             state["quote_currency"] = data["currency"].upper()
         if "amount" in data:
             state["trade_amount"] = float(data["amount"])
-        if "exchange" in data:
-            state["active_broker"] = data["exchange"].lower()
+        requested_exchange = str(data.get("exchange", state.get("market_data_exchange", "coindcx"))).lower()
+        broker_mode = str(data.get("broker_mode", "real")).lower()
+        if requested_exchange != "paper":
+            state["market_data_exchange"] = requested_exchange
+        if broker_mode == "paper":
+            state["active_broker"] = "paper"
+        else:
+            state["active_broker"] = requested_exchange
         if "deal_condition" in data:
             state["deal_condition"] = str(data["deal_condition"])
         if "target_coin" in data:
@@ -1539,7 +1510,7 @@ async def bot_control(request: Request):
         add_log(
             state,
             f"🚀 BOT STARTED | Target: {target_info} | Slots: {state['max_trades']} | "
-            f"Broker: {state['active_broker'].upper()} | Lot: {curr_sym}{state['trade_amount']} | "
+            f"Broker: {state['active_broker'].upper()} | Data: {get_market_data_exchange(state).upper()} | Lot: {curr_sym}{state['trade_amount']} | "
             f"Target: +{state['target_percent']}% | SL: -{state['sl_percent']}%"
         )
         return {
@@ -1558,6 +1529,28 @@ async def bot_control(request: Request):
         return {"status": "success", "message": "Bot Stopped!", "is_running": False}
 
     return {"status": "error", "message": "Unknown bot action."}
+
+@app.get("/api/chart-data")
+def get_chart_data(device_id: str = "DEFAULT_DEVICE", symbol: str = "BTC", timeframe: str = "15m"):
+    state = get_user_session(device_id)
+    clean = str(symbol or "BTC").upper().replace("INR", "").replace("USDT", "").replace("/", "")
+    if not clean:
+        clean = "BTC"
+    markets = fetch_active_exchange_markets(state)
+    coin = next((m for m in markets if str(m.get("base_coin", "")).upper() == clean), None)
+    if coin is None:
+        return {"status": "error", "message": f"{clean} is not available on {get_market_data_exchange(state).upper()} in {state.get('quote_currency','INR')}.", "exchange": get_market_data_exchange(state)}
+    candles = _fetch_analysis_ohlcv(clean, state, coin.get("raw_symbol"), timeframe, 300)
+    if not candles:
+        return {"status": "error", "message": f"No candle data from {get_market_data_exchange(state).upper()} for {clean}.", "exchange": get_market_data_exchange(state)}
+    return {
+        "status": "success",
+        "exchange": get_market_data_exchange(state),
+        "symbol": f"{clean}/{state.get('quote_currency','INR').upper()}",
+        "timeframe": timeframe,
+        "candles": candles,
+    }
+
 
 @app.get("/api/bot-status")
 def get_bot_status(device_id: str = "DEFAULT_DEVICE"):
@@ -1673,7 +1666,8 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "selected_coin": state.get("selected_coin", "AUTO"),
         "target_percent": state.get("target_percent", 2.5),
         "sl_percent": state.get("sl_percent", 1.5),
-        "active_broker": state.get("active_broker", "coindcx")
+        "active_broker": state.get("active_broker", "coindcx"),
+        "market_data_exchange": get_market_data_exchange(state)
     }
 
 def _get_ai_sentiment_scores():
@@ -1814,49 +1808,85 @@ def _supertrend_signal(highs, lows, closes, period=10, multiplier=3.0):
     return trend
 
 
-def _fetch_analysis_ohlcv(base_coin, timeframe="15m", limit=220):
+def _exchange_public_client(state):
+    broker = get_market_data_exchange(state)
+    if broker == "coindcx":
+        return None, broker
+    if hasattr(ccxt, broker):
+        exchange_class = getattr(ccxt, broker)
+        return exchange_class({'enableRateLimit': True, 'timeout': 6000}), broker
+    return None, broker
+
+
+def _fetch_analysis_ohlcv(base_coin, state, raw_symbol=None, timeframe="15m", limit=220):
     coin = str(base_coin or "").upper().strip()
+    broker = get_market_data_exchange(state)
+    quote = state.get("quote_currency", "INR").upper()
     if not coin:
         return []
-    # Public Binance candles are used only as a market-analysis feed. Orders
-    # still go through the configured broker below.
-    symbol = coin + "USDT"
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": symbol, "interval": timeframe, "limit": min(int(limit), 500)},
-            timeout=5,
-        )
-        if r.status_code != 200:
+
+    if broker == "coindcx":
+        pair = raw_symbol or f"B-{coin}_{quote}"
+        if not str(pair).startswith(("B-", "I-")):
+            pair = f"B-{coin}_{quote}"
+        try:
             r = requests.get(
-                "https://data-api.binance.vision/api/v3/klines",
-                params={"symbol": symbol, "interval": timeframe, "limit": min(int(limit), 500)},
-                timeout=5,
+                "https://api.coindcx.com/market_data/candles",
+                params={"pair": pair, "interval": timeframe, "limit": min(int(limit), 500)},
+                timeout=6,
             )
-        data = r.json() if r.ok else []
-        out = []
-        for x in data:
-            out.append({
-                "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
-                "close": float(x[4]), "volume": float(x[5])
-            })
-        return out
+            r.raise_for_status()
+            data = r.json()
+            out = []
+            for x in data:
+                out.append({"time": int(float(x.get("time", 0) or 0)), "open": float(x["open"]), "high": float(x["high"]),
+                            "low": float(x["low"]), "close": float(x["close"]),
+                            "volume": float(x.get("volume", 0) or 0)})
+            return list(reversed(out))
+        except Exception:
+            return []
+
+    inst, broker = _exchange_public_client(state)
+    if inst is None:
+        return []
+    symbol_pair = raw_symbol if raw_symbol and "/" in str(raw_symbol) else f"{coin}/{quote}"
+    try:
+        rows = inst.fetch_ohlcv(symbol_pair, timeframe=timeframe, limit=min(int(limit), 500))
+        return [{"time": int(x[0]), "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+                 "close": float(x[4]), "volume": float(x[5] or 0)} for x in rows]
     except Exception:
         return []
 
 
-def _fetch_orderbook_imbalance(base_coin):
+def _fetch_orderbook_imbalance(base_coin, state, raw_symbol=None):
     coin = str(base_coin or "").upper().strip()
+    broker = get_market_data_exchange(state)
+    quote = state.get("quote_currency", "INR").upper()
     if not coin:
         return 0.0
-    try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/depth",
-            params={"symbol": coin + "USDT", "limit": 20}, timeout=4
-        )
-        if not r.ok:
+
+    if broker == "coindcx":
+        pair = raw_symbol or f"B-{coin}_{quote}"
+        if not str(pair).startswith(("B-", "I-")):
+            pair = f"B-{coin}_{quote}"
+        try:
+            r = requests.get("https://api.coindcx.com/market_data/orderbook",
+                             params={"pair": pair, "depth": 20}, timeout=5)
+            r.raise_for_status()
+            d = r.json()
+            bids = sum(float(v) for v in d.get("bids", {}).values())
+            asks = sum(float(v) for v in d.get("asks", {}).values())
+            total = bids + asks
+            return ((bids - asks) / total) if total else 0.0
+        except Exception:
             return 0.0
-        d = r.json()
+
+    inst, _ = _exchange_public_client(state)
+    if inst is None:
+        return 0.0
+    symbol_pair = raw_symbol if raw_symbol and "/" in str(raw_symbol) else f"{coin}/{quote}"
+    try:
+        d = inst.fetch_order_book(symbol_pair, limit=20)
         bids = sum(float(x[1]) for x in d.get("bids", []))
         asks = sum(float(x[1]) for x in d.get("asks", []))
         total = bids + asks
@@ -1864,16 +1894,18 @@ def _fetch_orderbook_imbalance(base_coin):
     except Exception:
         return 0.0
 
-
-def _analyze_coin(coin):
+def _analyze_coin(coin, state):
     """Return a strict, explainable technical-analysis signal for one coin."""
     base = str(coin.get("base_coin", "")).upper()
-    cache_key = base
+    broker = get_market_data_exchange(state)
+    quote = state.get("quote_currency", "INR").upper()
+    raw_symbol = coin.get("raw_symbol")
+    cache_key = f"{broker}|{quote}|{base}|{raw_symbol}"
     cached = _analysis_cache.get(cache_key)
     if cached and (time.time() - cached.get("ts", 0)) < 45:
         return cached.get("analysis")
-    c15 = _fetch_analysis_ohlcv(base, "15m", 220)
-    c1h = _fetch_analysis_ohlcv(base, "1h", 220)
+    c15 = _fetch_analysis_ohlcv(base, state, raw_symbol, "15m", 220)
+    c1h = _fetch_analysis_ohlcv(base, state, raw_symbol, "1h", 220)
     if len(c15) < 80 or len(c1h) < 80:
         return None
 
@@ -1901,7 +1933,7 @@ def _analyze_coin(coin):
     squeeze_threshold = sorted(bb_widths)[max(0, int(len(bb_widths) * 0.20) - 1)] if bb_widths else 0.0
     stoch_k, stoch_d = _stochastic(highs, lows, closes, 14, 3)
     supertrend = _supertrend_signal(highs, lows, closes, 10, 3.0)
-    orderbook = _fetch_orderbook_imbalance(base)
+    orderbook = _fetch_orderbook_imbalance(base, state, raw_symbol)
 
     avg_vol = sum(vols[-21:-1]) / max(1, len(vols[-21:-1]))
     volume_ratio = vols[-1] / avg_vol if avg_vol else 0.0
@@ -2028,7 +2060,7 @@ def _signal_passes(analysis, condition, market_mode):
     return direction == "LONG" if market_mode == "spot" else direction in ("LONG", "SHORT")
 
 
-def _select_analyzed_candidate(valid, condition, market_mode, selected_coin=None):
+def _select_analyzed_candidate(valid, state, condition, market_mode, selected_coin=None):
     pool = valid
     if selected_coin and selected_coin != "AUTO":
         clean = str(selected_coin).upper().replace("INR", "").replace("USDT", "").replace("/", "")
@@ -2040,7 +2072,7 @@ def _select_analyzed_candidate(valid, condition, market_mode, selected_coin=None
     best = None
     best_score = -1
     for coin in pool:
-        a = _analyze_coin(coin)
+        a = _analyze_coin(coin, state)
         if not _signal_passes(a, condition, market_mode):
             continue
         if a["score"] > best_score:
@@ -2186,7 +2218,7 @@ async def market_scanner_loop():
                     best_scan = None
                     for scan_idx, scan_coin in enumerate(scan_pool, 1):
                         try:
-                            scan_analysis = _analyze_coin(scan_coin)
+                            scan_analysis = _analyze_coin(scan_coin, state)
                             scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
                             scan_status = "PASS" if scan_pass else "NO TRADE"
                             rsi_text = f"{scan_analysis['rsi']:.1f}" if scan_analysis.get("rsi") is not None else "N/A"
