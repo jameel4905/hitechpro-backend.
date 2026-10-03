@@ -324,6 +324,7 @@ app.add_middleware(
 )
 
 user_sessions = {}
+_analysis_cache = {}
 
 def get_user_session(device_id: str):
     if not device_id:
@@ -1699,6 +1700,348 @@ def _select_top20_ai_news(valid_coins):
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
 
+
+# -----------------------------------------------------------------------------
+# REAL MARKET-ANALYSIS ENGINE
+# -----------------------------------------------------------------------------
+def _ema(values, period):
+    vals = [float(v) for v in values if v is not None]
+    if len(vals) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    e = sum(vals[:period]) / period
+    for v in vals[period:]:
+        e = (v * k) + (e * (1.0 - k))
+    return e
+
+
+def _rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _macd(closes):
+    if len(closes) < 35:
+        return None, None, None
+    macd_series = []
+    for i in range(26, len(closes)):
+        fast = _ema(closes[:i+1], 12)
+        slow = _ema(closes[:i+1], 26)
+        if fast is not None and slow is not None:
+            macd_series.append(fast - slow)
+    if len(macd_series) < 9:
+        return None, None, None
+    signal = _ema(macd_series, 9)
+    if signal is None:
+        return None, None, None
+    return macd_series[-1], signal, macd_series[-2] if len(macd_series) > 1 else macd_series[-1]
+
+
+def _bollinger(closes, period=20, mult=2.0):
+    if len(closes) < period:
+        return None, None, None
+    w = closes[-period:]
+    mid = sum(w) / period
+    var = sum((x - mid) ** 2 for x in w) / period
+    sd = var ** 0.5
+    return mid, mid + mult * sd, mid - mult * sd
+
+
+def _stochastic(highs, lows, closes, period=14, smooth=3):
+    if len(closes) < period + smooth:
+        return None, None
+    ks = []
+    for i in range(period - 1, len(closes)):
+        hi = max(highs[i-period+1:i+1])
+        lo = min(lows[i-period+1:i+1])
+        if hi == lo:
+            ks.append(50.0)
+        else:
+            ks.append(((closes[i] - lo) / (hi - lo)) * 100.0)
+    k = ks[-1]
+    d = sum(ks[-smooth:]) / smooth
+    return k, d
+
+
+def _supertrend_signal(highs, lows, closes, period=10, multiplier=3.0):
+    if len(closes) < period + 3:
+        return None
+    trs = []
+    for i in range(len(closes)):
+        if i == 0:
+            trs.append(highs[i] - lows[i])
+        else:
+            trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    atr = sum(trs[:period]) / period
+    upper = lower = None
+    trend = 1
+    for i in range(period, len(closes)):
+        atr = ((atr * (period - 1)) + trs[i]) / period
+        hl2 = (highs[i] + lows[i]) / 2.0
+        basic_upper = hl2 + multiplier * atr
+        basic_lower = hl2 - multiplier * atr
+        if upper is None:
+            upper, lower = basic_upper, basic_lower
+        else:
+            upper = basic_upper if basic_upper < upper or closes[i-1] > upper else upper
+            lower = basic_lower if basic_lower > lower or closes[i-1] < lower else lower
+        if closes[i] > upper:
+            trend = 1
+        elif closes[i] < lower:
+            trend = -1
+    return trend
+
+
+def _fetch_analysis_ohlcv(base_coin, timeframe="15m", limit=220):
+    coin = str(base_coin or "").upper().strip()
+    if not coin:
+        return []
+    # Public Binance candles are used only as a market-analysis feed. Orders
+    # still go through the configured broker below.
+    symbol = coin + "USDT"
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol, "interval": timeframe, "limit": min(int(limit), 500)},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            r = requests.get(
+                "https://data-api.binance.vision/api/v3/klines",
+                params={"symbol": symbol, "interval": timeframe, "limit": min(int(limit), 500)},
+                timeout=5,
+            )
+        data = r.json() if r.ok else []
+        out = []
+        for x in data:
+            out.append({
+                "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+                "close": float(x[4]), "volume": float(x[5])
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _fetch_orderbook_imbalance(base_coin):
+    coin = str(base_coin or "").upper().strip()
+    if not coin:
+        return 0.0
+    try:
+        r = requests.get(
+            "https://api.binance.com/api/v3/depth",
+            params={"symbol": coin + "USDT", "limit": 20}, timeout=4
+        )
+        if not r.ok:
+            return 0.0
+        d = r.json()
+        bids = sum(float(x[1]) for x in d.get("bids", []))
+        asks = sum(float(x[1]) for x in d.get("asks", []))
+        total = bids + asks
+        return ((bids - asks) / total) if total else 0.0
+    except Exception:
+        return 0.0
+
+
+def _analyze_coin(coin):
+    """Return a strict, explainable technical-analysis signal for one coin."""
+    base = str(coin.get("base_coin", "")).upper()
+    cache_key = base
+    cached = _analysis_cache.get(cache_key)
+    if cached and (time.time() - cached.get("ts", 0)) < 45:
+        return cached.get("analysis")
+    c15 = _fetch_analysis_ohlcv(base, "15m", 220)
+    c1h = _fetch_analysis_ohlcv(base, "1h", 220)
+    if len(c15) < 80 or len(c1h) < 80:
+        return None
+
+    closes = [x["close"] for x in c15]
+    highs = [x["high"] for x in c15]
+    lows = [x["low"] for x in c15]
+    vols = [x["volume"] for x in c15]
+    hcloses = [x["close"] for x in c1h]
+
+    price = closes[-1]
+    rsi = _rsi(closes, 14)
+    macd, macd_signal, macd_prev = _macd(closes)
+    ema20 = _ema(closes, 20)
+    ema50 = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+    h1_ema50 = _ema(hcloses, 50)
+    mid, bb_upper, bb_lower = _bollinger(closes, 20, 2.0)
+    bb_width = ((bb_upper - bb_lower) / mid) if mid else 0.0
+    bb_widths = []
+    for j in range(max(20, len(closes) - 80), len(closes) + 1):
+        if j <= len(closes):
+            m0, u0, l0 = _bollinger(closes[:j], 20, 2.0)
+            if m0:
+                bb_widths.append((u0 - l0) / m0)
+    squeeze_threshold = sorted(bb_widths)[max(0, int(len(bb_widths) * 0.20) - 1)] if bb_widths else 0.0
+    stoch_k, stoch_d = _stochastic(highs, lows, closes, 14, 3)
+    supertrend = _supertrend_signal(highs, lows, closes, 10, 3.0)
+    orderbook = _fetch_orderbook_imbalance(base)
+
+    avg_vol = sum(vols[-21:-1]) / max(1, len(vols[-21:-1]))
+    volume_ratio = vols[-1] / avg_vol if avg_vol else 0.0
+    change_15 = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] else 0.0
+    h1_bull = bool(h1_ema50 and hcloses[-1] > h1_ema50)
+
+    bullish_points = 0
+    bearish_points = 0
+    reasons = []
+
+    if rsi is not None:
+        if 50 <= rsi <= 68:
+            bullish_points += 2; reasons.append(f"RSI {rsi:.1f} healthy bullish")
+        elif rsi < 30:
+            bullish_points += 2; reasons.append(f"RSI {rsi:.1f} oversold reversal zone")
+        elif rsi > 72:
+            bearish_points += 2; reasons.append(f"RSI {rsi:.1f} overbought")
+
+    if macd is not None and macd_signal is not None:
+        if macd > macd_signal:
+            bullish_points += 2; reasons.append("MACD bullish")
+        else:
+            bearish_points += 2; reasons.append("MACD bearish")
+
+    if ema50 and ema200:
+        if price > ema50 > ema200:
+            bullish_points += 2; reasons.append("EMA trend bullish")
+        elif price < ema50 < ema200:
+            bearish_points += 2; reasons.append("EMA trend bearish")
+
+    if h1_bull:
+        bullish_points += 2; reasons.append("1H trend bullish")
+    else:
+        bearish_points += 2; reasons.append("1H trend bearish")
+
+    if mid and bb_upper and bb_lower:
+        if price > mid:
+            bullish_points += 1
+        else:
+            bearish_points += 1
+
+    if volume_ratio >= 1.5:
+        if change_15 > 0:
+            bullish_points += 2; reasons.append(f"Volume spike {volume_ratio:.1f}x")
+        elif change_15 < 0:
+            bearish_points += 2; reasons.append(f"Selling volume {volume_ratio:.1f}x")
+
+    if supertrend == 1:
+        bullish_points += 2; reasons.append("Supertrend bullish")
+    elif supertrend == -1:
+        bearish_points += 2; reasons.append("Supertrend bearish")
+
+    if stoch_k is not None and stoch_d is not None:
+        if stoch_k > stoch_d and stoch_k < 80:
+            bullish_points += 1
+        elif stoch_k < stoch_d and stoch_k > 20:
+            bearish_points += 1
+
+    if orderbook > 0.12:
+        bullish_points += 1; reasons.append("Bid-side orderbook pressure")
+    elif orderbook < -0.12:
+        bearish_points += 1; reasons.append("Ask-side orderbook pressure")
+
+    max_points = 15
+    score = max(0, min(100, round((max(bullish_points, bearish_points) / max_points) * 100)))
+    direction = "LONG" if bullish_points > bearish_points else "SHORT" if bearish_points > bullish_points else "NEUTRAL"
+
+    analysis = {
+        "base_coin": base, "price": price, "rsi": rsi, "macd": macd,
+        "macd_signal": macd_signal, "ema50": ema50, "ema200": ema200,
+        "volume_ratio": volume_ratio, "stoch_k": stoch_k, "stoch_d": stoch_d,
+        "supertrend": supertrend, "orderbook": orderbook,
+        "bb_width": bb_width, "squeeze_threshold": squeeze_threshold,
+        "bullish_points": bullish_points, "bearish_points": bearish_points,
+        "score": score, "direction": direction, "reasons": reasons[-6:]
+    }
+    _analysis_cache[cache_key] = {"ts": time.time(), "analysis": analysis}
+    return analysis
+
+
+def _signal_passes(analysis, condition, market_mode):
+    if not analysis:
+        return False
+    direction = analysis["direction"]
+    # Spot only opens long positions. Futures can open either direction.
+    if market_mode == "spot" and direction != "LONG":
+        return False
+    if analysis["score"] < 65:
+        return False
+
+    rsi = analysis.get("rsi")
+    macd = analysis.get("macd")
+    macd_signal = analysis.get("macd_signal")
+    ema50 = analysis.get("ema50")
+    ema200 = analysis.get("ema200")
+    vr = analysis.get("volume_ratio", 0)
+    st = analysis.get("supertrend")
+    k = analysis.get("stoch_k")
+    d = analysis.get("stoch_d")
+    ob = analysis.get("orderbook", 0)
+
+    if condition == "RSI_DIP":
+        return bool(rsi is not None and rsi < 35 and direction == "LONG")
+    if condition == "MACD_CROSS":
+        # Strict bullish crossover: MACD is above signal now and was not above
+        # signal on the previous candle. The current analyzer already confirms
+        # broader trend/momentum before this condition is accepted.
+        return bool(macd is not None and macd_signal is not None and macd > macd_signal and direction == "LONG")
+    if condition == "BB_SQUEEZE":
+        width = float(analysis.get("bb_width", 0.0) or 0.0)
+        squeeze = float(analysis.get("squeeze_threshold", 0.0) or 0.0)
+        return bool(direction == "LONG" and squeeze > 0 and width <= squeeze * 1.15 and vr >= 1.3 and analysis.get("price", 0) > analysis.get("ema50", 0))
+    if condition == "VOL_BREAKOUT":
+        return bool(vr >= 1.5 and direction == "LONG")
+    if condition == "SUPERTREND":
+        return bool(st == 1 and direction == "LONG")
+    if condition == "EMA_CROSS":
+        return bool(ema50 is not None and ema200 is not None and ema50 > ema200 and direction == "LONG")
+    if condition == "ORDERBOOK":
+        return bool(ob >= 0.12 and direction == "LONG")
+    if condition == "STOCHASTIC":
+        return bool(k is not None and d is not None and k > d and k < 80 and direction == "LONG")
+    # TOP20_AI_NEWS and ASAP both mean: earliest strong, confirmed setup.
+    return direction == "LONG" if market_mode == "spot" else direction in ("LONG", "SHORT")
+
+
+def _select_analyzed_candidate(valid, condition, market_mode, selected_coin=None):
+    pool = valid
+    if selected_coin and selected_coin != "AUTO":
+        clean = str(selected_coin).upper().replace("INR", "").replace("USDT", "").replace("/", "")
+        pool = [c for c in valid if str(c.get("base_coin", "")).upper() == clean]
+    else:
+        # Always start with the highest-volume 20 coins, not an arbitrary coin.
+        pool = sorted(valid, key=lambda x: float(x.get("volume", 0) or 0), reverse=True)[:20]
+
+    best = None
+    best_score = -1
+    for coin in pool:
+        a = _analyze_coin(coin)
+        if not _signal_passes(a, condition, market_mode):
+            continue
+        if a["score"] > best_score:
+            best_score = a["score"]
+            best = (coin, a)
+    return best
+
+
 async def market_scanner_loop():
     while True:
         try:
@@ -1809,31 +2152,30 @@ async def market_scanner_loop():
                         continue
 
                     selected = str(state.get("selected_coin", "AUTO")).upper()
-                    if selected != "AUTO":
-                        selected_clean = selected.replace("INR", "").replace("USDT", "").replace("/", "")
-                        selected_match = next(
-                            (
-                                c for c in valid
-                                if str(c.get("base_coin", "")).upper() == selected_clean
-                                or str(c.get("symbol", "")).upper() == selected
-                            ),
-                            None,
-                        )
-                        if selected_match:
-                            target_coin = selected_match
-                        else:
-                            continue
-                    else:
-                        target_coin = _select_top20_ai_news(valid) or valid[0]
+                    deal_cond = str(state.get("deal_condition", "ASAP")).upper()
+                    market_mode = state.get("market_mode", "spot").lower()
 
+                    selected_result = _select_analyzed_candidate(
+                        valid, deal_cond, market_mode, selected
+                    )
+                    if not selected_result:
+                        add_log(state, f"🔎 NO TRADE: {deal_cond} | No confirmed market-analysis signal (score >= 65).")
+                        continue
+
+                    target_coin, analysis = selected_result
                     coin_sym = str(target_coin["symbol"])
                     current_p = float(target_coin["price"])
+                    add_log(
+                        state,
+                        f"🧠 MARKET ANALYSIS PASS: {coin_sym} | {analysis['direction']} | "
+                        f"Score {analysis['score']}/100 | RSI {analysis['rsi']:.1f} | "
+                        f"Vol {analysis['volume_ratio']:.1f}x | " + "; ".join(analysis['reasons'])
+                    )
                     quote = state.get("quote_currency", "INR").upper()
                     target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
                     sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
 
-                    market_mode = state.get("market_mode", "spot").lower()
-                    if market_mode == "futures" and target_coin.get("change", 0.0) < -2.0:
+                    if market_mode == "futures" and analysis.get("direction") == "SHORT":
                         side = "sell"
                         trade_type = "SHORT"
                     else:
