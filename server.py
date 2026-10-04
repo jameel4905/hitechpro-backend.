@@ -1644,6 +1644,8 @@ def get_chart_data(device_id: str = "DEFAULT_DEVICE", symbol: str = "BTC", timef
         "status": "success",
         "exchange": get_market_data_exchange(state),
         "symbol": f"{clean}/{state.get('quote_currency','INR').upper()}",
+        "market_symbol": coin.get("raw_symbol"),
+        "live_price": float(coin.get("price", 0) or 0),
         "timeframe": timeframe,
         "candles": candles,
     }
@@ -2037,6 +2039,7 @@ def _analyze_coin(coin, state):
     volume_ratio = vols[-1] / avg_vol if avg_vol else 0.0
     change_15 = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] else 0.0
     h1_bull = bool(h1_ema50 and hcloses[-1] > h1_ema50)
+    change_15 = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if len(closes) >= 5 and closes[-5] else 0.0
 
     bullish_points = 0
     bearish_points = 0
@@ -2102,7 +2105,7 @@ def _analyze_coin(coin, state):
     analysis = {
         "base_coin": base, "price": price, "rsi": rsi, "macd": macd,
         "macd_signal": macd_signal, "macd_prev": macd_prev, "ema50": ema50, "ema200": ema200,
-        "volume_ratio": volume_ratio, "stoch_k": stoch_k, "stoch_d": stoch_d,
+        "volume_ratio": volume_ratio, "change_15": change_15, "ema20": ema20, "h1_ema50": h1_ema50, "stoch_k": stoch_k, "stoch_d": stoch_d,
         "supertrend": supertrend, "orderbook": orderbook,
         "bb_width": bb_width, "squeeze_threshold": squeeze_threshold,
         "bullish_points": bullish_points, "bearish_points": bearish_points,
@@ -2112,14 +2115,63 @@ def _analyze_coin(coin, state):
     return analysis
 
 
+def _long_entry_confirmed(analysis):
+    """Require trend + momentum confirmation before a spot LONG entry.
+
+    Oversold RSI alone is never enough: a falling coin must show evidence of
+    reversal before the bot is allowed to buy it.
+    """
+    if not analysis:
+        return False
+    price = float(analysis.get("price", 0) or 0)
+    ema20 = analysis.get("ema20")
+    ema50 = analysis.get("ema50")
+    ema200 = analysis.get("ema200")
+    h1_ema50 = analysis.get("h1_ema50")
+    h1_bull = bool(h1_ema50 and price > float(h1_ema50))
+    macd = analysis.get("macd")
+    signal = analysis.get("macd_signal")
+    supertrend = analysis.get("supertrend")
+    rsi = analysis.get("rsi")
+    k = analysis.get("stoch_k")
+    d = analysis.get("stoch_d")
+    change_15 = float(analysis.get("change_15", 0) or 0)
+
+    # Normal trend entry: price must be above EMA20/EMA50, 1H trend bullish,
+    # MACD bullish and Supertrend bullish.
+    normal = bool(
+        price > float(ema20 or 0) > 0
+        and price > float(ema50 or 0) > 0
+        and (not ema200 or price > float(ema200))
+        and h1_bull
+        and macd is not None and signal is not None and macd > signal
+        and supertrend == 1
+    )
+
+    # RSI-dip reversal entry: allow an oversold bounce only when momentum has
+    # actually turned, rather than buying while price is still falling.
+    reversal = bool(
+        rsi is not None and 25 <= rsi < 38
+        and macd is not None and signal is not None and macd > signal
+        and supertrend == 1
+        and ema20 and price > float(ema20)
+        and k is not None and d is not None and k > d
+        and change_15 > -0.25
+    )
+    return normal or reversal
+
+
 def _signal_passes(analysis, condition, market_mode):
     if not analysis:
         return False
     direction = analysis["direction"]
-    # Spot only opens long positions. Futures can open either direction.
     if market_mode == "spot" and direction != "LONG":
         return False
-    if analysis["score"] < 65:
+    if analysis.get("score", 0) < 70:
+        return False
+
+    # Spot LONG entries must pass the anti-falling-knife confirmation.
+    if market_mode == "spot" and not _long_entry_confirmed(analysis):
         return False
 
     rsi = analysis.get("rsi")
@@ -2135,29 +2187,26 @@ def _signal_passes(analysis, condition, market_mode):
     ob = analysis.get("orderbook", 0)
 
     if condition == "RSI_DIP":
-        return bool(rsi is not None and rsi < 35 and direction == "LONG")
+        return bool(_long_entry_confirmed(analysis) and rsi is not None and rsi < 38)
     if condition == "MACD_CROSS":
-        # Strict bullish crossover: MACD is above signal now and was not above
-        # signal on the previous candle. The current analyzer already confirms
-        # broader trend/momentum before this condition is accepted.
-        return bool(macd is not None and macd_signal is not None and macd_prev is not None and macd > macd_signal and macd_prev <= macd_signal and direction == "LONG")
+        return bool(macd is not None and macd_signal is not None and macd_prev is not None and macd > macd_signal and macd_prev <= macd_signal and direction == "LONG" and _long_entry_confirmed(analysis))
     if condition == "BB_SQUEEZE":
         width = float(analysis.get("bb_width", 0.0) or 0.0)
         squeeze = float(analysis.get("squeeze_threshold", 0.0) or 0.0)
-        return bool(direction == "LONG" and squeeze > 0 and width <= squeeze * 1.15 and vr >= 1.3 and analysis.get("price", 0) > analysis.get("ema50", 0))
+        return bool(direction == "LONG" and squeeze > 0 and width <= squeeze * 1.15 and vr >= 1.3 and analysis.get("price", 0) > analysis.get("ema50", 0) and _long_entry_confirmed(analysis))
     if condition == "VOL_BREAKOUT":
-        return bool(vr >= 1.5 and direction == "LONG")
+        return bool(vr >= 1.5 and direction == "LONG" and _long_entry_confirmed(analysis))
     if condition == "SUPERTREND":
-        return bool(st == 1 and direction == "LONG")
+        return bool(st == 1 and direction == "LONG" and _long_entry_confirmed(analysis))
     if condition == "EMA_CROSS":
-        return bool(ema50 is not None and ema200 is not None and ema50 > ema200 and direction == "LONG")
+        return bool(ema50 is not None and ema200 is not None and ema50 > ema200 and direction == "LONG" and _long_entry_confirmed(analysis))
     if condition == "ORDERBOOK":
-        return bool(ob >= 0.12 and direction == "LONG")
+        return bool(ob >= 0.12 and direction == "LONG" and _long_entry_confirmed(analysis))
     if condition == "STOCHASTIC":
-        return bool(k is not None and d is not None and k > d and k < 80 and direction == "LONG")
-    # TOP20_AI_NEWS and ASAP both mean: earliest strong, confirmed setup.
-    return direction == "LONG" if market_mode == "spot" else direction in ("LONG", "SHORT")
-
+        return bool(k is not None and d is not None and k > d and k < 80 and direction == "LONG" and _long_entry_confirmed(analysis))
+    # ASAP/TOP20_AI_NEWS now means earliest strong, confirmed setup; it does not
+    # bypass the anti-falling-knife rule in spot mode.
+    return _long_entry_confirmed(analysis) if market_mode == "spot" else direction in ("LONG", "SHORT") and analysis.get("score", 0) >= 70
 
 def _select_analyzed_candidate(valid, state, condition, market_mode, selected_coin=None):
     pool = valid
@@ -2319,133 +2368,137 @@ async def market_scanner_loop():
                             f"{market_mode.upper()} | Top-20 volume ranking"
                         )
 
-                        best_scan = None
+                        candidates = []
                         for scan_idx, scan_coin in enumerate(scan_pool, 1):
                             try:
                                 scan_analysis = _analyze_coin(scan_coin, state)
                                 scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
                                 scan_status = "PASS" if scan_pass else "NO TRADE"
-                                rsi_text = f"{scan_analysis['rsi']:.1f}" if scan_analysis.get("rsi") is not None else "N/A"
-                                vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
+                                if scan_analysis:
+                                    rsi_text = f"{scan_analysis.get('rsi'):.1f}" if scan_analysis.get('rsi') is not None else "N/A"
+                                    vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
+                                    direction = scan_analysis.get('direction', 'N/A')
+                                    score = scan_analysis.get('score', 0)
+                                else:
+                                    rsi_text, vol_text, direction, score = "N/A", "0.0x", "N/A", 0
                                 add_log(
                                     state,
-                                    f"🔍 SCAN {scan_idx:02d}/{len(scan_pool):02d} | "
-                                    f"{scan_coin.get('symbol')} | {scan_analysis.get('direction')} | "
-                                    f"Score {scan_analysis.get('score', 0)}/100 | RSI {rsi_text} | "
-                                    f"Vol {vol_text} | {scan_status}"
+                                    f"🔍 SCAN {scan_idx:02d}/{len(scan_pool):02d} | {scan_coin.get('symbol')} | "
+                                    f"{direction} | Score {score}/100 | RSI {rsi_text} | Vol {vol_text} | {scan_status}"
                                 )
-                                if scan_pass and (best_scan is None or scan_analysis["score"] > best_scan[1]["score"]):
-                                    best_scan = (scan_coin, scan_analysis)
+                                if scan_pass:
+                                    candidates.append((scan_coin, scan_analysis))
                             except Exception as scan_exc:
                                 add_log(state, f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}")
 
-                        if best_scan is None:
-                            add_log(
-                                state,
-                                f"🔎 NO TRADE: {deal_cond} | All scanned coins failed the confirmed market-analysis rules."
-                            )
+                        if not candidates:
+                            add_log(state, f"🔎 NO TRADE: {deal_cond} | All scanned coins failed the confirmed market-analysis rules.")
                             continue
 
-                        target_coin, analysis = best_scan
-                        coin_sym = str(target_coin["symbol"])
-                        current_p = float(target_coin["price"])
-                        add_log(
-                            state,
-                            f"🧠 MARKET ANALYSIS PASS: {coin_sym} | {analysis['direction']} | "
-                            f"Score {analysis['score']}/100 | RSI {analysis['rsi']:.1f} | "
-                            f"Vol {analysis['volume_ratio']:.1f}x | " + "; ".join(analysis['reasons'])
-                        )
+                        # Fill every free slot from the best confirmed candidates in
+                        # one scan cycle. The old code opened only the single best
+                        # candidate and waited for the next cycle, which made a
+                        # 5-slot configuration look like a 1-slot bot.
+                        candidates.sort(key=lambda item: float(item[1].get("score", 0) or 0), reverse=True)
+                        slots_left = max(0, allowed_slots - len(state.get("active_trades", [])))
+                        opened_this_cycle = 0
+                        opened_symbols = set(active_symbols)
                         quote = state.get("quote_currency", "INR").upper()
                         target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
                         sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
-
-                        if market_mode == "futures" and analysis.get("direction") == "SHORT":
-                            side = "sell"
-                            trade_type = "SHORT"
-                        else:
-                            side = "buy"
-                            trade_type = "LONG"
-
                         broker = state.get("active_broker", "coindcx").lower()
 
-                        if broker == "paper":
-                            if state.get("paper_balance", 500000.0) < order_amount:
+                        for target_coin, analysis in candidates:
+                            if opened_this_cycle >= slots_left:
+                                break
+                            coin_sym = str(target_coin["symbol"]).upper()
+                            if coin_sym in opened_symbols:
                                 continue
-                            sim_price = current_p
-                            calc_qty = (
-                                int(order_amount / sim_price)
-                                if sim_price < 20
-                                else round(order_amount / sim_price, 8)
-                            )
-                            if calc_qty <= 0:
-                                calc_qty = 1
+                            current_p = float(target_coin.get("price", 0) or 0)
+                            if current_p <= 0:
+                                continue
 
-                            state["paper_balance"] = round(state["paper_balance"] - order_amount, 2)
-                            entry_price = sim_price
-                            filled_qty = float(calc_qty)
+                            if market_mode == "futures" and analysis.get("direction") == "SHORT":
+                                side, trade_type = "sell", "SHORT"
+                            else:
+                                side, trade_type = "buy", "LONG"
 
-                        elif broker == "coindcx":
-                            ok, entry_price, filled_qty, result = execute_coindcx_order(
+                            add_log(
                                 state,
-                                coin_sym,
-                                side=side,
-                                target_amount=order_amount,
+                                f"🧠 MARKET ANALYSIS PASS: {coin_sym} | {analysis['direction']} | "
+                                f"Score {analysis['score']}/100 | RSI {analysis.get('rsi'):.1f} | "
+                                f"Vol {analysis.get('volume_ratio', 0):.1f}x | " + "; ".join(analysis.get('reasons', []))
                             )
-                            if not ok or filled_qty <= 0:
+
+                            if broker == "paper":
+                                if state.get("paper_balance", 500000.0) < order_amount:
+                                    add_log(state, f"⚠️ SLOT SKIPPED: {coin_sym} | Insufficient paper balance")
+                                    continue
+                                sim_price = current_p
+                                calc_qty = int(order_amount / sim_price) if sim_price < 20 else round(order_amount / sim_price, 8)
+                                if calc_qty <= 0:
+                                    calc_qty = 1
+                                state["paper_balance"] = round(state.get("paper_balance", 500000.0) - order_amount, 2)
+                                entry_price, filled_qty = sim_price, float(calc_qty)
+                            elif broker == "coindcx":
+                                ok, entry_price, filled_qty, result = execute_coindcx_order(state, coin_sym, side=side, target_amount=order_amount)
+                                if not ok or filled_qty <= 0:
+                                    add_log(state, f"⚠️ ENTRY REJECTED: {coin_sym} | {result}")
+                                    continue
+                            elif hasattr(ccxt, broker):
+                                ok, entry_price, filled_qty, result = execute_ccxt_order(state, coin_sym, side=side, target_amount=order_amount)
+                                if not ok or filled_qty <= 0:
+                                    add_log(state, f"⚠️ ENTRY REJECTED: {coin_sym} | {result}")
+                                    continue
+                            else:
                                 continue
 
-                        elif hasattr(ccxt, broker):
-                            ok, entry_price, filled_qty, result = execute_ccxt_order(
+                            entry_price = float(entry_price)
+                            filled_qty = float(filled_qty)
+                            if entry_price <= 0 or filled_qty <= 0:
+                                continue
+
+                            if trade_type == "SHORT":
+                                target_price = entry_price * (1.0 - target_pct)
+                                sl_price = entry_price * (1.0 + sl_pct)
+                            else:
+                                target_price = entry_price * (1.0 + target_pct)
+                                sl_price = entry_price * (1.0 - sl_pct)
+
+                            new_trade = {
+                                "id": int(time.time() * 1000) + opened_this_cycle,
+                                "symbol": coin_sym,
+                                "currency": quote,
+                                "exchange": state.get("market_data_exchange", broker),
+                                "type": trade_type,
+                                "entry_price": entry_price,
+                                "quantity": filled_qty,
+                                "amount": round(entry_price * filled_qty, 2),
+                                "highest_price": entry_price,
+                                "lowest_price": entry_price,
+                                "sl_price": sl_price,
+                                "target_price": target_price,
+                                "current_price": entry_price,
+                                "current_pnl_percent": 0.0,
+                                "current_pnl_val": 0.0,
+                                "unrealized_pnl": 0.0,
+                                "unrealized_pnl_percent": 0.0,
+                                "time": get_global_time(),
+                            }
+                            state["active_trades"].insert(0, new_trade)
+                            db_save_active_trade(new_trade, dev_id, broker)
+                            opened_symbols.add(coin_sym)
+                            opened_this_cycle += 1
+                            save_state_to_db(dev_id, state)
+                            add_log(
                                 state,
-                                coin_sym,
-                                side=side,
-                                target_amount=order_amount,
+                                f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
+                                f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']} | "
+                                f"SLOT {len(state['active_trades'])}/{allowed_slots}"
                             )
-                            if not ok or filled_qty <= 0:
-                                continue
-                        else:
-                            continue
 
-                        entry_price = float(entry_price)
-                        filled_qty = float(filled_qty)
-                        if entry_price <= 0 or filled_qty <= 0:
-                            continue
-
-                        if trade_type == "SHORT":
-                            target_price = entry_price * (1.0 - target_pct)
-                            sl_price = entry_price * (1.0 + sl_pct)
-                        else:
-                            target_price = entry_price * (1.0 + target_pct)
-                            sl_price = entry_price * (1.0 - sl_pct)
-
-                        new_trade = {
-                            "id": int(time.time() * 1000),
-                            "symbol": coin_sym,
-                            "currency": quote,
-                            "type": trade_type,
-                            "entry_price": entry_price,
-                            "quantity": filled_qty,
-                            "amount": round(entry_price * filled_qty, 2),
-                            "highest_price": entry_price,
-                            "lowest_price": entry_price,
-                            "sl_price": sl_price,
-                            "target_price": target_price,
-                            "current_price": entry_price,
-                            "current_pnl_percent": 0.0,
-                            "current_pnl_val": 0.0,
-                            "unrealized_pnl": 0.0,
-                            "unrealized_pnl_percent": 0.0,
-                            "time": get_global_time(),
-                        }
-
-                        state["active_trades"].insert(0, new_trade)
-                        db_save_active_trade(new_trade, dev_id, broker)
-                        save_state_to_db(dev_id, state)
-                        add_log(
-                            state,
-                            f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
-                            f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']}"
-                        )
+                        if opened_this_cycle == 0:
+                            add_log(state, "🔎 NO TRADE OPENED | Candidates existed but no entry could be confirmed/executed.")
 
                     except Exception as inner_err:
                         print(f"Loop error for {dev_id}: {inner_err}")
