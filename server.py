@@ -102,6 +102,11 @@ def init_db():
         )
     """)
 
+    # Ensure migrations that depend on active_trades run after its CREATE TABLE.
+    try:
+        cursor.execute("ALTER TABLE active_trades ADD COLUMN exchange TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -271,18 +276,70 @@ def save_state_to_db(device_id: str, state: dict):
         print(f"DB State Save Error: {e}")
 
 # ----------------- APP LIFECYCLE & STATE -----------------
+SCANNER_TASK = None
+SCANNER_LOCK = None
+
+def _load_persisted_runtime_sessions():
+    """Recover every persisted bot session/position after a process restart.
+    Real-money sessions are recovered but will not place new orders until API
+    credentials are reconnected; public-price monitoring remains safe.
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM bot_state WHERE is_running = 1 OR device_id IN (SELECT device_id FROM active_trades WHERE status='OPEN')").fetchall()
+        conn.close()
+        for row in rows:
+            dev = row["device_id"]
+            if dev not in user_sessions:
+                user_sessions[dev] = {
+                    "is_running": bool(row["is_running"]),
+                    "active_broker": row["active_broker"] or "coindcx",
+                    "market_data_exchange": row["market_data_exchange"] or (row["active_broker"] if row["active_broker"] != "paper" else "coindcx"),
+                    "market_mode": row["market_mode"] or "spot",
+                    "api_key": "", "secret_key": "",
+                    "quote_currency": row["quote_currency"] or "INR",
+                    "trade_amount": float(row["trade_amount"] or 500.0),
+                    "max_trades": int(row["max_trades"] or 1),
+                    "target_percent": float(row["target_percent"] or 2.5),
+                    "sl_percent": float(row["sl_percent"] or 1.5),
+                    "selected_coin": row["selected_coin"] or "AUTO",
+                    "deal_condition": row["deal_condition"] or "ASAP",
+                    "trade_type": "intraday", "strategy": "volume",
+                    "logs": ["🔄 Runtime recovered from persistent database."],
+                    "active_trades": db_load_active_trades(dev),
+                    "paper_balance": float(row["paper_balance"] if row["paper_balance"] is not None else 500000.0),
+                    "today_pnl": float(row["today_pnl"] if row["today_pnl"] is not None else 0.0),
+                    "session_start_fund": 0.0, "sleep_until": None, "sleep_reason": "",
+                    "last_settlement_date": row["last_settlement_date"] or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    "_closing_ids": set(), "_last_recovery_log": 0.0
+                }
+                if user_sessions[dev]["active_trades"] and user_sessions[dev]["active_broker"] != "paper":
+                    user_sessions[dev]["is_running"] = False
+                    add_log(user_sessions[dev], "🛡️ Real-trading safety pause after server restart: reconnect API credentials before new orders.")
+    except Exception as exc:
+        print(f"Runtime recovery error: {exc}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scanner_task = asyncio.create_task(market_scanner_loop())
+    global SCANNER_TASK, SCANNER_LOCK
+    SCANNER_LOCK = asyncio.Lock()
+    _load_persisted_runtime_sessions()
+    SCANNER_TASK = asyncio.create_task(market_scanner_loop())
     yield
-    scanner_task.cancel()
+    if SCANNER_TASK:
+        SCANNER_TASK.cancel()
+        try:
+            await SCANNER_TASK
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=os.environ.get("HITECH_CORS_ORIGINS", "*").split(","),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -329,7 +386,7 @@ def get_user_session(device_id: str):
                 "session_start_fund": 0.0,
                 "sleep_until": None,
                 "sleep_reason": "",
-                "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                "last_settlement_date": row[12] or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 "_closing_ids": set()
             }
         else:
@@ -505,31 +562,65 @@ async def verify_vip_key(request: Request):
 
 @app.post("/api/backtest")
 async def run_backtest(request: Request):
-    data = await request.json()
-    strategy = data.get("strategy", "RSI_FAV")
-    days = int(data.get("days", 7))
-    base_win_rate = 68.5 if "RSI" in strategy or "SUPERTREND" in strategy else 62.0
-    simulated_deals = days * 12
-    wins = int(simulated_deals * (base_win_rate / 100.0))
-    losses = simulated_deals - wins
-    net_profit_pct = (wins * 2.5) - (losses * 1.5)
-    return {
-        "status": "success", "strategy": strategy, "period_days": days,
-        "total_deals": simulated_deals, "win_rate": base_win_rate,
-        "winning_deals": wins, "losing_deals": losses,
-        "net_simulated_profit_pct": round(net_profit_pct, 2),
-        "message": f"Backtest completed successfully over {days} days of tick data."
-    }
+    """Exchange-native historical backtest. Never reports fabricated win rates."""
+    try:
+        data = await request.json()
+        device_id = data.get("device_id", "DEFAULT_DEVICE")
+        state = get_user_session(device_id)
+        strategy = str(data.get("strategy", "RSI_FAV")).upper()
+        days = max(1, min(30, int(data.get("days", 7))))
+        coin = str(data.get("symbol", state.get("selected_coin", "BTC"))).upper()
+        if coin == "AUTO":
+            coin = "BTC"
+        clean = coin.replace("INR", "").replace("USDT", "").replace("/", "")
+        markets = fetch_active_exchange_markets(state)
+        market = next((m for m in markets if str(m.get("base_coin", "")).upper() == clean), None)
+        if not market:
+            return {"status":"error", "message":f"{clean} is unavailable on {get_market_data_exchange(state).upper()} in {state.get('quote_currency','INR')}."}
+        candles = _fetch_analysis_ohlcv(clean, state, market.get("raw_symbol"), "15m", min(500, days*96+220))
+        if len(candles) < 80:
+            return {"status":"error", "message":"Not enough historical candles from the selected exchange for a real backtest."}
+        closes=[float(x["close"]) for x in candles]
+        highs=[float(x["high"]) for x in candles]
+        lows=[float(x["low"]) for x in candles]
+        fee_bps=float(os.environ.get("HITECH_BACKTEST_FEE_BPS","10"))
+        fee=fee_bps/10000.0
+        trades=[]; position=None; equity=1.0; wins=losses=0
+        lookback=200
+        for i in range(lookback, len(closes)-1):
+            window=closes[:i+1]
+            rsi=_rsi(window,14); macd,signal,_prev=_macd(window); ema50=_ema(window,50); ema200=_ema(window,200)
+            if rsi is None or macd is None or signal is None or ema50 is None or ema200 is None: continue
+            long_signal = rsi < 35 and macd > signal and closes[i] > ema50 > ema200
+            short_signal = rsi > 65 and macd < signal and closes[i] < ema50 < ema200
+            if position is None:
+                if long_signal or (state.get("market_mode") == "futures" and short_signal):
+                    position={"side":"LONG" if long_signal else "SHORT","entry":closes[i],"i":i}
+            else:
+                side=position["side"]; entry=position["entry"]; exit_now=(side=="LONG" and (short_signal or rsi>70)) or (side=="SHORT" and (long_signal or rsi<30))
+                if exit_now:
+                    exit_p=closes[i]; gross=(exit_p-entry)/entry if side=="LONG" else (entry-exit_p)/entry
+                    net=gross-2*fee; equity*=1+net
+                    trades.append(net*100); wins+=net>0; losses+=net<=0; position=None
+        if position is not None:
+            exit_p=closes[-1]; entry=position["entry"]; gross=(exit_p-entry)/entry if position["side"]=="LONG" else (entry-exit_p)/entry
+            net=gross-2*fee; equity*=1+net; trades.append(net*100); wins+=net>0; losses+=net<=0
+        total=len(trades); win_rate=(wins/total*100) if total else 0.0
+        return {"status":"success","exchange":get_market_data_exchange(state),"symbol":f"{clean}/{state.get('quote_currency','INR').upper()}","strategy":strategy,"period_days":days,"total_deals":total,"win_rate":round(win_rate,2),"winning_deals":wins,"losing_deals":losses,"net_profit_pct":round((equity-1)*100,2),"max_loss_pct":round(min(trades),2) if trades else 0.0,"message":"Backtest uses historical candles from the selected exchange; results are not a profit guarantee."}
+    except Exception as e:
+        return {"status":"error","message":f"Backtest error: {e}"}
 
 @app.get("/api/sentiment")
-def get_ai_sentiment():
-    sentiments = [
-        {"coin": "BTC", "sentiment": "BULLISH", "score": 84, "reason": "Institutional ETF Inflow Surge & Whale Accumulation"},
-        {"coin": "ETH", "sentiment": "BULLISH", "score": 79, "reason": "Layer-2 TVL Record High & Gas Optimization"},
-        {"coin": "SOL", "sentiment": "EXTREME BULLISH", "score": 91, "reason": "DEX Volume Dominance & Memecoin Activity"},
-        {"coin": "XRP", "sentiment": "NEUTRAL", "score": 52, "reason": "Consolidation Range Bound between Resistance"}
-    ]
-    return {"status": "success", "market_mood": "Greed (74/100)", "top_sentiments": sentiments}
+def get_market_sentiment(device_id: str = "DEFAULT_DEVICE"):
+    """Exchange-native technical mood; deliberately not presented as live news/AI."""
+    state=get_user_session(device_id)
+    markets=fetch_active_exchange_markets(state)
+    if not markets:
+        return {"status":"error","message":"No market data available from the selected exchange."}
+    changes=[float(m.get("change",0) or 0) for m in markets[:30]]
+    avg=sum(changes)/len(changes) if changes else 0.0
+    mood="BULLISH" if avg>1.0 else "BEARISH" if avg<-1.0 else "NEUTRAL"
+    return {"status":"success","source_exchange":get_market_data_exchange(state),"market_mood":mood,"average_24h_change":round(avg,2),"note":"Technical exchange-ticker mood only; no external news feed is claimed."}
 
 def get_market_data_exchange(state):
     broker = str(state.get("active_broker", "coindcx") or "coindcx").lower()
@@ -1259,8 +1350,10 @@ async def execute_order(request: Request):
             markets = fetch_active_exchange_markets(state)
             clean_coin = symbol.replace("INR", "").replace("USDT", "")
             match = next((m for m in markets if clean_coin in m["symbol"]), None)
-            sim_price = match["price"] if match else (8500000.0 if "BTC" in symbol else 150.0)
-            calc_qty = int(amount / sim_price) if sim_price < 20 else round(amount / sim_price, 4)
+            if not match:
+                return {"status": "error", "message": f"{symbol} is not available on {state.get('market_data_exchange','coindcx').upper()}; no fallback price is allowed."}
+            sim_price = float(match["price"])
+            calc_qty = int(amount / sim_price) if sim_price < 20 else round(amount / sim_price, 8)
             if calc_qty <= 0: calc_qty = 1
 
             if state.get("paper_balance", 500000.0) < amount:
@@ -1300,7 +1393,7 @@ async def execute_order(request: Request):
             return {"status": "success", "message": f"Paper {trade_type} order placed!", "price": sim_price, "qty": calc_qty}
 
         else:
-            success, price, qty, res = True, 8500000.0 if "BTC" in symbol else 150.0, 0.001, "Filled via Gateway"
+            success, price, qty, res = False, 0.0, 0.0, "No execution adapter selected"
             if exchange == "coindcx":
                 success, price, qty, res = execute_coindcx_order(state, symbol, side=side, target_amount=amount)
             elif hasattr(ccxt, exchange):
@@ -1321,6 +1414,7 @@ async def execute_order(request: Request):
                     "id": int(time.time() * 1000),
                     "symbol": symbol,
                     "currency": currency,
+                    "exchange": exchange,
                     "type": trade_type,
                     "entry_price": price,
                     "quantity": qty,
@@ -1533,6 +1627,9 @@ async def bot_control(request: Request):
 @app.get("/api/chart-data")
 def get_chart_data(device_id: str = "DEFAULT_DEVICE", symbol: str = "BTC", timeframe: str = "15m"):
     state = get_user_session(device_id)
+    timeframe = str(timeframe or "15m").lower()
+    if timeframe not in {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}:
+        return {"status": "error", "message": "Unsupported timeframe. Use 1m, 5m, 15m, 30m, 1h, 4h or 1d."}
     clean = str(symbol or "BTC").upper().replace("INR", "").replace("USDT", "").replace("/", "")
     if not clean:
         clean = "BTC"
@@ -1564,6 +1661,7 @@ def get_bot_status(device_id: str = "DEFAULT_DEVICE"):
         "sleep_until": state.get("sleep_until"),
         "sleep_reason": state.get("sleep_reason", ""),
         "active_broker": state.get("active_broker"),
+        "market_data_exchange": get_market_data_exchange(state),
         "quote_currency": state.get("quote_currency"),
         "trade_amount": state.get("trade_amount"),
         "max_trades": state.get("max_trades", 1),
@@ -2003,7 +2101,7 @@ def _analyze_coin(coin, state):
 
     analysis = {
         "base_coin": base, "price": price, "rsi": rsi, "macd": macd,
-        "macd_signal": macd_signal, "ema50": ema50, "ema200": ema200,
+        "macd_signal": macd_signal, "macd_prev": macd_prev, "ema50": ema50, "ema200": ema200,
         "volume_ratio": volume_ratio, "stoch_k": stoch_k, "stoch_d": stoch_d,
         "supertrend": supertrend, "orderbook": orderbook,
         "bb_width": bb_width, "squeeze_threshold": squeeze_threshold,
@@ -2027,6 +2125,7 @@ def _signal_passes(analysis, condition, market_mode):
     rsi = analysis.get("rsi")
     macd = analysis.get("macd")
     macd_signal = analysis.get("macd_signal")
+    macd_prev = analysis.get("macd_prev")
     ema50 = analysis.get("ema50")
     ema200 = analysis.get("ema200")
     vr = analysis.get("volume_ratio", 0)
@@ -2041,7 +2140,7 @@ def _signal_passes(analysis, condition, market_mode):
         # Strict bullish crossover: MACD is above signal now and was not above
         # signal on the previous candle. The current analyzer already confirms
         # broader trend/momentum before this condition is accepted.
-        return bool(macd is not None and macd_signal is not None and macd > macd_signal and direction == "LONG")
+        return bool(macd is not None and macd_signal is not None and macd_prev is not None and macd > macd_signal and macd_prev <= macd_signal and direction == "LONG")
     if condition == "BB_SQUEEZE":
         width = float(analysis.get("bb_width", 0.0) or 0.0)
         squeeze = float(analysis.get("squeeze_threshold", 0.0) or 0.0)
@@ -2084,277 +2183,303 @@ def _select_analyzed_candidate(valid, state, condition, market_mode, selected_co
 async def market_scanner_loop():
     while True:
         try:
-            for dev_id, state in list(user_sessions.items()):
-                try:
-                    # 1) ALWAYS REFRESH PNL & MONITOR TARGET / SL / TRAILING STOP LOSS FOR ACTIVE TRADES
-                    active = list(state.get("active_trades", []))
-                    if active:
-                        live_prices, live_by_base = _build_live_price_maps(state)
+            if SCANNER_LOCK is not None and SCANNER_LOCK.locked():
+                await asyncio.sleep(0.25)
+                continue
+            lock_ctx = SCANNER_LOCK if SCANNER_LOCK is not None else asyncio.Lock()
+            async with lock_ctx:
+                for dev_id, state in list(user_sessions.items()):
+                    try:
+                        # 1) ALWAYS REFRESH PNL & MONITOR TARGET / SL / TRAILING STOP LOSS FOR ACTIVE TRADES
+                        active = list(state.get("active_trades", []))
+                        if active:
+                            live_prices, live_by_base = _build_live_price_maps(state)
 
-                        for trade in active:
-                            if trade.get("_closing"):
-                                continue
+                            for trade in active:
+                                if trade.get("_closing"):
+                                    continue
 
-                            sym = str(trade.get("symbol", "")).upper()
-                            clean = sym.replace("INR", "").replace("USDT", "").replace("/", "")
-                            curr_p = _resolve_trade_live_price(state, trade, live_prices, live_by_base)
+                                sym = str(trade.get("symbol", "")).upper()
+                                clean = sym.replace("INR", "").replace("USDT", "").replace("/", "")
+                                curr_p = _resolve_trade_live_price(state, trade, live_prices, live_by_base)
 
-                            entry = float(trade.get("entry_price", 0.0) or 0.0)
-                            target_p = float(trade.get("target_price", 0.0) or 0.0)
-                            sl_p = float(trade.get("sl_price", 0.0) or 0.0)
+                                entry = float(trade.get("entry_price", 0.0) or 0.0)
+                                target_p = float(trade.get("target_price", 0.0) or 0.0)
+                                sl_p = float(trade.get("sl_price", 0.0) or 0.0)
 
-                            if curr_p > 0 and entry > 0:
-                                _update_trade_unrealized_pnl(trade, curr_p)
+                                if curr_p > 0 and entry > 0:
+                                    _update_trade_unrealized_pnl(trade, curr_p)
                                 
-                                # --- TRAILING STOP LOSS (TSL) LOGIC ---
+                                    # --- TRAILING STOP LOSS (TSL) LOGIC ---
+                                    is_long = trade.get("type") in ["LONG", "BUY"]
+                                    sl_pct_val = float(state.get("sl_percent", 1.5)) / 100.0
+                                
+                                    if is_long:
+                                        highest = float(trade.get("highest_price", entry) or entry)
+                                        if curr_p > highest:
+                                            trade["highest_price"] = curr_p
+                                            # Trail SL upwards if price goes up
+                                            new_sl = curr_p * (1.0 - sl_pct_val)
+                                            if new_sl > sl_p:
+                                                trade["sl_price"] = new_sl
+                                                sl_p = new_sl
+                                    else:
+                                        lowest = float(trade.get("lowest_price", entry) or entry)
+                                        if curr_p < lowest:
+                                            trade["lowest_price"] = curr_p
+                                            # Trail SL downwards if price goes down for short
+                                            new_sl = curr_p * (1.0 + sl_pct_val)
+                                            if new_sl < sl_p:
+                                                trade["sl_price"] = new_sl
+                                                sl_p = new_sl
+
+                                # Keep the persistent active-trade record synchronized.
+                                db_update_active_trade(trade, dev_id, state.get("active_broker", "paper"))
+
+                                if curr_p <= 0 or entry <= 0 or target_p <= 0 or sl_p <= 0:
+                                    continue
+
                                 is_long = trade.get("type") in ["LONG", "BUY"]
-                                sl_pct_val = float(state.get("sl_percent", 1.5)) / 100.0
-                                
                                 if is_long:
-                                    highest = float(trade.get("highest_price", entry) or entry)
-                                    if curr_p > highest:
-                                        trade["highest_price"] = curr_p
-                                        # Trail SL upwards if price goes up
-                                        new_sl = curr_p * (1.0 - sl_pct_val)
-                                        if new_sl > sl_p:
-                                            trade["sl_price"] = new_sl
-                                            sl_p = new_sl
+                                    current_pct = ((curr_p - entry) / entry) * 100.0
+                                    target_hit = curr_p >= target_p
+                                    sl_hit = curr_p <= sl_p
                                 else:
-                                    lowest = float(trade.get("lowest_price", entry) or entry)
-                                    if curr_p < lowest:
-                                        trade["lowest_price"] = curr_p
-                                        # Trail SL downwards if price goes down for short
-                                        new_sl = curr_p * (1.0 + sl_pct_val)
-                                        if new_sl < sl_p:
-                                            trade["sl_price"] = new_sl
-                                            sl_p = new_sl
+                                    current_pct = ((entry - curr_p) / entry) * 100.0
+                                    target_hit = curr_p <= target_p
+                                    sl_hit = curr_p >= sl_p
 
-                            # Keep the persistent active-trade record synchronized.
-                            db_update_active_trade(trade, dev_id, state.get("active_broker", "paper"))
-
-                            if curr_p <= 0 or entry <= 0 or target_p <= 0 or sl_p <= 0:
-                                continue
-
-                            is_long = trade.get("type") in ["LONG", "BUY"]
-                            if is_long:
-                                current_pct = ((curr_p - entry) / entry) * 100.0
-                                target_hit = curr_p >= target_p
-                                sl_hit = curr_p <= sl_p
-                            else:
-                                current_pct = ((entry - curr_p) / entry) * 100.0
-                                target_hit = curr_p <= target_p
-                                sl_hit = curr_p >= sl_p
-
-                            if target_hit or sl_hit:
-                                reason = "TARGET HIT" if target_hit else "SL/TSL HIT"
-                                ok, exit_price, filled_qty, msg = _close_trade_at_market(
-                                    state, dev_id, trade, reason, curr_p
-                                )
-
-                                if ok:
-                                    add_log(
-                                        state,
-                                        f"🎯 {reason}: {sym} | Exit {exit_price} | "
-                                        f"P&L {trade.get('pnl_percent', current_pct)}%"
-                                    )
-                                else:
-                                    add_log(
-                                        state,
-                                        f"⚠️ {reason} DETECTED but EXIT NOT CONFIRMED: "
-                                        f"{sym} | {msg}"
+                                if target_hit or sl_hit:
+                                    reason = "TARGET HIT" if target_hit else "SL/TSL HIT"
+                                    ok, exit_price, filled_qty, msg = _close_trade_at_market(
+                                        state, dev_id, trade, reason, curr_p
                                     )
 
-                    # 2) NEW DEAL SCANNING
-                    if not state.get("is_running"):
-                        continue
+                                    if ok:
+                                        add_log(
+                                            state,
+                                            f"🎯 {reason}: {sym} | Exit {exit_price} | "
+                                            f"P&L {trade.get('pnl_percent', current_pct)}%"
+                                        )
+                                    else:
+                                        add_log(
+                                            state,
+                                            f"⚠️ {reason} DETECTED but EXIT NOT CONFIRMED: "
+                                            f"{sym} | {msg}"
+                                        )
 
-                    allowed_slots = max(1, int(state.get("max_trades", 1)))
-                    if len(state.get("active_trades", [])) >= allowed_slots:
-                        continue
+                        # 2) NEW DEAL SCANNING
+                        if not state.get("is_running"):
+                            continue
 
-                    all_coins = fetch_active_exchange_markets(state)
-                    if not all_coins:
-                        continue
+                        allowed_slots = max(1, int(state.get("max_trades", 1)))
+                        if len(state.get("active_trades", [])) >= allowed_slots:
+                            continue
 
-                    order_amount = float(state.get("trade_amount", 500.0))
-                    active_symbols = {
-                        str(t.get("symbol", "")).upper()
-                        for t in state.get("active_trades", [])
-                    }
+                        all_coins = fetch_active_exchange_markets(state)
+                        if not all_coins:
+                            continue
 
-                    valid = [
-                        c for c in all_coins
-                        if float(c.get("price", 0) or 0) > 0
-                        and str(c.get("symbol", "")).upper() not in active_symbols
-                    ]
-                    if not valid:
-                        continue
+                        order_amount = float(state.get("trade_amount", 500.0))
+                        active_symbols = {
+                            str(t.get("symbol", "")).upper()
+                            for t in state.get("active_trades", [])
+                        }
 
-                    selected = str(state.get("selected_coin", "AUTO")).upper()
-                    deal_cond = str(state.get("deal_condition", "ASAP")).upper()
-                    market_mode = state.get("market_mode", "spot").lower()
+                        valid = [
+                            c for c in all_coins
+                            if float(c.get("price", 0) or 0) > 0
+                            and str(c.get("symbol", "")).upper() not in active_symbols
+                        ]
+                        if not valid:
+                            continue
 
-                    # REAL LIVE SCANNER: analyze the same market pool used by the
-                    # trade engine and publish each result to the server log.
-                    # The UI only displays these server-authoritative results; it
-                    # never invents/randomizes scan data.
-                    scan_pool = valid
-                    if selected != "AUTO":
-                        clean_selected = selected.replace("INR", "").replace("USDT", "").replace("/", "")
-                        scan_pool = [c for c in valid if str(c.get("base_coin", "")).upper() == clean_selected]
-                    else:
-                        scan_pool = sorted(
-                            valid,
-                            key=lambda x: float(x.get("volume", 0) or 0),
-                            reverse=True
-                        )[:20]
+                        selected = str(state.get("selected_coin", "AUTO")).upper()
+                        deal_cond = str(state.get("deal_condition", "ASAP")).upper()
+                        market_mode = state.get("market_mode", "spot").lower()
 
-                    add_log(
-                        state,
-                        f"🔎 SCAN START | {len(scan_pool)} coin(s) | {deal_cond} | "
-                        f"{market_mode.upper()} | Top-20 volume ranking"
-                    )
+                        # REAL LIVE SCANNER: analyze the same market pool used by the
+                        # trade engine and publish each result to the server log.
+                        # The UI only displays these server-authoritative results; it
+                        # never invents/randomizes scan data.
+                        scan_pool = valid
+                        if selected != "AUTO":
+                            clean_selected = selected.replace("INR", "").replace("USDT", "").replace("/", "")
+                            scan_pool = [c for c in valid if str(c.get("base_coin", "")).upper() == clean_selected]
+                        else:
+                            scan_pool = sorted(
+                                valid,
+                                key=lambda x: float(x.get("volume", 0) or 0),
+                                reverse=True
+                            )[:20]
 
-                    best_scan = None
-                    for scan_idx, scan_coin in enumerate(scan_pool, 1):
-                        try:
-                            scan_analysis = _analyze_coin(scan_coin, state)
-                            scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
-                            scan_status = "PASS" if scan_pass else "NO TRADE"
-                            rsi_text = f"{scan_analysis['rsi']:.1f}" if scan_analysis.get("rsi") is not None else "N/A"
-                            vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
-                            add_log(
-                                state,
-                                f"🔍 SCAN {scan_idx:02d}/{len(scan_pool):02d} | "
-                                f"{scan_coin.get('symbol')} | {scan_analysis.get('direction')} | "
-                                f"Score {scan_analysis.get('score', 0)}/100 | RSI {rsi_text} | "
-                                f"Vol {vol_text} | {scan_status}"
-                            )
-                            if scan_pass and (best_scan is None or scan_analysis["score"] > best_scan[1]["score"]):
-                                best_scan = (scan_coin, scan_analysis)
-                        except Exception as scan_exc:
-                            add_log(state, f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}")
-
-                    if best_scan is None:
                         add_log(
                             state,
-                            f"🔎 NO TRADE: {deal_cond} | All scanned coins failed the confirmed market-analysis rules."
+                            f"🔎 SCAN START | {len(scan_pool)} coin(s) | {deal_cond} | "
+                            f"{market_mode.upper()} | Top-20 volume ranking"
                         )
-                        continue
 
-                    target_coin, analysis = best_scan
-                    coin_sym = str(target_coin["symbol"])
-                    current_p = float(target_coin["price"])
-                    add_log(
-                        state,
-                        f"🧠 MARKET ANALYSIS PASS: {coin_sym} | {analysis['direction']} | "
-                        f"Score {analysis['score']}/100 | RSI {analysis['rsi']:.1f} | "
-                        f"Vol {analysis['volume_ratio']:.1f}x | " + "; ".join(analysis['reasons'])
-                    )
-                    quote = state.get("quote_currency", "INR").upper()
-                    target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
-                    sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
+                        best_scan = None
+                        for scan_idx, scan_coin in enumerate(scan_pool, 1):
+                            try:
+                                scan_analysis = _analyze_coin(scan_coin, state)
+                                scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
+                                scan_status = "PASS" if scan_pass else "NO TRADE"
+                                rsi_text = f"{scan_analysis['rsi']:.1f}" if scan_analysis.get("rsi") is not None else "N/A"
+                                vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
+                                add_log(
+                                    state,
+                                    f"🔍 SCAN {scan_idx:02d}/{len(scan_pool):02d} | "
+                                    f"{scan_coin.get('symbol')} | {scan_analysis.get('direction')} | "
+                                    f"Score {scan_analysis.get('score', 0)}/100 | RSI {rsi_text} | "
+                                    f"Vol {vol_text} | {scan_status}"
+                                )
+                                if scan_pass and (best_scan is None or scan_analysis["score"] > best_scan[1]["score"]):
+                                    best_scan = (scan_coin, scan_analysis)
+                            except Exception as scan_exc:
+                                add_log(state, f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}")
 
-                    if market_mode == "futures" and analysis.get("direction") == "SHORT":
-                        side = "sell"
-                        trade_type = "SHORT"
-                    else:
-                        side = "buy"
-                        trade_type = "LONG"
-
-                    broker = state.get("active_broker", "coindcx").lower()
-
-                    if broker == "paper":
-                        if state.get("paper_balance", 500000.0) < order_amount:
+                        if best_scan is None:
+                            add_log(
+                                state,
+                                f"🔎 NO TRADE: {deal_cond} | All scanned coins failed the confirmed market-analysis rules."
+                            )
                             continue
-                        sim_price = current_p
-                        calc_qty = (
-                            int(order_amount / sim_price)
-                            if sim_price < 20
-                            else round(order_amount / sim_price, 8)
-                        )
-                        if calc_qty <= 0:
-                            calc_qty = 1
 
-                        state["paper_balance"] = round(state["paper_balance"] - order_amount, 2)
-                        entry_price = sim_price
-                        filled_qty = float(calc_qty)
-
-                    elif broker == "coindcx":
-                        ok, entry_price, filled_qty, result = execute_coindcx_order(
+                        target_coin, analysis = best_scan
+                        coin_sym = str(target_coin["symbol"])
+                        current_p = float(target_coin["price"])
+                        add_log(
                             state,
-                            coin_sym,
-                            side=side,
-                            target_amount=order_amount,
+                            f"🧠 MARKET ANALYSIS PASS: {coin_sym} | {analysis['direction']} | "
+                            f"Score {analysis['score']}/100 | RSI {analysis['rsi']:.1f} | "
+                            f"Vol {analysis['volume_ratio']:.1f}x | " + "; ".join(analysis['reasons'])
                         )
-                        if not ok or filled_qty <= 0:
+                        quote = state.get("quote_currency", "INR").upper()
+                        target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
+                        sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
+
+                        if market_mode == "futures" and analysis.get("direction") == "SHORT":
+                            side = "sell"
+                            trade_type = "SHORT"
+                        else:
+                            side = "buy"
+                            trade_type = "LONG"
+
+                        broker = state.get("active_broker", "coindcx").lower()
+
+                        if broker == "paper":
+                            if state.get("paper_balance", 500000.0) < order_amount:
+                                continue
+                            sim_price = current_p
+                            calc_qty = (
+                                int(order_amount / sim_price)
+                                if sim_price < 20
+                                else round(order_amount / sim_price, 8)
+                            )
+                            if calc_qty <= 0:
+                                calc_qty = 1
+
+                            state["paper_balance"] = round(state["paper_balance"] - order_amount, 2)
+                            entry_price = sim_price
+                            filled_qty = float(calc_qty)
+
+                        elif broker == "coindcx":
+                            ok, entry_price, filled_qty, result = execute_coindcx_order(
+                                state,
+                                coin_sym,
+                                side=side,
+                                target_amount=order_amount,
+                            )
+                            if not ok or filled_qty <= 0:
+                                continue
+
+                        elif hasattr(ccxt, broker):
+                            ok, entry_price, filled_qty, result = execute_ccxt_order(
+                                state,
+                                coin_sym,
+                                side=side,
+                                target_amount=order_amount,
+                            )
+                            if not ok or filled_qty <= 0:
+                                continue
+                        else:
                             continue
 
-                    elif hasattr(ccxt, broker):
-                        ok, entry_price, filled_qty, result = execute_ccxt_order(
+                        entry_price = float(entry_price)
+                        filled_qty = float(filled_qty)
+                        if entry_price <= 0 or filled_qty <= 0:
+                            continue
+
+                        if trade_type == "SHORT":
+                            target_price = entry_price * (1.0 - target_pct)
+                            sl_price = entry_price * (1.0 + sl_pct)
+                        else:
+                            target_price = entry_price * (1.0 + target_pct)
+                            sl_price = entry_price * (1.0 - sl_pct)
+
+                        new_trade = {
+                            "id": int(time.time() * 1000),
+                            "symbol": coin_sym,
+                            "currency": quote,
+                            "type": trade_type,
+                            "entry_price": entry_price,
+                            "quantity": filled_qty,
+                            "amount": round(entry_price * filled_qty, 2),
+                            "highest_price": entry_price,
+                            "lowest_price": entry_price,
+                            "sl_price": sl_price,
+                            "target_price": target_price,
+                            "current_price": entry_price,
+                            "current_pnl_percent": 0.0,
+                            "current_pnl_val": 0.0,
+                            "unrealized_pnl": 0.0,
+                            "unrealized_pnl_percent": 0.0,
+                            "time": get_global_time(),
+                        }
+
+                        state["active_trades"].insert(0, new_trade)
+                        db_save_active_trade(new_trade, dev_id, broker)
+                        save_state_to_db(dev_id, state)
+                        add_log(
                             state,
-                            coin_sym,
-                            side=side,
-                            target_amount=order_amount,
+                            f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
+                            f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']}"
                         )
-                        if not ok or filled_qty <= 0:
-                            continue
-                    else:
-                        continue
 
-                    entry_price = float(entry_price)
-                    filled_qty = float(filled_qty)
-                    if entry_price <= 0 or filled_qty <= 0:
-                        continue
-
-                    if trade_type == "SHORT":
-                        target_price = entry_price * (1.0 - target_pct)
-                        sl_price = entry_price * (1.0 + sl_pct)
-                    else:
-                        target_price = entry_price * (1.0 + target_pct)
-                        sl_price = entry_price * (1.0 - sl_pct)
-
-                    new_trade = {
-                        "id": int(time.time() * 1000),
-                        "symbol": coin_sym,
-                        "currency": quote,
-                        "type": trade_type,
-                        "entry_price": entry_price,
-                        "quantity": filled_qty,
-                        "amount": round(entry_price * filled_qty, 2),
-                        "highest_price": entry_price,
-                        "lowest_price": entry_price,
-                        "sl_price": sl_price,
-                        "target_price": target_price,
-                        "current_price": entry_price,
-                        "current_pnl_percent": 0.0,
-                        "current_pnl_val": 0.0,
-                        "unrealized_pnl": 0.0,
-                        "unrealized_pnl_percent": 0.0,
-                        "time": get_global_time(),
-                    }
-
-                    state["active_trades"].insert(0, new_trade)
-                    db_save_active_trade(new_trade, dev_id, broker)
-                    save_state_to_db(dev_id, state)
-                    add_log(
-                        state,
-                        f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
-                        f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']}"
-                    )
-
-                except Exception as inner_err:
-                    print(f"Loop error for {dev_id}: {inner_err}")
+                    except Exception as inner_err:
+                        print(f"Loop error for {dev_id}: {inner_err}")
 
         except Exception as e:
             print(f"Scanner error: {e}")
 
         await asyncio.sleep(2.0)
 
+
+@app.post("/api/clear-history")
+async def clear_history(request: Request):
+    try:
+        data = await request.json()
+        device_id = data.get("device_id", "DEFAULT_DEVICE")
+        state = get_user_session(device_id)
+        if state.get("active_trades"):
+            return {"status":"error","message":"Close all active trades before clearing history."}
+        conn=sqlite3.connect(DB_FILE)
+        conn.execute("DELETE FROM trades WHERE device_id = ?", (device_id,))
+        conn.commit(); conn.close()
+        add_log(state, "🗑️ Trade history cleared for this device.")
+        return {"status":"success","message":"Trade history cleared."}
+    except Exception as e:
+        return {"status":"error","message":str(e)}
+
+@app.get("/api/health")
+def health_check():
+    return {"status":"ok","service":"hitechpro","time":get_global_time(),"scanner_task":bool(SCANNER_TASK and not SCANNER_TASK.done())}
+
 @app.get("/")
 def root():
     return {
-        "status": "HiTech Dual AI Engine Live (Universal Secure Gateway)!",
+        "status": "HiTechPro Trading Engine Live",
         "database": "SQLite Trades Active",
         "total_vip_keys": len(keys_db)
     }
