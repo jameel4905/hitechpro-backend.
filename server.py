@@ -5,7 +5,6 @@ import hashlib
 import json
 import sqlite3
 import requests
-from urllib.parse import urlencode
 import ccxt
 import uvicorn
 import asyncio
@@ -14,6 +13,12 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
+from urllib.parse import urlencode
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+except Exception:
+    ed25519 = None
 
 # ----------------- DATABASE SETUP (PERMANENT EXACT HISTORY) -----------------
 DB_FILE = "trades_history.db"
@@ -640,7 +645,22 @@ def fetch_active_exchange_markets(state):
     market_list = []
 
     try:
-        if broker == "coindcx":
+        if broker == "wazirx":
+            res = requests.get("https://api.wazirx.com/sapi/v1/tickers/24hr", timeout=8)
+            res.raise_for_status()
+            data = res.json()
+            for item in data if isinstance(data, list) else []:
+                q = str(item.get("quoteAsset", "") or "").upper()
+                base = str(item.get("baseAsset", "") or "").upper()
+                if q != quote or not base:
+                    continue
+                price = float(item.get("lastPrice", 0) or 0)
+                if price <= 0:
+                    continue
+                open_price = float(item.get("openPrice", 0) or 0)
+                change = ((price - open_price) / open_price * 100.0) if open_price > 0 else 0.0
+                market_list.append({"symbol": base + quote, "base_coin": base, "raw_symbol": base + quote, "price": price, "volume": float(item.get("volume", 0) or 0), "change": change, "exchange": "wazirx"})
+        elif broker == "coindcx":
             res = requests.get("https://api.coindcx.com/exchange/ticker", timeout=5)
             res.raise_for_status()
             data = res.json()
@@ -719,6 +739,263 @@ def get_coin_precision(clean_coin, current_price):
         else:
             return 4
 
+# ----------------- 30-BROKER API ADAPTER LAYER -----------------
+# The UI exposes 30 real exchanges.  This registry prevents UI names from
+# being passed blindly to CCXT and gives exchanges with non-CCXT auth a direct
+# adapter.  No adapter reports success without an actual authenticated request.
+BROKER_CCXT_ALIASES = {
+    "crypto_com": "cryptocom",
+    "crypto.com": "cryptocom",
+    "gate.io": "gateio",
+    "gate": "gateio",
+    "huobi": "htx",
+    "coinbase": "coinbase",
+    "delta_exchange": "delta",
+}
+
+# Brokers whose authentication format is NOT safe to assume from generic CCXT.
+# The UI can use the normal API Key + Secret fields, while adapters below map
+# them to the broker's actual authentication scheme.
+BROKER_AUTH_MODES = {
+    "mudrex": "secret_header",
+    "coinswitch": "ed25519",
+    "wazirx": "hmac_sha256",
+    "delta": "hmac_sha256_headers",
+    "coindcx": "hmac_sha256_headers",
+}
+
+SUPPORTED_REAL_BROKERS = {
+    "coindcx", "wazirx", "coinswitch", "zebpay", "mudrex", "delta",
+    "pi42", "bitbns", "giottus", "unocoin", "binance", "bybit", "okx",
+    "bitget", "kucoin", "gateio", "mexc", "htx", "kraken", "coinbase",
+    "bingx", "phemex", "bitmart", "lbank", "coinex", "deribit", "bitfinex",
+    "bitstamp", "crypto_com", "whitebit"
+}
+
+
+def _ccxt_id_for_broker(broker):
+    broker = str(broker or "").lower().strip()
+    return BROKER_CCXT_ALIASES.get(broker, broker)
+
+
+def _wazirx_signed_request(state, method, path, params=None, timeout=8):
+    """WazirX SAPI signed request. Never logs API credentials/signatures."""
+    api_key = str(state.get("api_key", "") or "").strip()
+    secret_key = str(state.get("secret_key", "") or "").strip()
+    if not api_key or not secret_key:
+        raise ValueError("WazirX API key and secret key are required.")
+
+    payload = dict(params or {})
+    payload.setdefault("recvWindow", 5000)
+    payload["timestamp"] = int(time.time() * 1000)
+    query = urlencode(payload)
+    payload["signature"] = hmac.new(
+        secret_key.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    headers = {"X-API-KEY": api_key, "Content-Type": "application/x-www-form-urlencoded"}
+    url = "https://api.wazirx.com" + path
+    response = requests.request(method.upper(), url, headers=headers, data=payload, timeout=timeout)
+    try:
+        body = response.json()
+    except Exception:
+        body = {"message": response.text[:500]}
+    if response.status_code >= 400:
+        message = body.get("msg") or body.get("message") if isinstance(body, dict) else str(body)
+        raise RuntimeError(f"HTTP {response.status_code}: {message or 'WazirX request failed'}")
+    if isinstance(body, dict) and body.get("code") not in (None, 0, "0"):
+        raise RuntimeError(f"WazirX error {body.get('code')}: {body.get('msg') or body.get('message')}")
+    return body
+
+
+def _wazirx_balances(state):
+    data = _wazirx_signed_request(state, "GET", "/sapi/v1/funds")
+    balances = {}
+    if not isinstance(data, list):
+        raise RuntimeError("WazirX returned an unexpected funds response.")
+    for item in data:
+        asset = str(item.get("asset", "") or "").upper()
+        if not asset:
+            continue
+        free = float(item.get("free", 0) or 0)
+        locked = float(item.get("locked", 0) or 0)
+        total = free + locked
+        if total > 1e-12:
+            balances[asset] = total
+    return balances
+
+
+def _json_or_text(response, broker):
+    try:
+        body = response.json()
+    except Exception:
+        body = {"message": response.text[:500]}
+    if response.status_code >= 400:
+        if isinstance(body, dict):
+            msg = body.get("message") or body.get("msg") or body.get("error") or body.get("error_description")
+        else:
+            msg = str(body)
+        raise RuntimeError(f"HTTP {response.status_code}: {msg or 'request failed'}")
+    return body
+
+
+def _coinswitch_signed_request(method, path, api_key, secret_key, params=None, body=None, timeout=8):
+    """CoinSwitch PRO Spot v2 Ed25519 authentication."""
+    if ed25519 is None:
+        raise RuntimeError("CoinSwitch requires the 'cryptography' package for Ed25519 authentication.")
+    if not api_key or not secret_key:
+        raise ValueError("CoinSwitch API key and secret key are required.")
+    path = str(path)
+    if params:
+        path += ("&" if "?" in path else "?") + urlencode(params)
+    # CoinSwitch signs METHOD + URL-decoded path+query + epoch.
+    from urllib.parse import unquote_plus
+    decoded_path = unquote_plus(path)
+    epoch = str(int(time.time() * 1000))
+    message = method.upper() + decoded_path + epoch
+    try:
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(secret_key))
+    except Exception as e:
+        raise RuntimeError(f"Invalid CoinSwitch Ed25519 secret format: {e}")
+    signature = private_key.sign(message.encode("utf-8")).hex()
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": api_key,
+        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-EPOCH": epoch,
+    }
+    url = "https://coinswitch.co" + decoded_path
+    response = requests.request(method.upper(), url, headers=headers, json=body if body is not None else None, timeout=timeout)
+    return _json_or_text(response, "CoinSwitch")
+
+
+def _coinswitch_balances(api_key, secret_key):
+    # validate first: a 200 Valid Access is the connection proof.
+    _coinswitch_signed_request("GET", "/trade/api/v2/validate/keys", api_key, secret_key)
+    data = _coinswitch_signed_request("GET", "/trade/api/v2/portfolio", api_key, secret_key)
+    balances = {}
+    payload = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(payload, dict):
+        # Current API may expose holdings under portfolio/holdings/balances.
+        rows = payload.get("portfolio") or payload.get("holdings") or payload.get("balances") or []
+    else:
+        rows = payload
+    if isinstance(rows, dict):
+        rows = [{"currency": k, "balance": v} for k, v in rows.items()]
+    if isinstance(rows, list):
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            coin = str(item.get("currency") or item.get("coin") or item.get("asset") or "").upper()
+            amount = item.get("total")
+            if amount is None: amount = item.get("balance")
+            if amount is None: amount = item.get("quantity")
+            try: amount = float(amount or 0)
+            except Exception: continue
+            if coin and amount > 1e-12:
+                balances[coin] = amount
+    return balances
+
+
+def _mudrex_request(method, path, secret_key, params=None, body=None, timeout=8):
+    if not secret_key:
+        raise ValueError("Mudrex API secret is required.")
+    url = "https://trade.mudrex.com/fapi/v1" + path
+    headers = {"X-Authentication": secret_key, "Content-Type": "application/json"}
+    response = requests.request(method.upper(), url, headers=headers, params=params, json=body if body is not None else None, timeout=timeout)
+    data = _json_or_text(response, "Mudrex")
+    if isinstance(data, dict) and data.get("success") is False:
+        errors = data.get("errors") or []
+        msg = errors[0].get("text") if errors and isinstance(errors[0], dict) else data.get("message")
+        raise RuntimeError(msg or "Mudrex authentication failed")
+    return data
+
+
+def _mudrex_balances(secret_key):
+    # Authenticated spot-wallet read is the cleanest connection proof and does
+    # not place an order. The endpoint accepts currency=INR/USDT.
+    balances = {}
+    for currency in ("INR", "USDT"):
+        data = _mudrex_request("GET", "/wallet/funds", secret_key, params={"currency": currency})
+        payload = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(payload, dict):
+            amount = payload.get("balance")
+            if amount is None: amount = payload.get("available_balance")
+            if amount is None: amount = payload.get("available")
+            if amount is not None:
+                try:
+                    amount = float(amount)
+                    if amount > 1e-12:
+                        balances[currency] = amount
+                except Exception:
+                    pass
+    return balances
+
+
+def _delta_signed_request(method, path, api_key, secret_key, params=None, body=None, timeout=8):
+    """Delta Exchange REST v2 HMAC authentication."""
+    if not api_key or not secret_key:
+        raise ValueError("Delta API key and secret key are required.")
+    method = method.upper()
+    query = urlencode(params or {})
+    body_text = json.dumps(body, separators=(",", ":")) if body is not None else ""
+    timestamp = str(int(time.time()))
+    prehash = method + timestamp + path + query + body_text
+    signature = hmac.new(secret_key.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "api-key": api_key,
+        "signature": signature,
+        "timestamp": timestamp,
+    }
+    url = "https://api.delta.exchange" + path
+    response = requests.request(method, url, headers=headers, params=params, data=body_text if body is not None else None, timeout=timeout)
+    data = _json_or_text(response, "Delta")
+    if isinstance(data, dict) and data.get("success") is False:
+        raise RuntimeError(data.get("message") or data.get("error") or "Delta authentication failed")
+    return data
+
+
+def _delta_balances(api_key, secret_key):
+    data = _delta_signed_request("GET", "/v2/wallet/balances", api_key, secret_key)
+    rows = data.get("result", []) if isinstance(data, dict) else []
+    balances = {}
+    if isinstance(rows, list):
+        for item in rows:
+            if not isinstance(item, dict): continue
+            coin = str(item.get("asset_symbol") or item.get("symbol") or "").upper()
+            amount = item.get("available_balance")
+            if amount is None: amount = item.get("balance")
+            try: amount = float(amount or 0)
+            except Exception: continue
+            if coin and amount > 1e-12:
+                balances[coin] = amount
+    return balances
+
+
+def _connect_ccxt_broker(exchange_id, api_key, secret_key, state):
+    ccxt_id = _ccxt_id_for_broker(exchange_id)
+    if not hasattr(ccxt, ccxt_id):
+        raise RuntimeError(
+            f"{exchange_id.upper()} needs a dedicated adapter; it is not available in the installed CCXT build."
+        )
+    exchange_class = getattr(ccxt, ccxt_id)
+    exchange = exchange_class({
+        "apiKey": api_key,
+        "secret": secret_key,
+        "enableRateLimit": True,
+        "timeout": 8000,
+    })
+    balance = exchange.fetch_balance()
+    total = balance.get("total", {}) or {}
+    dynamic = {
+        str(coin).upper(): float(amount)
+        for coin, amount in total.items()
+        if isinstance(amount, (int, float)) and amount > 1e-12
+    }
+    return dynamic
+
+
 def fetch_real_cash_balance(state):
     broker = state.get("active_broker", "coindcx").lower()
     api_key = state.get("api_key", "").strip()
@@ -726,11 +1003,7 @@ def fetch_real_cash_balance(state):
     quote = state.get("quote_currency", "INR").upper()
 
     if broker == "paper":
-        # paper_balance is the actual AVAILABLE cash balance.
-        # Trade entry deducts the order amount immediately; closing adds
-        # the returned principal plus realized P&L.
         return round(max(0.0, float(state.get("paper_balance", 500000.0))), 2)
-
     if not api_key or not secret_key:
         return 0.0
 
@@ -741,57 +1014,30 @@ def fetch_real_cash_balance(state):
             json_body = json.dumps(body, separators=(',', ':'))
             signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
             headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
-            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=5)
+            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=8)
+            res.raise_for_status()
             res_data = res.json()
             if isinstance(res_data, list):
-                total_quote_bal = 0.0
                 for item in res_data:
-                    curr = item.get("currency", "").upper()
-                    if curr == quote:
-                        free_b = float(item.get("balance", 0.0) or 0.0)
-                        lock_b = float(item.get("lock", 0.0) or 0.0)
-                        total_quote_bal = free_b + lock_b
-                        break
-                return total_quote_bal
+                    if str(item.get("currency", "")).upper() == quote:
+                        return float(item.get("balance", 0.0) or 0) + float(item.get("lock", 0.0) or 0)
             return 0.0
-
         elif broker == "wazirx":
-            # WazirX is handled with its official signed REST API instead of
-            # relying on a CCXT adapter that may not be present in the
-            # installed CCXT build.
-            params = {
-                "recvWindow": 5000,
-                "timestamp": int(round(time.time() * 1000)),
-            }
-            query = urlencode(params)
-            signature = hmac.new(
-                secret_key.encode("utf-8"),
-                query.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-            url = f"https://api.wazirx.com/sapi/v1/funds?{query}&signature={signature}"
-            headers = {"X-API-KEY": api_key}
-            res = requests.get(url, headers=headers, timeout=8)
-            payload = res.json()
-            if res.status_code != 200:
-                raise RuntimeError(f"HTTP {res.status_code}: {payload}")
-            if not isinstance(payload, list):
-                raise RuntimeError(f"Unexpected WazirX funds response: {payload}")
-            for item in payload:
-                asset = str(item.get("asset", "")).upper()
-                if asset == quote:
-                    return float(item.get("free", 0.0) or 0.0) + float(item.get("locked", 0.0) or 0.0)
-            return 0.0
-
-        elif hasattr(ccxt, broker):
-            exchange_class = getattr(ccxt, broker)
-            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True, 'timeout': 5000})
-            balance = exchange.fetch_balance()
-            total_bals = balance.get('total', {})
-            return float(total_bals.get(quote, 0.0))
-        
-        else:
-            return 0.0
+            balances = _wazirx_balances(state)
+            return float(balances.get(quote, 0.0))
+        elif broker == "coinswitch":
+            balances = _coinswitch_balances(api_key, secret_key)
+            return float(balances.get(quote, 0.0))
+        elif broker == "mudrex":
+            balances = _mudrex_balances(secret_key)
+            return float(balances.get(quote, 0.0))
+        elif broker == "delta":
+            balances = _delta_balances(api_key, secret_key)
+            return float(balances.get(quote, 0.0))
+        elif broker in SUPPORTED_REAL_BROKERS:
+            balances = _connect_ccxt_broker(broker, api_key, secret_key, state)
+            return float(balances.get(quote, 0.0))
+        return 0.0
     except Exception as e:
         print(f"Balance Fetch Error ({broker}): {e}")
         return 0.0
@@ -1525,105 +1771,95 @@ async def connect_exchange(request: Request):
     data = await request.json()
     device_id = data.get("device_id", "")
     state = get_user_session(device_id)
-    exchange_id = data.get("exchange", "coindcx").lower()
-    api_key = data.get("api_key", "").strip()
-    secret_key = data.get("secret_key", "").strip()
+    exchange_id = str(data.get("exchange", "coindcx") or "coindcx").lower().strip()
+    api_key = str(data.get("api_key", "") or "").strip()
+    secret_key = str(data.get("secret_key", "") or "").strip()
 
-    if exchange_id != "paper":
-        state["market_data_exchange"] = exchange_id
-    state["active_broker"] = exchange_id
-    state["api_key"] = api_key
-    state["secret_key"] = secret_key
-    save_state_to_db(device_id, state)
+    if exchange_id == "paper":
+        state["active_broker"] = "paper"
+        save_state_to_db(device_id, state)
+        return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {state["quote_currency"]: fetch_real_cash_balance(state)}}
+
+    if exchange_id not in SUPPORTED_REAL_BROKERS:
+        return {"status": "error", "message": f"Exchange '{exchange_id.upper()}' is not in the app's supported broker registry."}
+    # Mudrex's current API authenticates with the API secret in X-Authentication.
+    # The UI may still send the generated API key; it is retained for account
+    # metadata, but the secret is the credential actually used on the wire.
+    if exchange_id == "mudrex":
+        if not secret_key:
+            return {"status": "error", "message": "MUDREX requires the API Secret for X-Authentication."}
+    elif not api_key or not secret_key:
+        return {"status": "error", "message": f"{exchange_id.upper()} requires both API Key and Secret Key."}
 
     try:
-        if exchange_id == "paper":
-            return {"status": "success", "message": "🟢 Paper Trading Synced!", "balances": {state["quote_currency"]: fetch_real_cash_balance(state)}}
-        
-        elif exchange_id == "coindcx":
-            timeStamp = int(round(time.time() * 1000))
-            body = {"timestamp": timeStamp}
+        if exchange_id == "coindcx":
+            time_stamp = int(time.time() * 1000)
+            body = {"timestamp": time_stamp}
             json_body = json.dumps(body, separators=(',', ':'))
             signature = hmac.new(secret_key.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
             headers = {'Content-Type': 'application/json', 'X-AUTH-APIKEY': api_key, 'X-AUTH-SIGNATURE': signature}
-            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=5)
+            res = requests.post("https://api.coindcx.com/exchange/v1/users/balances", data=json_body, headers=headers, timeout=8)
+            res.raise_for_status()
             res_data = res.json()
-            
-            if isinstance(res_data, list):
-                dynamic_balances = {}
-                for item in res_data:
-                    curr = item.get("currency", "").upper()
-                    free_bal = float(item.get("balance", 0.0) or 0.0)
-                    locked_bal = float(item.get("lock", 0.0) or 0.0)
-                    total_bal = free_bal + locked_bal
-                    if total_bal > 0.00000001:
-                        dynamic_balances[curr] = total_bal
-                
-                inr_bal = dynamic_balances.get("INR", 0.0)
-                state["session_start_fund"] = inr_bal if state["quote_currency"] == "INR" else dynamic_balances.get("USDT", 0.0)
-                add_log(state, f"🔗 Connected to CoinDCX! Live Cash: {get_curr_symbol(state)}{state['session_start_fund']}")
-                return {"status": "success", "message": "Connected to CoinDCX!", "balances": dynamic_balances}
-            else:
-                return {"status": "error", "message": "CoinDCX Keys Invalid!"}
-        
-        elif exchange_id == "wazirx":
-            if not api_key or not secret_key:
-                return {"status": "error", "message": "WAZIRX API Key and Secret Key are required."}
-
-            params = {
-                "recvWindow": 5000,
-                "timestamp": int(round(time.time() * 1000)),
-            }
-            query = urlencode(params)
-            signature = hmac.new(
-                secret_key.encode("utf-8"),
-                query.encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-            url = f"https://api.wazirx.com/sapi/v1/funds?{query}&signature={signature}"
-            headers = {"X-API-KEY": api_key}
-            res = requests.get(url, headers=headers, timeout=8)
-            try:
-                payload = res.json()
-            except Exception:
-                payload = {"message": res.text}
-
-            if res.status_code != 200:
-                detail = payload.get("msg", payload.get("message", str(payload))) if isinstance(payload, dict) else str(payload)
-                return {"status": "error", "message": f"WAZIRX authentication failed (HTTP {res.status_code}): {detail}"}
-
-            if not isinstance(payload, list):
-                return {"status": "error", "message": f"WAZIRX returned an unexpected funds response: {payload}"}
-
+            if not isinstance(res_data, list):
+                raise RuntimeError("CoinDCX returned an unexpected balance response.")
             dynamic_balances = {}
-            for item in payload:
-                asset = str(item.get("asset", "")).upper()
-                free_bal = float(item.get("free", 0.0) or 0.0)
-                locked_bal = float(item.get("locked", 0.0) or 0.0)
-                total_bal = free_bal + locked_bal
-                if asset and total_bal > 0.00000001:
-                    dynamic_balances[asset] = total_bal
+            for item in res_data:
+                curr = str(item.get("currency", "") or "").upper()
+                total = float(item.get("balance", 0) or 0) + float(item.get("lock", 0) or 0)
+                if curr and total > 1e-12:
+                    dynamic_balances[curr] = total
 
-            cash_fund = dynamic_balances.get(state["quote_currency"], 0.0)
-            state["session_start_fund"] = cash_fund
-            add_log(state, f"🔗 Connected to WazirX! Live Cash: {get_curr_symbol(state)}{cash_fund}")
-            return {"status": "success", "message": "Connected to WazirX!", "balances": dynamic_balances}
+        elif exchange_id == "wazirx":
+            # WazirX uses its own signed SAPI. Do not depend on CCXT here.
+            dynamic_balances = _wazirx_balances({**state, "api_key": api_key, "secret_key": secret_key})
 
-        elif hasattr(ccxt, exchange_id):
-            exchange_class = getattr(ccxt, exchange_id)
-            exchange = exchange_class({'apiKey': api_key, 'secret': secret_key, 'enableRateLimit': True, 'timeout': 5000})
-            balance = exchange.fetch_balance()
-            dynamic_balances = {coin: float(amt) for coin, amt in balance.get('total', {}).items() if isinstance(amt, (int, float)) and amt > 0.00000001}
-            cash_fund = dynamic_balances.get(state["quote_currency"], 0.0)
-            state["session_start_fund"] = cash_fund
-            add_log(state, f"🔗 Connected to {exchange_id.upper()}! Cash: {get_curr_symbol(state)}{cash_fund}")
-            return {"status": "success", "message": f"Connected to {exchange_id.upper()}!", "balances": dynamic_balances}
-        
+        elif exchange_id == "coinswitch":
+            dynamic_balances = _coinswitch_balances(api_key, secret_key)
+
+        elif exchange_id == "mudrex":
+            dynamic_balances = _mudrex_balances(secret_key)
+
+        elif exchange_id == "delta":
+            dynamic_balances = _delta_balances(api_key, secret_key)
+
         else:
-            return {"status": "error", "message": f"Exchange '{exchange_id.upper()}' is not supported by the current adapter. No fake connection is allowed."}
-            
+            dynamic_balances = _connect_ccxt_broker(exchange_id, api_key, secret_key, state)
+
+        # Only persist credentials after a real authenticated balance request succeeds.
+        state["market_data_exchange"] = exchange_id
+        state["active_broker"] = exchange_id
+        state["api_key"] = api_key
+        state["secret_key"] = secret_key
+        quote = state.get("quote_currency", "INR").upper()
+        state["session_start_fund"] = float(dynamic_balances.get(quote, 0.0))
+        save_state_to_db(device_id, state)
+        add_log(state, f"🔗 Connected to {exchange_id.upper()}! Live Cash: {get_curr_symbol(state)}{state['session_start_fund']}")
+        return {
+            "status": "success",
+            "message": f"Connected to {exchange_id.upper()}!",
+            "balances": dynamic_balances,
+            "exchange": exchange_id,
+            "authenticated": True,
+        }
     except Exception as e:
-        return {"status": "error", "message": f"{exchange_id.upper()} connection failed: {e}"}
+        # Failed authentication must not be presented as a successful connection.
+        return {"status": "error", "message": f"{exchange_id.upper()} connection failed: {str(e)[:500]}"}
+
+@app.get("/api/broker-capabilities")
+async def broker_capabilities():
+    """Expose the real adapter status so the UI never implies unsupported auth."""
+    rows = []
+    for broker in sorted(SUPPORTED_REAL_BROKERS):
+        mode = BROKER_AUTH_MODES.get(broker, "ccxt")
+        rows.append({
+            "broker": broker,
+            "auth_mode": mode,
+            "connection": "dedicated" if mode != "ccxt" else "ccxt",
+            "real_auth_required": True,
+            "fake_success": False,
+        })
+    return {"status": "success", "brokers": rows, "count": len(rows)}
 
 @app.post("/api/bot-control")
 async def bot_control(request: Request):
@@ -1994,6 +2230,35 @@ def _fetch_analysis_ohlcv(base_coin, state, raw_symbol=None, timeframe="15m", li
     quote = state.get("quote_currency", "INR").upper()
     if not coin:
         return []
+
+    if broker == "wazirx":
+        symbol = str(raw_symbol or f"{coin}{quote}").replace("/", "").replace("_", "").replace("-", "").lower()
+        try:
+            r = requests.get("https://api.wazirx.com/sapi/v1/klines", params={"symbol": symbol, "interval": timeframe, "limit": min(int(limit), 2000)}, timeout=8)
+            r.raise_for_status()
+            rows = r.json()
+            out = []
+            for x in rows:
+                ts = int(float(x[0] or 0))
+                if ts < 10**12:
+                    ts *= 1000
+                out.append({"time": ts, "open": float(x[1]), "high": float(x[2]), "low": float(x[3]), "close": float(x[4]), "volume": float(x[5] or 0)})
+            return out
+        except Exception:
+            return []
+
+    if broker == "wazirx":
+        symbol = str(raw_symbol or f"{coin}{quote}").replace("/", "").replace("_", "").replace("-", "").lower()
+        try:
+            r = requests.get("https://api.wazirx.com/sapi/v1/depth", params={"symbol": symbol, "limit": 20}, timeout=8)
+            r.raise_for_status()
+            d = r.json()
+            bids = sum(float(v[1]) for v in d.get("bids", []))
+            asks = sum(float(v[1]) for v in d.get("asks", []))
+            total = bids + asks
+            return ((bids - asks) / total) if total else 0.0
+        except Exception:
+            return 0.0
 
     if broker == "coindcx":
         pair = raw_symbol or f"B-{coin}_{quote}"
