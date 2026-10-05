@@ -9,6 +9,7 @@ import ccxt
 import uvicorn
 import asyncio
 import threading
+import uuid
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta, timezone
@@ -1411,8 +1412,15 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
     state["today_pnl"] = round(float(state.get("today_pnl", 0.0)) + pnl_val, 2)
     
     if broker == "paper":
-        trade_amt = float(trade.get("amount", 0.0) or 0.0)
-        state["paper_balance"] = round(float(state.get("paper_balance", 500000.0)) + trade_amt + pnl_val, 2)
+        # Return the exact cash reserved when the paper position was opened,
+        # then apply realized P&L. This avoids losing rounding dust on cheap coins.
+        reserved_amt = float(
+            trade.get("reserved_amount", trade.get("amount", 0.0)) or 0.0
+        )
+        state["paper_balance"] = round(
+            float(state.get("paper_balance", 500000.0)) + reserved_amt + pnl_val,
+            2,
+        )
 
     if trade in state["active_trades"]:
         state["active_trades"].remove(trade)
@@ -1932,6 +1940,47 @@ async def bot_control(request: Request):
 
     return {"status": "error", "message": "Unknown bot action."}
 
+@app.get("/api/market-index")
+def get_market_index(device_id: str = "DEFAULT_DEVICE"):
+    """Return the selected exchange's authoritative Top-100 volume index."""
+    state = get_user_session(device_id)
+    try:
+        markets = fetch_active_exchange_markets(state)
+        clean = []
+        seen = set()
+        for m in markets:
+            base = str(m.get("base_coin", "") or "").upper().strip()
+            price = float(m.get("price", 0) or 0)
+            if not base or price <= 0 or base in seen:
+                continue
+            seen.add(base)
+            clean.append({
+                "rank": len(clean) + 1,
+                "symbol": base,
+                "market_symbol": str(m.get("raw_symbol") or m.get("symbol") or ""),
+                "price": price,
+                "change": float(m.get("change", 0) or 0),
+                "volume": float(m.get("volume", 0) or 0),
+                "exchange": str(m.get("exchange") or get_market_data_exchange(state)),
+            })
+            if len(clean) >= 100:
+                break
+        return {
+            "status": "success",
+            "exchange": get_market_data_exchange(state),
+            "quote_currency": str(state.get("quote_currency", "INR")).upper(),
+            "count": len(clean),
+            "coins": clean,
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": f"Market index unavailable: {exc}",
+            "exchange": get_market_data_exchange(state),
+            "coins": [],
+        }
+
+
 @app.get("/api/chart-data")
 def get_chart_data(device_id: str = "DEFAULT_DEVICE", symbol: str = "BTC", timeframe: str = "15m"):
     state = get_user_session(device_id)
@@ -1951,8 +2000,10 @@ def get_chart_data(device_id: str = "DEFAULT_DEVICE", symbol: str = "BTC", timef
     return {
         "status": "success",
         "exchange": get_market_data_exchange(state),
+        "market_symbol": str(coin.get("raw_symbol") or coin.get("symbol") or f"{clean}/{state.get('quote_currency','INR').upper()}"),
         "symbol": f"{clean}/{state.get('quote_currency','INR').upper()}",
         "timeframe": timeframe,
+        "live_price": float(coin.get("price", 0) or 0),
         "candles": candles,
     }
 
@@ -2635,154 +2686,222 @@ async def market_scanner_loop():
                         deal_cond = str(state.get("deal_condition", "ASAP")).upper()
                         market_mode = state.get("market_mode", "spot").lower()
 
-                        # REAL LIVE SCANNER: analyze the same market pool used by the
-                        # trade engine and publish each result to the server log.
-                        # The UI only displays these server-authoritative results; it
-                        # never invents/randomizes scan data.
+                        # REAL LIVE SCANNER: analyze the selected exchange's Top-100
+                        # volume-ranked market universe. The browser never invents signals.
                         scan_pool = valid
                         if selected != "AUTO":
                             clean_selected = selected.replace("INR", "").replace("USDT", "").replace("/", "")
-                            scan_pool = [c for c in valid if str(c.get("base_coin", "")).upper() == clean_selected]
+                            scan_pool = [
+                                c for c in valid
+                                if str(c.get("base_coin", "")).upper() == clean_selected
+                            ]
                         else:
                             scan_pool = sorted(
                                 valid,
                                 key=lambda x: float(x.get("volume", 0) or 0),
                                 reverse=True
-                            )[:20]
+                            )[:100]
 
                         add_log(
                             state,
                             f"🔎 SCAN START | {len(scan_pool)} coin(s) | {deal_cond} | "
-                            f"{market_mode.upper()} | Top-20 volume ranking"
+                            f"{market_mode.upper()} | Top-100 volume ranking"
                         )
 
-                        best_scan = None
+                        # Evaluate the whole pool, rank every passing setup, and fill
+                        # every free slot. This fixes the old 'best one only' bug.
+                        passing_scans = []
                         for scan_idx, scan_coin in enumerate(scan_pool, 1):
                             try:
                                 scan_analysis = _analyze_coin(scan_coin, state)
                                 scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
                                 scan_status = "PASS" if scan_pass else "NO TRADE"
-                                rsi_text = f"{scan_analysis['rsi']:.1f}" if scan_analysis.get("rsi") is not None else "N/A"
+                                rsi_text = (
+                                    f"{scan_analysis['rsi']:.1f}"
+                                    if scan_analysis.get('rsi') is not None else "N/A"
+                                )
                                 vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
                                 add_log(
                                     state,
-                                    f"🔍 SCAN {scan_idx:02d}/{len(scan_pool):02d} | "
+                                    f"🔍 SCAN {scan_idx:03d}/{len(scan_pool):03d} | "
                                     f"{scan_coin.get('symbol')} | {scan_analysis.get('direction')} | "
                                     f"Score {scan_analysis.get('score', 0)}/100 | RSI {rsi_text} | "
                                     f"Vol {vol_text} | {scan_status}"
                                 )
-                                if scan_pass and (best_scan is None or scan_analysis["score"] > best_scan[1]["score"]):
-                                    best_scan = (scan_coin, scan_analysis)
+                                if scan_pass:
+                                    passing_scans.append((scan_coin, scan_analysis))
                             except Exception as scan_exc:
-                                add_log(state, f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}")
+                                add_log(
+                                    state,
+                                    f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}"
+                                )
 
-                        if best_scan is None:
+                        if not passing_scans:
                             add_log(
                                 state,
-                                f"🔎 NO TRADE: {deal_cond} | All scanned coins failed the confirmed market-analysis rules."
+                                f"🔎 NO TRADE: {deal_cond} | All Top-100 coins failed the confirmed market-analysis rules."
                             )
                             continue
 
-                        target_coin, analysis = best_scan
-                        coin_sym = str(target_coin["symbol"])
-                        current_p = float(target_coin["price"])
-                        add_log(
-                            state,
-                            f"🧠 MARKET ANALYSIS PASS: {coin_sym} | {analysis['direction']} | "
-                            f"Score {analysis['score']}/100 | RSI {analysis['rsi']:.1f} | "
-                            f"Vol {analysis['volume_ratio']:.1f}x | " + "; ".join(analysis['reasons'])
+                        passing_scans.sort(
+                            key=lambda pair: float(pair[1].get("score", 0) or 0),
+                            reverse=True
                         )
+
+                        free_slots = max(
+                            0,
+                            allowed_slots - len(state.get("active_trades", []))
+                        )
+                        selected_candidates = passing_scans[:free_slots]
                         quote = state.get("quote_currency", "INR").upper()
-                        target_pct = max(0.001, float(state.get("target_percent", 2.5)) / 100.0)
-                        sl_pct = max(0.001, float(state.get("sl_percent", 1.5)) / 100.0)
-
-                        if market_mode == "futures" and analysis.get("direction") == "SHORT":
-                            side = "sell"
-                            trade_type = "SHORT"
-                        else:
-                            side = "buy"
-                            trade_type = "LONG"
-
+                        target_pct = max(
+                            0.001, float(state.get("target_percent", 2.5)) / 100.0
+                        )
+                        sl_pct = max(
+                            0.001, float(state.get("sl_percent", 1.5)) / 100.0
+                        )
                         broker = state.get("active_broker", "coindcx").lower()
 
-                        if broker == "paper":
-                            if state.get("paper_balance", 500000.0) < order_amount:
-                                continue
-                            sim_price = current_p
-                            calc_qty = (
-                                int(order_amount / sim_price)
-                                if sim_price < 20
-                                else round(order_amount / sim_price, 8)
-                            )
-                            if calc_qty <= 0:
-                                calc_qty = 1
+                        for candidate_no, (target_coin, analysis) in enumerate(selected_candidates, 1):
+                            try:
+                                coin_sym = str(target_coin["symbol"])
+                                current_p = float(target_coin["price"])
+                                add_log(
+                                    state,
+                                    f"🧠 MARKET ANALYSIS PASS {candidate_no}/{len(selected_candidates)}: "
+                                    f"{coin_sym} | {analysis['direction']} | "
+                                    f"Score {analysis['score']}/100 | RSI "
+                                    f"{analysis['rsi']:.1f} | Vol {analysis['volume_ratio']:.1f}x | "
+                                    + "; ".join(analysis['reasons'])
+                                )
 
-                            state["paper_balance"] = round(state["paper_balance"] - order_amount, 2)
-                            entry_price = sim_price
-                            filled_qty = float(calc_qty)
+                                if market_mode == "futures" and analysis.get("direction") == "SHORT":
+                                    side = "sell"
+                                    trade_type = "SHORT"
+                                else:
+                                    side = "buy"
+                                    trade_type = "LONG"
 
-                        elif broker == "coindcx":
-                            ok, entry_price, filled_qty, result = execute_coindcx_order(
-                                state,
-                                coin_sym,
-                                side=side,
-                                target_amount=order_amount,
-                            )
-                            if not ok or filled_qty <= 0:
-                                continue
+                                if broker == "paper":
+                                    if float(state.get("paper_balance", 500000.0) or 0.0) < order_amount:
+                                        add_log(
+                                            state,
+                                            f"⚠️ PAPER BALANCE LIMIT: {coin_sym} skipped; "
+                                            f"required {get_curr_symbol(state)}{order_amount:.2f}."
+                                        )
+                                        continue
 
-                        elif hasattr(ccxt, broker):
-                            ok, entry_price, filled_qty, result = execute_ccxt_order(
-                                state,
-                                coin_sym,
-                                side=side,
-                                target_amount=order_amount,
-                            )
-                            if not ok or filled_qty <= 0:
-                                continue
-                        else:
-                            continue
+                                    sim_price = current_p
+                                    if sim_price <= 0:
+                                        continue
+                                    # Paper mode uses fractional quantities too; this
+                                    # keeps the reserved amount exact for low-priced assets.
+                                    calc_qty = round(order_amount / sim_price, 12)
+                                    if calc_qty <= 0:
+                                        add_log(
+                                            state,
+                                            f"⚠️ ORDER SIZE TOO SMALL: {coin_sym} at {sim_price}."
+                                        )
+                                        continue
 
-                        entry_price = float(entry_price)
-                        filled_qty = float(filled_qty)
-                        if entry_price <= 0 or filled_qty <= 0:
-                            continue
+                                    state["paper_balance"] = round(
+                                        float(state.get("paper_balance", 500000.0))
+                                        - order_amount,
+                                        2,
+                                    )
+                                    entry_price = sim_price
+                                    filled_qty = float(calc_qty)
 
-                        if trade_type == "SHORT":
-                            target_price = entry_price * (1.0 - target_pct)
-                            sl_price = entry_price * (1.0 + sl_pct)
-                        else:
-                            target_price = entry_price * (1.0 + target_pct)
-                            sl_price = entry_price * (1.0 - sl_pct)
+                                elif broker == "coindcx":
+                                    ok, entry_price, filled_qty, result = execute_coindcx_order(
+                                        state,
+                                        coin_sym,
+                                        side=side,
+                                        target_amount=order_amount,
+                                    )
+                                    if not ok or filled_qty <= 0:
+                                        add_log(
+                                            state,
+                                            f"⚠️ ORDER NOT CONFIRMED: {coin_sym} | {result}"
+                                        )
+                                        continue
 
-                        new_trade = {
-                            "id": int(time.time() * 1000),
-                            "symbol": coin_sym,
-                            "currency": quote,
-                            "type": trade_type,
-                            "entry_price": entry_price,
-                            "quantity": filled_qty,
-                            "amount": round(entry_price * filled_qty, 2),
-                            "highest_price": entry_price,
-                            "lowest_price": entry_price,
-                            "sl_price": sl_price,
-                            "target_price": target_price,
-                            "current_price": entry_price,
-                            "current_pnl_percent": 0.0,
-                            "current_pnl_val": 0.0,
-                            "unrealized_pnl": 0.0,
-                            "unrealized_pnl_percent": 0.0,
-                            "time": get_global_time(),
-                        }
+                                elif hasattr(ccxt, broker):
+                                    ok, entry_price, filled_qty, result = execute_ccxt_order(
+                                        state,
+                                        coin_sym,
+                                        side=side,
+                                        target_amount=order_amount,
+                                    )
+                                    if not ok or filled_qty <= 0:
+                                        add_log(
+                                            state,
+                                            f"⚠️ ORDER NOT CONFIRMED: {coin_sym} | {result}"
+                                        )
+                                        continue
+                                else:
+                                    add_log(
+                                        state,
+                                        f"⚠️ Unsupported active broker: {broker.upper()}"
+                                    )
+                                    continue
 
-                        state["active_trades"].insert(0, new_trade)
-                        db_save_active_trade(new_trade, dev_id, broker)
-                        save_state_to_db(dev_id, state)
-                        add_log(
-                            state,
-                            f"⚡ BOT OPENED {trade_type}: {coin_sym} | Entry {get_curr_symbol(state)}{entry_price} | "
-                            f"Qty {filled_qty} | Target {new_trade['target_price']} | SL {new_trade['sl_price']}"
-                        )
+                                entry_price = float(entry_price)
+                                filled_qty = float(filled_qty)
+                                if entry_price <= 0 or filled_qty <= 0:
+                                    continue
+
+                                if trade_type == "SHORT":
+                                    target_price = entry_price * (1.0 - target_pct)
+                                    sl_price = entry_price * (1.0 + sl_pct)
+                                else:
+                                    target_price = entry_price * (1.0 + target_pct)
+                                    sl_price = entry_price * (1.0 - sl_pct)
+
+                                # Millisecond timestamps can collide when multiple
+                                # trades are opened in one scanner pass. Use a UUID
+                                # suffix so every active/history record is unique.
+                                trade_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:10]}"
+
+                                new_trade = {
+                                    "id": trade_id,
+                                    "symbol": coin_sym,
+                                    "currency": quote,
+                                    "type": trade_type,
+                                    "entry_price": entry_price,
+                                    "quantity": filled_qty,
+                                    "amount": round(entry_price * filled_qty, 2),
+                                    "reserved_amount": round(order_amount, 2) if broker == "paper" else round(entry_price * filled_qty, 2),
+                                    "highest_price": entry_price,
+                                    "lowest_price": entry_price,
+                                    "sl_price": sl_price,
+                                    "target_price": target_price,
+                                    "current_price": entry_price,
+                                    "current_pnl_percent": 0.0,
+                                    "current_pnl_val": 0.0,
+                                    "unrealized_pnl": 0.0,
+                                    "unrealized_pnl_percent": 0.0,
+                                    "time": get_global_time(),
+                                }
+
+                                state["active_trades"].insert(0, new_trade)
+                                db_save_active_trade(new_trade, dev_id, broker)
+                                save_state_to_db(dev_id, state)
+                                add_log(
+                                    state,
+                                    f"⚡ BOT OPENED {trade_type}: {coin_sym} | "
+                                    f"Entry {get_curr_symbol(state)}{entry_price} | "
+                                    f"Qty {filled_qty} | Target {new_trade['target_price']} | "
+                                    f"SL {new_trade['sl_price']} | "
+                                    f"Slots {len(state['active_trades'])}/{allowed_slots}"
+                                )
+
+                            except Exception as trade_open_err:
+                                add_log(
+                                    state,
+                                    f"⚠️ TRADE OPEN ERROR | {target_coin.get('symbol', '?')} | "
+                                    f"{trade_open_err}"
+                                )
 
                     except Exception as inner_err:
                         print(f"Loop error for {dev_id}: {inner_err}")
