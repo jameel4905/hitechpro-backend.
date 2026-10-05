@@ -2298,19 +2298,6 @@ def _fetch_analysis_ohlcv(base_coin, state, raw_symbol=None, timeframe="15m", li
         except Exception:
             return []
 
-    if broker == "wazirx":
-        symbol = str(raw_symbol or f"{coin}{quote}").replace("/", "").replace("_", "").replace("-", "").lower()
-        try:
-            r = requests.get("https://api.wazirx.com/sapi/v1/depth", params={"symbol": symbol, "limit": 20}, timeout=8)
-            r.raise_for_status()
-            d = r.json()
-            bids = sum(float(v[1]) for v in d.get("bids", []))
-            asks = sum(float(v[1]) for v in d.get("asks", []))
-            total = bids + asks
-            return ((bids - asks) / total) if total else 0.0
-        except Exception:
-            return 0.0
-
     if broker == "coindcx":
         pair = raw_symbol or f"B-{coin}_{quote}"
         if not str(pair).startswith(("B-", "I-")):
@@ -2342,7 +2329,6 @@ def _fetch_analysis_ohlcv(base_coin, state, raw_symbol=None, timeframe="15m", li
                  "close": float(x[4]), "volume": float(x[5] or 0)} for x in rows]
     except Exception:
         return []
-
 
 def _fetch_orderbook_imbalance(base_coin, state, raw_symbol=None):
     coin = str(base_coin or "").upper().strip()
