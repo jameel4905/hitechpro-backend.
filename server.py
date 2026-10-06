@@ -631,9 +631,100 @@ def get_market_sentiment(device_id: str = "DEFAULT_DEVICE"):
 
 def get_market_data_exchange(state):
     broker = str(state.get("active_broker", "coindcx") or "coindcx").lower()
+    # Paper mode is deliberately independent of the user's broker.
+    # Its public market source is TradingView's crypto scanner / BINANCE symbols,
+    # while execution remains 100% simulated.
     if broker == "paper":
-        return str(state.get("market_data_exchange", "coindcx") or "coindcx").lower()
+        return "tradingview"
     return broker
+
+
+def _tv_scan(tickers=None, columns=None, market="crypto", filters=None, sort_by=None, sort_order="desc", limit=100):
+    """Small TradingView public-scanner adapter used only for public paper data.
+    It does not require a user API key and never executes trades."""
+    payload = {
+        "filter": filters or [],
+        "symbols": {"query": {"types": []}},
+        "columns": columns or ["name", "close", "change", "24h_vol|5"],
+        "sort": {"sortBy": sort_by or "24h_vol|5", "sortOrder": sort_order},
+        "options": {"lang": "en"},
+        "range": [0, int(limit)],
+    }
+    if tickers:
+        payload["symbols"]["tickers"] = list(tickers)
+    try:
+        r = requests.post(
+            f"https://scanner.tradingview.com/{market}/scan",
+            json=payload,
+            headers={"User-Agent": "HiTech-Trading-Pro/1.0", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data.get("data", []) if isinstance(data, dict) else []
+    except Exception as exc:
+        raise RuntimeError(f"TradingView scanner unavailable: {exc}") from exc
+
+
+def _tv_usdinr():
+    rows = _tv_scan(
+        tickers=["FX_IDC:USDINR"],
+        columns=["close"],
+        market="forex",
+        sort_by="close",
+        sort_order="desc",
+        limit=1,
+    )
+    if not rows:
+        raise RuntimeError("TradingView USDINR quote unavailable")
+    value = float(rows[0].get("d", [0])[0] or 0)
+    if value <= 0:
+        raise RuntimeError("TradingView returned an invalid USDINR quote")
+    return value
+
+
+def _fetch_tradingview_paper_markets(quote):
+    rows = _tv_scan(
+        columns=["name", "close", "change", "24h_vol|5"],
+        market="crypto",
+        filters=[
+            {"left": "exchange", "operation": "equal", "right": "BINANCE"},
+            {"left": "name", "operation": "match", "right": "USDT"},
+        ],
+        sort_by="24h_vol|5",
+        sort_order="desc",
+        limit=100,
+    )
+    usdinr = _tv_usdinr() if quote == "INR" else 1.0
+    out = []
+    seen = set()
+    for row in rows:
+        vals = row.get("d", []) if isinstance(row, dict) else []
+        name = str(vals[0] if len(vals) > 0 else "").upper()
+        close = float(vals[1] if len(vals) > 1 and vals[1] is not None else 0)
+        change = float(vals[2] if len(vals) > 2 and vals[2] is not None else 0)
+        volume = float(vals[3] if len(vals) > 3 and vals[3] is not None else 0)
+        if not name.endswith("USDT") or close <= 0:
+            continue
+        base = name[:-4]
+        if not base or base in seen:
+            continue
+        seen.add(base)
+        price = close * usdinr
+        out.append({
+            "symbol": base + quote,
+            "base_coin": base,
+            "raw_symbol": f"{base}/USDT",
+            "price": price,
+            "price_usdt": close,
+            "volume": volume,
+            "change": change,
+            "exchange": "tradingview",
+            "tv_symbol": f"BINANCE:{base}USDT",
+        })
+        if len(out) >= 100:
+            break
+    return out
 
 
 def fetch_active_exchange_markets(state):
@@ -646,7 +737,9 @@ def fetch_active_exchange_markets(state):
     market_list = []
 
     try:
-        if broker == "wazirx":
+        if broker == "tradingview":
+            market_list = _fetch_tradingview_paper_markets(quote)
+        elif broker == "wazirx":
             res = requests.get("https://api.wazirx.com/sapi/v1/tickers/24hr", timeout=8)
             res.raise_for_status()
             data = res.json()
@@ -1990,10 +2083,30 @@ def get_chart_data(device_id: str = "DEFAULT_DEVICE", symbol: str = "BTC", timef
     clean = str(symbol or "BTC").upper().replace("INR", "").replace("USDT", "").replace("/", "")
     if not clean:
         clean = "BTC"
+
+    # Paper mode uses the real TradingView widget directly; this endpoint is only
+    # needed by the broker-data chart path. Keeping the distinction explicit avoids
+    # ever trying to render a CoinDCX/WazirX symbol inside TradingView.
+    if state.get("active_broker") == "paper":
+        markets = fetch_active_exchange_markets(state)
+        coin = next((m for m in markets if str(m.get("base_coin", "")).upper() == clean), None)
+        if coin is None:
+            return {"status": "error", "message": f"{clean} is not available in the TradingView paper universe.", "exchange": "tradingview"}
+        return {
+            "status": "success",
+            "exchange": "tradingview",
+            "market_symbol": coin.get("tv_symbol", f"BINANCE:{clean}USDT"),
+            "symbol": f"{clean}/{state.get('quote_currency','INR').upper()}",
+            "timeframe": timeframe,
+            "live_price": float(coin.get("price", 0) or 0),
+            "candles": [],
+            "paper": True,
+        }
+
     markets = fetch_active_exchange_markets(state)
     coin = next((m for m in markets if str(m.get("base_coin", "")).upper() == clean), None)
     if coin is None:
-        return {"status": "error", "message": f"{clean} is not available on {get_market_data_exchange(state).upper()} in {state.get('quote_currency','INR')}.", "exchange": get_market_data_exchange(state)}
+        return {"status": "error", "message": f"{clean} is not available on {get_market_data_exchange(state).upper()} in {state.get('quote_currency','INR')}", "exchange": get_market_data_exchange(state)}
     candles = _fetch_analysis_ohlcv(clean, state, coin.get("raw_symbol"), timeframe, 300)
     if not candles:
         return {"status": "error", "message": f"No candle data from {get_market_data_exchange(state).upper()} for {clean}.", "exchange": get_market_data_exchange(state)}
@@ -2281,6 +2394,19 @@ def _fetch_analysis_ohlcv(base_coin, state, raw_symbol=None, timeframe="15m", li
     quote = state.get("quote_currency", "INR").upper()
     if not coin:
         return []
+
+    if broker == "tradingview":
+        # TradingView's public scanner supplies the paper-mode live market view.
+        # For historical candles/indicator calculations, use the same BINANCE
+        # public market represented by the TradingView symbol. No broker API is used.
+        symbol_pair = f"{coin}/USDT"
+        try:
+            inst = ccxt.binance({"enableRateLimit": True, "timeout": 8000})
+            rows = inst.fetch_ohlcv(symbol_pair, timeframe=timeframe, limit=min(int(limit), 500))
+            return [{"time": int(x[0]), "open": float(x[1]), "high": float(x[2]), "low": float(x[3]),
+                     "close": float(x[4]), "volume": float(x[5] or 0)} for x in rows]
+        except Exception:
+            return []
 
     if broker == "wazirx":
         symbol = str(raw_symbol or f"{coin}{quote}").replace("/", "").replace("_", "").replace("-", "").lower()
