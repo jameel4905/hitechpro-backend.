@@ -353,6 +353,9 @@ app.add_middleware(
 
 user_sessions = {}
 _analysis_cache = {}
+_tv_paper_cache = {"ts": 0.0, "quote": "", "coins": []}
+_tv_paper_cache_lock = threading.Lock()
+TV_PAPER_CACHE_TTL = 45
 
 def get_user_session(device_id: str):
     if not device_id:
@@ -614,6 +617,8 @@ async def run_backtest(request: Request):
         market = next((m for m in markets if str(m.get("base_coin", "")).upper() == clean), None)
         if not market:
             return {"status":"error", "message":f"{clean} is unavailable on {get_market_data_exchange(state).upper()} in {state.get('quote_currency','INR')}."}
+        if get_market_data_exchange(state) == "tradingview":
+            return {"status":"error","message":"TradingView Paper Mode live scanner does not substitute another exchange for historical backtesting."}
         candles = _fetch_analysis_ohlcv(clean, state, market.get("raw_symbol"), "15m", min(500, days*96+220))
         if len(candles) < 80:
             return {"status":"error", "message":"Not enough historical candles from the selected exchange for a real backtest."}
@@ -660,10 +665,62 @@ def get_market_sentiment(device_id: str = "DEFAULT_DEVICE"):
     return {"status":"success","source_exchange":get_market_data_exchange(state),"market_mood":mood,"average_24h_change":round(avg,2),"note":"Technical exchange-ticker mood only; no external news feed is claimed."}
 
 def get_market_data_exchange(state):
+    """Paper is always TradingView; Real is always the user's connected broker."""
     broker = str(state.get("active_broker", "coindcx") or "coindcx").lower()
     if broker == "paper":
-        return str(state.get("market_data_exchange", "coindcx") or "coindcx").lower()
+        return "tradingview"
     return broker
+
+
+def _tv_scan_cached(payload, cache_key, ttl=45):
+    """TradingView public scanner with short caching to reduce repeated 429s."""
+    now = time.time()
+    cache = getattr(_tv_scan_cached, "_cache", {})
+    item = cache.get(cache_key)
+    if item and now - item["ts"] < ttl:
+        return item["data"]
+    response = requests.post("https://scanner.tradingview.com/crypto/scan", json=payload, headers={"User-Agent":"HiTech-Trading-Pro/1.0","Content-Type":"application/json"}, timeout=10)
+    response.raise_for_status()
+    body = response.json()
+    rows = body.get("data", []) if isinstance(body, dict) else []
+    cache[cache_key] = {"ts": now, "data": rows}
+    _tv_scan_cached._cache = cache
+    return rows
+
+
+def _fetch_tradingview_paper_markets(quote):
+    quote = str(quote or "USDT").upper()
+    now = time.time()
+    with _tv_paper_cache_lock:
+        if _tv_paper_cache["coins"] and _tv_paper_cache["quote"] == quote and now - _tv_paper_cache["ts"] < TV_PAPER_CACHE_TTL:
+            return list(_tv_paper_cache["coins"])
+    columns=["name","close","change","24h_vol|5","RSI|15","RSI|60","MACD.macd|15","MACD.signal|15","EMA20|15","EMA50|15","EMA200|15","EMA50|60","relative_volume_10d_calc|15","Stoch.K|15","Stoch.D|15"]
+    payload={"filter":[{"left":"exchange","operation":"equal","right":"BINANCE"}],"symbols":{"query":{"types":[]}},"columns":columns,"sort":{"sortBy":"24h_vol|5","sortOrder":"desc"},"options":{"lang":"en"},"range":[0,100]}
+    rows=_tv_scan_cached(payload,"paper-binance-top100",TV_PAPER_CACHE_TTL)
+    usd_inr=1.0
+    if quote=="INR":
+        fx_payload={"filter":[],"symbols":{"tickers":["FX_IDC:USDINR"],"query":{"types":[]}},"columns":["close"],"options":{"lang":"en"},"range":[0,1]}
+        fx_rows=_tv_scan_cached(fx_payload,"paper-usdinr",TV_PAPER_CACHE_TTL)
+        try: usd_inr=float(fx_rows[0].get("d",[0])[0] or 0) if fx_rows else 0.0
+        except Exception: usd_inr=0.0
+        if usd_inr<=0: raise RuntimeError("TradingView USDINR quote unavailable")
+    out=[]
+    for row in rows:
+        d=row.get("d",[]) if isinstance(row,dict) else []
+        if not d: continue
+        vals={columns[i]:(d[i] if i<len(d) else None) for i in range(len(columns))}
+        symbol=str(row.get("s","") or "").upper()
+        if ":" in symbol: symbol=symbol.split(":",1)[1]
+        base=symbol.replace("USDT","").replace("USD","").replace("/","").strip()
+        try: usd_price=float(vals.get("close") or 0)
+        except Exception: usd_price=0.0
+        if not base or usd_price<=0: continue
+        mult=usd_inr if quote=="INR" else 1.0
+        out.append({"symbol":base+quote,"base_coin":base,"raw_symbol":f"BINANCE:{base}USDT","tv_symbol":f"BINANCE:{base}USDT","price":usd_price*mult,"volume":float(vals.get("24h_vol|5") or 0)*mult,"change":float(vals.get("change") or 0),"exchange":"tradingview","tv":{"rsi15":vals.get("RSI|15"),"rsi60":vals.get("RSI|60"),"macd":vals.get("MACD.macd|15"),"macd_signal":vals.get("MACD.signal|15"),"ema20":vals.get("EMA20|15"),"ema50":vals.get("EMA50|15"),"ema200":vals.get("EMA200|15"),"ema50_60":vals.get("EMA50|60"),"volume_ratio":vals.get("relative_volume_10d_calc|15"),"stoch_k":vals.get("Stoch.K|15"),"stoch_d":vals.get("Stoch.D|15")}})
+    out.sort(key=lambda x:float(x.get("volume",0) or 0),reverse=True)
+    out=out[:100]
+    with _tv_paper_cache_lock: _tv_paper_cache.update({"ts":time.time(),"quote":quote,"coins":out})
+    return list(out)
 
 
 def fetch_active_exchange_markets(state):
@@ -674,6 +731,12 @@ def fetch_active_exchange_markets(state):
     broker = get_market_data_exchange(state)
     quote = state.get("quote_currency", "INR").upper()
     market_list = []
+
+    if broker == "tradingview":
+        try: return _fetch_tradingview_paper_markets(quote)
+        except Exception as exc:
+            add_log(state, f"⚠️ TRADINGVIEW PAPER DATA ERROR: {exc}")
+            return []
 
     try:
         if broker == "wazirx":
@@ -2420,6 +2483,40 @@ def _analyze_coin(coin, state):
     cached = _analysis_cache.get(cache_key)
     if cached and (time.time() - cached.get("ts", 0)) < 45:
         return cached.get("analysis")
+
+    if broker == "tradingview":
+        tv=coin.get("tv") or {}
+        def _num(k):
+            try:
+                v=float(tv.get(k)); return v if math.isfinite(v) else None
+            except Exception: return None
+        price=float(coin.get("price",0) or 0); rsi=_num("rsi15"); macd=_num("macd"); macd_signal=_num("macd_signal")
+        ema50=_num("ema50"); ema200=_num("ema200"); h1_ema50=_num("ema50_60"); vr=_num("volume_ratio") or 0.0
+        k=_num("stoch_k"); d=_num("stoch_d")
+        if price<=0 or rsi is None or macd is None or macd_signal is None or ema50 is None: return None
+        bull=bear=0; reasons=[]
+        if 50<=rsi<=68 or rsi<30: bull+=2; reasons.append(f"RSI {rsi:.1f} bullish/reversal zone")
+        elif rsi>72: bear+=2; reasons.append(f"RSI {rsi:.1f} overbought")
+        if macd>macd_signal: bull+=2; reasons.append("MACD bullish")
+        else: bear+=2; reasons.append("MACD bearish")
+        if ema200 is not None:
+            if price>ema50>ema200: bull+=2; reasons.append("EMA trend bullish")
+            elif price<ema50<ema200: bear+=2; reasons.append("EMA trend bearish")
+        h1_bull=bool(h1_ema50 is not None and price>h1_ema50)
+        if h1_bull: bull+=2; reasons.append("1H trend bullish")
+        else: bear+=2; reasons.append("1H trend bearish")
+        if vr>=1.5:
+            if float(coin.get("change",0) or 0)>0: bull+=2; reasons.append(f"Volume spike {vr:.1f}x")
+            elif float(coin.get("change",0) or 0)<0: bear+=2; reasons.append(f"Selling volume {vr:.1f}x")
+        if k is not None and d is not None:
+            if k>d and k<80: bull+=1
+            elif k<d and k>20: bear+=1
+        score=max(0,min(100,round(max(bull,bear)/11*100)))
+        direction="LONG" if bull>bear else "SHORT" if bear>bull else "NEUTRAL"
+        analysis={"base_coin":base,"price":price,"rsi":rsi,"macd":macd,"macd_signal":macd_signal,"macd_prev":None,"ema50":ema50,"ema200":ema200,"volume_ratio":vr,"stoch_k":k,"stoch_d":d,"supertrend":1 if h1_bull else -1,"orderbook":0.0,"bb_width":0.0,"squeeze_threshold":0.0,"bullish_points":bull,"bearish_points":bear,"score":score,"direction":direction,"reasons":reasons[-6:]}
+        _analysis_cache[cache_key]={"ts":time.time(),"analysis":analysis}
+        return analysis
+
     c15 = _fetch_analysis_ohlcv(base, state, raw_symbol, "15m", 220)
     c1h = _fetch_analysis_ohlcv(base, state, raw_symbol, "1h", 220)
     if len(c15) < 80 or len(c1h) < 80:
