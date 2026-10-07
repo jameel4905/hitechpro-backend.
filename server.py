@@ -353,8 +353,6 @@ app.add_middleware(
 
 user_sessions = {}
 _analysis_cache = {}
-_market_data_cache = {}
-MARKET_DATA_CACHE_TTL = 20.0
 
 def get_user_session(device_id: str):
     if not device_id:
@@ -396,7 +394,10 @@ def get_user_session(device_id: str):
                 "sleep_until": None,
                 "sleep_reason": "",
                 "last_settlement_date": row[12] or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                "_closing_ids": set()
+                "_closing_ids": set(),
+                "scanner_reports": [],
+                "scanner_cycle": 0,
+                "scanner_updated_at": None
             }
         else:
             user_sessions[device_id] = {
@@ -423,12 +424,18 @@ def get_user_session(device_id: str):
                 "sleep_until": None,
                 "sleep_reason": "",
                 "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                "_closing_ids": set()
+                "_closing_ids": set(),
+                "scanner_reports": [],
+                "scanner_cycle": 0,
+                "scanner_updated_at": None
             }
     state = user_sessions[device_id]
     state.setdefault("target_percent", 2.5)
     state.setdefault("sl_percent", 1.5)
     state.setdefault("_closing_ids", set())
+    state.setdefault("scanner_reports", [])
+    state.setdefault("scanner_cycle", 0)
+    state.setdefault("scanner_updated_at", None)
     return state
 
 KEYS_DB_FILE = "keys_db.json"
@@ -495,6 +502,28 @@ def add_log(state, msg):
     state["logs"].insert(0, f"{time_str}|{msg}")
     if len(state["logs"]) > 80:
         state["logs"].pop()
+
+
+def record_scanner_report(state, report):
+    """Store the latest authoritative per-coin scanner report for the UI.
+
+    Reports are derived only from the same exchange market feed and technical
+    analysis used by the bot. Paper mode therefore still uses real market data.
+    """
+    reports = state.setdefault("scanner_reports", [])
+    reports.insert(0, dict(report))
+    # Keep enough rows for the terminal without allowing unbounded memory growth.
+    del reports[120:]
+    state["scanner_updated_at"] = get_global_time()
+
+
+def _active_position_for_coin(state, base_coin):
+    base = str(base_coin or "").upper().replace("INR", "").replace("USDT", "").replace("/", "")
+    for trade in state.get("active_trades", []):
+        sym = str(trade.get("symbol", "")).upper().replace("INR", "").replace("USDT", "").replace("/", "")
+        if sym == base:
+            return str(trade.get("type", "ACTIVE")).upper()
+    return "FLAT"
 
 def check_midnight_settlement(state):
     current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -634,9 +663,6 @@ def get_market_sentiment(device_id: str = "DEFAULT_DEVICE"):
 def get_market_data_exchange(state):
     broker = str(state.get("active_broker", "coindcx") or "coindcx").lower()
     if broker == "paper":
-        # PAPER execution is simulated, but its scanner still uses a normal public
-        # exchange feed. TradingView is used by the chart widget for display only;
-        # it is not scraped/used as an automated scanner or signal source.
         return str(state.get("market_data_exchange", "coindcx") or "coindcx").lower()
     return broker
 
@@ -648,11 +674,6 @@ def fetch_active_exchange_markets(state):
     """
     broker = get_market_data_exchange(state)
     quote = state.get("quote_currency", "INR").upper()
-    cache_key = f"{broker}|{quote}"
-    cached = _market_data_cache.get(cache_key)
-    now = time.time()
-    if cached and (now - cached.get("ts", 0.0)) < MARKET_DATA_CACHE_TTL and cached.get("markets"):
-        return list(cached["markets"])
     market_list = []
 
     try:
@@ -725,19 +746,11 @@ def fetch_active_exchange_markets(state):
             add_log(state, f"⚠️ EXCHANGE UNSUPPORTED: {broker.upper()} has no market-data adapter installed.")
             return []
     except Exception as exc:
-        # Keep the last good public-exchange snapshot during a transient timeout/rate-limit.
-        stale = _market_data_cache.get(cache_key)
-        if stale and stale.get("markets"):
-            add_log(state, f"⚠️ {broker.upper()} MARKET DATA TEMPORARY ERROR: {exc} | Using last good snapshot.")
-            return list(stale["markets"])
         add_log(state, f"⚠️ {broker.upper()} MARKET DATA ERROR: {exc}")
         return []
 
     market_list.sort(key=lambda x: float(x.get("volume", 0.0) or 0.0), reverse=True)
-    result = market_list[:100]
-    if result:
-        _market_data_cache[cache_key] = {"ts": time.time(), "markets": list(result)}
-    return result
+    return market_list[:100]
 
 def get_coin_precision(clean_coin, current_price):
     if "BTC" in clean_coin:
@@ -2108,7 +2121,10 @@ def get_bot_logs(device_id: str = "DEFAULT_DEVICE"):
         "deal_condition": state.get("deal_condition", "ASAP"),
         "selected_coin": state.get("selected_coin", "AUTO"),
         "target_percent": state.get("target_percent", 2.5),
-        "sl_percent": state.get("sl_percent", 1.5)
+        "sl_percent": state.get("sl_percent", 1.5),
+        "scanner_cycle": int(state.get("scanner_cycle", 0) or 0),
+        "scanner_updated_at": state.get("scanner_updated_at"),
+        "scanner_reports": list(state.get("scanner_reports", []))
     }
 
 @app.get("/api/get-trades")
@@ -2681,7 +2697,6 @@ async def market_scanner_loop():
                         valid = [
                             c for c in all_coins
                             if float(c.get("price", 0) or 0) > 0
-                            and str(c.get("symbol", "")).upper() not in active_symbols
                         ]
                         if not valid:
                             continue
@@ -2706,39 +2721,89 @@ async def market_scanner_loop():
                                 reverse=True
                             )[:100]
 
+                        state["scanner_cycle"] = int(state.get("scanner_cycle", 0) or 0) + 1
+                        state["scanner_reports"] = []
                         add_log(
                             state,
                             f"🔎 SCAN START | {len(scan_pool)} coin(s) | {deal_cond} | "
-                            f"{market_mode.upper()} | Top-100 volume ranking"
+                            f"{market_mode.upper()} | Top-100 volume ranking | Cycle {state['scanner_cycle']}"
                         )
 
-                        # Evaluate the whole pool, rank every passing setup, and fill
-                        # every free slot. This fixes the old 'best one only' bug.
+                        # Evaluate every coin and publish one structured report per coin.
+                        # Active positions remain visible but can never be opened twice.
                         passing_scans = []
                         for scan_idx, scan_coin in enumerate(scan_pool, 1):
+                            symbol = str(scan_coin.get("base_coin") or scan_coin.get("symbol") or "?").upper()
+                            position = _active_position_for_coin(state, symbol)
                             try:
                                 scan_analysis = _analyze_coin(scan_coin, state)
+                                if not scan_analysis:
+                                    report = {
+                                        "cycle": state["scanner_cycle"], "scan_index": scan_idx,
+                                        "scan_total": len(scan_pool), "symbol": symbol,
+                                        "market_symbol": scan_coin.get("raw_symbol") or scan_coin.get("symbol"),
+                                        "price": float(scan_coin.get("price", 0) or 0),
+                                        "change": float(scan_coin.get("change", 0) or 0),
+                                        "volume": float(scan_coin.get("volume", 0) or 0),
+                                        "position": position, "direction": "NEUTRAL",
+                                        "score": 0, "rsi": None, "volume_ratio": 0.0,
+                                        "status": "INSUFFICIENT DATA", "action": "WAIT",
+                                        "reason": "Not enough live candles for technical analysis."
+                                    }
+                                    record_scanner_report(state, report)
+                                    add_log(state, f"🔍 SCAN {scan_idx:03d}/{len(scan_pool):03d} | {symbol} | {position} | INSUFFICIENT DATA | WAIT")
+                                    await asyncio.sleep(0)
+                                    continue
+
                                 scan_pass = _signal_passes(scan_analysis, deal_cond, market_mode)
-                                scan_status = "PASS" if scan_pass else "NO TRADE"
-                                rsi_text = (
-                                    f"{scan_analysis['rsi']:.1f}"
-                                    if scan_analysis.get('rsi') is not None else "N/A"
-                                )
-                                vol_text = f"{scan_analysis.get('volume_ratio', 0.0):.1f}x"
+                                # Never select an already-active symbol for a new order.
+                                scan_pass_for_order = scan_pass and position == "FLAT"
+                                direction = str(scan_analysis.get("direction", "NEUTRAL")).upper()
+                                score = int(scan_analysis.get("score", 0) or 0)
+                                action = "BUY" if direction == "LONG" and scan_pass else "SELL" if direction == "SHORT" and scan_pass and market_mode != "spot" else "WAIT"
+                                status = "ACTIVE POSITION" if position != "FLAT" else ("PASS" if scan_pass else "NO TRADE")
+                                rsi_val = scan_analysis.get("rsi")
+                                rsi_text = f"{rsi_val:.1f}" if rsi_val is not None else "N/A"
+                                vol_ratio = float(scan_analysis.get("volume_ratio", 0.0) or 0.0)
+                                report = {
+                                    "cycle": state["scanner_cycle"], "scan_index": scan_idx,
+                                    "scan_total": len(scan_pool), "symbol": symbol,
+                                    "market_symbol": scan_coin.get("raw_symbol") or scan_coin.get("symbol"),
+                                    "price": float(scan_analysis.get("price", scan_coin.get("price", 0)) or 0),
+                                    "change": float(scan_coin.get("change", 0) or 0),
+                                    "volume": float(scan_coin.get("volume", 0) or 0),
+                                    "position": position, "direction": direction, "score": score,
+                                    "rsi": float(rsi_val) if rsi_val is not None else None,
+                                    "volume_ratio": vol_ratio, "status": status, "action": action,
+                                    "reason": "; ".join(scan_analysis.get("reasons", [])[-3:]) or "Technical conditions evaluated."
+                                }
+                                record_scanner_report(state, report)
                                 add_log(
                                     state,
-                                    f"🔍 SCAN {scan_idx:03d}/{len(scan_pool):03d} | "
-                                    f"{scan_coin.get('symbol')} | {scan_analysis.get('direction')} | "
-                                    f"Score {scan_analysis.get('score', 0)}/100 | RSI {rsi_text} | "
-                                    f"Vol {vol_text} | {scan_status}"
+                                    f"🔍 SCAN {scan_idx:03d}/{len(scan_pool):03d} | {symbol} | "
+                                    f"{position} | {direction} | Score {score}/100 | RSI {rsi_text} | "
+                                    f"Vol {vol_ratio:.1f}x | {status} | {action}"
                                 )
-                                if scan_pass:
+                                if scan_pass_for_order:
                                     passing_scans.append((scan_coin, scan_analysis))
+                                # Yield after every completed coin so the UI can read the
+                                # report immediately instead of waiting for all 100 scans.
+                                await asyncio.sleep(0)
                             except Exception as scan_exc:
-                                add_log(
-                                    state,
-                                    f"⚠️ SCAN ERROR | {scan_coin.get('symbol', '?')} | {scan_exc}"
-                                )
+                                report = {
+                                    "cycle": state["scanner_cycle"], "scan_index": scan_idx,
+                                    "scan_total": len(scan_pool), "symbol": symbol,
+                                    "market_symbol": scan_coin.get("raw_symbol") or scan_coin.get("symbol"),
+                                    "price": float(scan_coin.get("price", 0) or 0),
+                                    "change": float(scan_coin.get("change", 0) or 0),
+                                    "volume": float(scan_coin.get("volume", 0) or 0),
+                                    "position": position, "direction": "NEUTRAL", "score": 0,
+                                    "rsi": None, "volume_ratio": 0.0, "status": "SCAN ERROR",
+                                    "action": "WAIT", "reason": str(scan_exc)[:240]
+                                }
+                                record_scanner_report(state, report)
+                                add_log(state, f"⚠️ SCAN {scan_idx:03d}/{len(scan_pool):03d} | {symbol} | {position} | SCAN ERROR | {scan_exc}")
+                                await asyncio.sleep(0)
 
                         if not passing_scans:
                             add_log(
