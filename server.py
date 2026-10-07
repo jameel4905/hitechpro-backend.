@@ -528,14 +528,13 @@ def _active_position_for_coin(state, base_coin):
 def check_midnight_settlement(state):
     current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if current_date != state["last_settlement_date"]:
-        curr_sym = get_curr_symbol(state)
-        state["paper_balance"] += state["today_pnl"]
-        state["paper_balance"] = round(state["paper_balance"], 2)
-        settled_amount = state["today_pnl"]
+        # Realized P&L is already credited to paper_balance at every paper exit.
+        # Do NOT add today_pnl again at midnight; doing so would double-count profit/loss.
+        settled_amount = float(state.get("today_pnl", 0.0) or 0.0)
         state["today_pnl"] = 0.0
         state["last_settlement_date"] = current_date
         save_state_to_db(next((k for k, v in user_sessions.items() if v is state), "DEFAULT_DEVICE"), state)
-        add_log(state, f"🏦 Midnight Settlement: {curr_sym}{settled_amount} moved to Wallet.")
+        add_log(state, f"🏦 Daily P&L rollover: {get_curr_symbol(state)}{settled_amount:.2f} archived; wallet unchanged.")
 
 @app.post("/api/verify-vip-key")
 async def verify_vip_key(request: Request):
@@ -1432,6 +1431,10 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
     trade["quantity"] = qty
     trade["pnl_percent"] = pnl_pct
     trade["pnl_val"] = pnl_val
+    trade["gross_pnl_percent"] = pnl_pct
+    trade["gross_pnl_val"] = pnl_val
+    trade["fees"] = float(trade.get("fees", 0.0) or 0.0)
+    trade["net_pnl_val"] = round(pnl_val - trade["fees"], 2)
     trade["exit_price"] = round(exit_p, 6 if exit_p < 1 else 2)
     trade["close_time"] = get_global_time()
     trade["status"] = reason
@@ -1440,7 +1443,7 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
     trade["current_pnl_val"] = pnl_val
     trade.pop("_closing", None)
 
-    state["today_pnl"] = round(float(state.get("today_pnl", 0.0)) + pnl_val, 2)
+    state["today_pnl"] = round(float(state.get("today_pnl", 0.0)) + float(trade.get("net_pnl_val", pnl_val)), 2)
     
     if broker == "paper":
         # Return the exact cash reserved when the paper position was opened,
@@ -1449,7 +1452,9 @@ def _finalize_closed_trade(state, device_id, trade, exit_price, filled_qty,
             trade.get("reserved_amount", trade.get("amount", 0.0)) or 0.0
         )
         state["paper_balance"] = round(
-            float(state.get("paper_balance", 500000.0)) + reserved_amt + pnl_val,
+            float(state.get("paper_balance", 500000.0))
+            + reserved_amt
+            + float(trade.get("net_pnl_val", pnl_val)),
             2,
         )
 
@@ -1667,8 +1672,12 @@ async def execute_order(request: Request):
             if not match:
                 return {"status": "error", "message": f"{symbol} is not available on {state.get('market_data_exchange','coindcx').upper()}; no fallback price is allowed."}
             sim_price = float(match["price"])
-            calc_qty = int(amount / sim_price) if sim_price < 20 else round(amount / sim_price, 8)
-            if calc_qty <= 0: calc_qty = 1
+            # Paper execution uses the exact order amount. Fractional quantity is
+            # required for low-priced/high-priced assets so P&L always matches the
+            # amount actually simulated.
+            calc_qty = round(amount / sim_price, 12) if sim_price > 0 else 0.0
+            if calc_qty <= 0:
+                return {"status": "error", "message": "Order size is too small for the selected market price."}
 
             if state.get("paper_balance", 500000.0) < amount:
                 return {"status": "error", "message": "Insufficient Paper Trading Balance!"}
@@ -1690,7 +1699,8 @@ async def execute_order(request: Request):
                 "type": trade_type,
                 "entry_price": sim_price,
                 "quantity": calc_qty,
-                "amount": amount,
+                "amount": round(sim_price * calc_qty, 2),
+                "reserved_amount": round(amount, 2),
                 "highest_price": sim_price,
                 "lowest_price": sim_price,
                 "sl_price": sl_price,
@@ -2139,7 +2149,7 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
     # P&L is currency-specific. Never add INR and USDT/USD amounts together.
     current_currency = str(state.get("quote_currency", "INR")).upper()
     display_today_pnl = round(sum(
-        float(t.get("pnl_val", 0.0) or 0.0)
+        float(t.get("net_pnl_val", t.get("pnl_val", 0.0)) or 0.0)
         for t in history_records
         if str(t.get("currency", current_currency)).upper() == current_currency
     ), 2)
