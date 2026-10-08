@@ -765,7 +765,7 @@ def fetch_real_cash_balance(state):
         return round(float(state.get("paper_balance", 500000.0)), 2)
     return 0.0
 
-# ----------------- MULTI-SLOT SCANNER ENGINE -----------------
+# ----------------- MULTI-SLOT SCANNER ENGINE WITH LIVE TELEMETRY LOGS -----------------
 async def market_scanner_loop():
     while True:
         try:
@@ -849,14 +849,46 @@ async def market_scanner_loop():
                         else:
                             scan_pool = valid[:30]
 
+                        # Collect candidates to fill all free slots + Log Live Telemetry to Terminal
                         approved_candidates = []
-                        for coin in scan_pool:
-                            if len(approved_candidates) >= free_slots:
-                                break
+                        for idx, coin in enumerate(scan_pool, 1):
+                            base = coin.get("base_coin", "").upper()
+                            price = float(coin.get("price", 0.0) or 0.0)
+                            chg = float(coin.get("change", 0.0) or 0.0)
                             analysis = await asyncio.to_thread(_analyze_coin, coin, state)
-                            if analysis and _signal_passes(analysis, deal_cond, market_mode):
+
+                            rsi_str = f"{analysis['rsi']:.1f}" if analysis and analysis.get("rsi") else "N/A"
+                            score = analysis.get("score", 0) if analysis else 50
+                            direction = analysis.get("direction", "NEUTRAL") if analysis else "NEUTRAL"
+                            vol_ratio = analysis.get("volume_ratio", 1.0) if analysis else 1.0
+                            passes = _signal_passes(analysis, deal_cond, market_mode) if analysis else False
+                            status = "PASS" if passes else "WAIT"
+
+                            # Telemetry line print to terminal
+                            sign = "+" if chg >= 0 else ""
+                            log_msg = f"🔍 #{idx:02d} {base} | {get_curr_symbol(state)}{price:.2f} ({sign}{chg:.2f}%) | Vol {vol_ratio:.1f}x | RSI {rsi_str} | {direction} ({score}/100) -> {status}"
+                            add_log(state, log_msg)
+
+                            state.setdefault("scanner_reports", []).insert(0, {
+                                "scan_index": idx,
+                                "symbol": base,
+                                "price": price,
+                                "change": chg,
+                                "volume_ratio": vol_ratio,
+                                "rsi": rsi_str,
+                                "score": score,
+                                "direction": direction,
+                                "status": status,
+                                "action": "BUY" if passes else "WAIT"
+                            })
+                            state["scanner_reports"] = state["scanner_reports"][:60]
+
+                            if passes and len(approved_candidates) < free_slots:
                                 approved_candidates.append((coin, analysis))
 
+                            await asyncio.sleep(0.05)
+
+                        # Execute entries for each available slot
                         order_amount = float(state.get("trade_amount", 500.0))
                         target_pct = float(state.get("target_percent", 2.5)) / 100.0
                         sl_pct = float(state.get("sl_percent", 1.5)) / 100.0
