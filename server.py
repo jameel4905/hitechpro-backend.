@@ -410,10 +410,27 @@ def get_user_session(device_id: str):
     state.setdefault("scanner_exchange", get_market_data_exchange(state))
     return state
 
+# ----------------- COMPLETE 100+ MASTER VIP KEYS DATABASE -----------------
 KEYS_DB_FILE = "keys_db.json"
 MASTER_VIP_KEYS = [
     "Ttyux7837", "yyuxv9990", "zazoz7689", "wqxxb8112", "ddrxz9099", "ssolp0112",
-    "dxxct8900", "vvvst6090", "topct4562", "jamrt2189", "bcjoz0445", "savvc3188"
+    "dxxct8900", "vvvst6090", "topct4562", "jamrt2189", "bcjoz0445", "savvc3188",
+    "gyyop5678", "somno8955", "okxdc9967", "ssopx3991", "sddtc0332", "wqplo0349",
+    "ccdri8922", "vdszx5678", "Ecxaz8881", "cccto8110", "ffrtc4590", "cvxns4286",
+    "drtpc7634", "trxza3339", "hctza7811", "drtrc4589", "ffctb8745", "Ahode3462",
+    "yjdtes8950", "huawol7624", "kiyfs8907", "hhyat7866", "hhgat8201", "hgwkl6544",
+    "ghlao8900", "hungd8765", "hutes9032", "huowl1425", "uwlak6902", "haqao3430",
+    "haeri9023", "lopas8443", "olase9088", "xvcbm3286", "cmzxn0990", "rteoa6723",
+    "awalo0120", "smxfg9034", "qoesk0098", "gdncm8674", "azmzn3490", "bhafi6789",
+    "plomc7563", "cvbfz5601", "hpctn8823", "qarap1209", "akyce9743", "dyyct1239",
+    "lopst2179", "wqlla1356", "bgmvs8040", "daytc7654", "slmpo4597", "ftesr0967",
+    "qawas8654", "vcxqa6789", "poiyt1452", "utyuo1001", "wopae9882", "lpost3459",
+    "laalo5901", "tyucv7732", "yeduo0111", "waqao9090", "wasar7728", "iitrc4567",
+    "tuyvc6610", "resct6712", "ohpor5098", "rwocp8724", "ghuyt6723", "Jiuno0989",
+    "ploar7093", "aeiop9321", "ppout9955", "ictno7766", "aicio7711", "ddrco3750",
+    "abovc8023", "ddcrt9959", "qoplu1898", "oiuyt4587", "qpoui0908", "woplt1010",
+    "mnuni4089", "dcvna3090", "aavvc0001", "aolct0099", "sasat7890", "llpot8686",
+    "kkubx0567", "ilctn4590", "actto1209", "ssdco5678"
 ]
 
 keys_db = {}
@@ -442,6 +459,70 @@ def save_keys_database():
         pass
 
 load_keys_database()
+
+# ----------------- VIP KEY VERIFICATION ENDPOINT -----------------
+@app.post("/api/verify-vip-key")
+async def verify_vip_key(request: Request):
+    data = await request.json()
+    raw_key = data.get("key", "").strip()
+    device_id = data.get("device_id", "").strip()
+    referral_code = data.get("referral_code", "").strip()
+
+    if not raw_key:
+        return {"status": "error", "message": "Key cannot be empty."}
+
+    # Case-insensitive matching taaki capital/small letter hone par bhi key match ho jaye
+    matched_key = next((k for k in keys_db if k.lower() == raw_key.lower()), None)
+
+    if not matched_key:
+        return {"status": "error", "message": "Invalid Activation Key. Please verify with admin."}
+
+    record = keys_db[matched_key]
+    now_dt = datetime.now(timezone.utc)
+
+    if record["used"]:
+        if record["device_id"] == device_id:
+            try:
+                exp_dt = datetime.fromisoformat(record["expires_at"].replace("Z", "+00:00"))
+                if exp_dt > now_dt:
+                    days_left = (exp_dt - now_dt).days + 1
+                    return {
+                        "status": "success",
+                        "message": f"Key verified! {days_left} remaining day(s).",
+                        "expires_at": record["expires_at"]
+                    }
+                else:
+                    return {"status": "error", "message": "This VIP Key has expired. Please renew."}
+            except Exception:
+                pass
+        return {"status": "error", "message": "This key has already been activated on another device!"}
+
+    activation_time = now_dt
+    expiry_time = activation_time + timedelta(days=30)
+
+    record["used"] = True
+    record["device_id"] = device_id if device_id else f"DEV_{int(time.time())}"
+    record["activated_at"] = activation_time.isoformat()
+    record["expires_at"] = expiry_time.isoformat()
+
+    if referral_code and referral_code in keys_db and referral_code.lower() != matched_key.lower():
+        ref_record = keys_db[referral_code]
+        if ref_record["used"] and ref_record["expires_at"]:
+            try:
+                ref_exp = datetime.fromisoformat(ref_record["expires_at"].replace("Z", "+00:00"))
+                base_time = ref_exp if ref_exp > now_dt else now_dt
+                new_ref_exp = base_time + timedelta(days=10)
+                ref_record["expires_at"] = new_ref_exp.isoformat()
+                ref_record["referral_count"] = ref_record.get("referral_count", 0) + 1
+            except Exception:
+                pass
+
+    save_keys_database()
+    return {
+        "status": "success",
+        "message": "VIP Key verified successfully! 30-Day access granted.",
+        "expires_at": record["expires_at"]
+    }
 
 def get_curr_symbol(state):
     return "₹" if state.get("quote_currency") == "INR" else "$"
@@ -503,56 +584,10 @@ def _macd(closes):
     if signal is None: return None, None, None
     return macd_series[-1], signal, macd_series[-2] if len(macd_series) > 1 else macd_series[-1]
 
-def _bollinger(closes, period=20, mult=2.0):
-    if len(closes) < period: return None, None, None
-    w = closes[-period:]
-    mid = sum(w) / period
-    var = sum((x - mid) ** 2 for x in w) / period
-    sd = var ** 0.5
-    return mid, mid + mult * sd, mid - mult * sd
-
-def _stochastic(highs, lows, closes, period=14, smooth=3):
-    if len(closes) < period + smooth: return None, None
-    ks = []
-    for i in range(period - 1, len(closes)):
-        hi = max(highs[i-period+1:i+1])
-        lo = min(lows[i-period+1:i+1])
-        if hi == lo: ks.append(50.0)
-        else: ks.append(((closes[i] - lo) / (hi - lo)) * 100.0)
-    k = ks[-1]
-    d = sum(ks[-smooth:]) / smooth
-    return k, d
-
-def _supertrend_signal(highs, lows, closes, period=10, multiplier=3.0):
-    if len(closes) < period + 3: return None
-    trs = []
-    for i in range(len(closes)):
-        if i == 0: trs.append(highs[i] - lows[i])
-        else: trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
-    atr = sum(trs[:period]) / period
-    upper = lower = None
-    trend = 1
-    for i in range(period, len(closes)):
-        atr = ((atr * (period - 1)) + trs[i]) / period
-        hl2 = (highs[i] + lows[i]) / 2.0
-        basic_upper = hl2 + multiplier * atr
-        basic_lower = hl2 - multiplier * atr
-        if upper is None: upper, lower = basic_upper, basic_lower
-        else:
-            upper = basic_upper if basic_upper < upper or closes[i-1] > upper else upper
-            lower = basic_lower if basic_lower > lower or closes[i-1] < lower else lower
-        if closes[i] > upper: trend = 1
-        elif closes[i] < lower: trend = -1
-    return trend
-
 # ----------------- BROKER REGISTRY & MARKET DATA -----------------
 BROKER_CCXT_ALIASES = {
     "crypto_com": "cryptocom", "crypto.com": "cryptocom", "gate.io": "gateio",
     "gate": "gateio", "huobi": "htx", "coinbase": "coinbase", "delta_exchange": "delta"
-}
-SUPPORTED_REAL_BROKERS = {
-    "coindcx", "wazirx", "coinswitch", "zebpay", "mudrex", "delta",
-    "binance", "bybit", "okx", "bitget", "kucoin", "gateio", "mexc", "htx"
 }
 
 def _ccxt_id_for_broker(broker):
@@ -659,15 +694,10 @@ def _analyze_coin(coin, state):
     if len(c15) < 35: return None
 
     closes = [x["close"] for x in c15]
-    highs = [x["high"] for x in c15]
-    lows = [x["low"] for x in c15]
-    vols = [x["volume"] for x in c15]
-
     price = closes[-1]
     rsi = _rsi(closes, 14) or 50.0
     macd, macd_signal, macd_prev = _macd(closes)
     ema50 = _ema(closes, 50)
-    ema200 = _ema(closes, 200)
 
     bullish_pts = 0
     bearish_pts = 0
