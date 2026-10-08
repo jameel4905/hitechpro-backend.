@@ -258,11 +258,11 @@ def save_state_to_db(device_id: str, state: dict):
         """, (
             device_id,
             1 if state.get("is_running") else 0,
-            state.get("active_broker", "coindcx"),
+            state.get("active_broker", "paper"),
             state.get("market_mode", "spot"),
             state.get("quote_currency", "INR"),
             state.get("trade_amount", 500.0),
-            state.get("max_trades", 1),
+            state.get("max_trades", 5),
             state.get("target_percent", 2.5),
             state.get("sl_percent", 1.5),
             state.get("selected_coin", "AUTO"),
@@ -296,26 +296,25 @@ def _load_persisted_runtime_sessions():
             if dev not in user_sessions:
                 user_sessions[dev] = {
                     "is_running": bool(row["is_running"]),
-                    "active_broker": row["active_broker"] or "coindcx",
-                    "market_data_exchange": row["market_data_exchange"] or (row["active_broker"] if row["active_broker"] != "paper" else "coindcx"),
+                    "active_broker": row["active_broker"] or "paper",
+                    "market_data_exchange": row["market_data_exchange"] or "coindcx",
                     "market_mode": row["market_mode"] or "spot",
                     "api_key": "", "secret_key": "",
                     "quote_currency": row["quote_currency"] or "INR",
                     "trade_amount": float(row["trade_amount"] or 500.0),
-                    "max_trades": int(row["max_trades"] or 1),
+                    "max_trades": int(row["max_trades"] or 5),
                     "target_percent": float(row["target_percent"] or 2.5),
                     "sl_percent": float(row["sl_percent"] or 1.5),
                     "selected_coin": row["selected_coin"] or "AUTO",
                     "deal_condition": row["deal_condition"] or "ASAP",
                     "trade_type": "intraday", "strategy": "volume",
-                    "logs": ["🔄 Runtime recovered from persistent database."],
+                    "logs": ["🔄 Runtime recovered from database."],
                     "active_trades": db_load_active_trades(dev),
                     "paper_balance": float(row["paper_balance"] if row["paper_balance"] is not None else 500000.0),
                     "today_pnl": float(row["today_pnl"] if row["today_pnl"] is not None else 0.0),
                     "session_start_fund": 0.0, "sleep_until": None, "sleep_reason": "",
                     "last_settlement_date": row["last_settlement_date"] or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    "_closing_ids": set(), "_last_recovery_log": 0.0,
-                    "scanner_reports": [], "scanner_cycle": 0, "scanner_updated_at": "", "scanner_exchange": "coindcx"
+                    "_closing_ids": set(), "scanner_reports": [], "scanner_cycle": 0, "scanner_updated_at": "", "scanner_exchange": "coindcx"
                 }
     except Exception as exc:
         print(f"Runtime recovery error: {exc}")
@@ -345,7 +344,7 @@ app.add_middleware(
 )
 
 def get_market_data_exchange(state):
-    broker = str(state.get("active_broker", "coindcx") or "coindcx").lower()
+    broker = str(state.get("active_broker", "paper") or "paper").lower()
     if broker == "paper":
         return str(state.get("market_data_exchange", "coindcx") or "coindcx").lower()
     return broker
@@ -368,13 +367,13 @@ def get_user_session(device_id: str):
         if row:
             user_sessions[device_id] = {
                 "is_running": bool(row[0]),
-                "active_broker": row[1] or "coindcx",
-                "market_data_exchange": row[13] or (row[1] if row[1] and row[1] != "paper" else "coindcx"),
+                "active_broker": row[1] or "paper",
+                "market_data_exchange": row[13] or "coindcx",
                 "market_mode": row[2] or "spot",
                 "api_key": "", "secret_key": "",
                 "quote_currency": row[3] or "INR",
                 "trade_amount": float(row[4] or 500.0),
-                "max_trades": int(row[5] or 1),
+                "max_trades": int(row[5] or 5),
                 "target_percent": float(row[6] or 2.5),
                 "sl_percent": float(row[7] or 1.5),
                 "selected_coin": row[8] or "AUTO",
@@ -390,9 +389,9 @@ def get_user_session(device_id: str):
             }
         else:
             user_sessions[device_id] = {
-                "is_running": False, "active_broker": "coindcx", "market_data_exchange": "coindcx",
+                "is_running": False, "active_broker": "paper", "market_data_exchange": "coindcx",
                 "market_mode": "spot", "api_key": "", "secret_key": "", "quote_currency": "INR",
-                "trade_amount": 500.0, "max_trades": 1, "trade_type": "intraday", "strategy": "volume",
+                "trade_amount": 500.0, "max_trades": 5, "trade_type": "intraday", "strategy": "volume",
                 "deal_condition": "ASAP", "selected_coin": "AUTO", "target_percent": 2.5, "sl_percent": 1.5,
                 "logs": ["🤖 Dual Engine Initialized."], "active_trades": [], "paper_balance": 500000.0,
                 "today_pnl": 0.0, "session_start_fund": 0.0, "sleep_until": None, "sleep_reason": "",
@@ -400,7 +399,7 @@ def get_user_session(device_id: str):
                 "scanner_reports": [], "scanner_cycle": 0, "scanner_updated_at": "", "scanner_exchange": "coindcx"
             }
     state = user_sessions[device_id]
-    state.setdefault("max_trades", 1)
+    state.setdefault("max_trades", 5)
     state.setdefault("target_percent", 2.5)
     state.setdefault("sl_percent", 1.5)
     state.setdefault("_closing_ids", set())
@@ -471,7 +470,6 @@ async def verify_vip_key(request: Request):
     if not raw_key:
         return {"status": "error", "message": "Key cannot be empty."}
 
-    # Case-insensitive matching taaki capital/small letter hone par bhi key match ho jaye
     matched_key = next((k for k in keys_db if k.lower() == raw_key.lower()), None)
 
     if not matched_key:
@@ -828,7 +826,7 @@ async def market_scanner_loop():
                         if not state.get("is_running"):
                             continue
 
-                        allowed_slots = max(1, int(state.get("max_trades", 1)))
+                        allowed_slots = max(1, int(state.get("max_trades", 5)))
                         current_active_count = len(state.get("active_trades", []))
                         free_slots = allowed_slots - current_active_count
 
@@ -851,7 +849,6 @@ async def market_scanner_loop():
                         else:
                             scan_pool = valid[:30]
 
-                        # Collect candidates to fill all free slots
                         approved_candidates = []
                         for coin in scan_pool:
                             if len(approved_candidates) >= free_slots:
@@ -860,7 +857,6 @@ async def market_scanner_loop():
                             if analysis and _signal_passes(analysis, deal_cond, market_mode):
                                 approved_candidates.append((coin, analysis))
 
-                        # Execute entries for each available slot
                         order_amount = float(state.get("trade_amount", 500.0))
                         target_pct = float(state.get("target_percent", 2.5)) / 100.0
                         sl_pct = float(state.get("sl_percent", 1.5)) / 100.0
@@ -913,6 +909,23 @@ async def market_scanner_loop():
         await asyncio.sleep(2.0)
 
 # ----------------- REST API ROUTES -----------------
+@app.post("/api/set-broker-mode")
+async def set_broker_mode(request: Request):
+    """Saves Paper vs Real mode permanently to prevent flip-back"""
+    data = await request.json()
+    device_id = data.get("device_id", "DEFAULT_DEVICE")
+    state = get_user_session(device_id)
+    mode = str(data.get("mode", "paper")).lower()
+
+    if mode == "paper":
+        state["active_broker"] = "paper"
+    else:
+        state["active_broker"] = state.get("market_data_exchange", "coindcx")
+
+    save_state_to_db(device_id, state)
+    add_log(state, f"⚡ Broker Mode: {mode.upper()} | Active: {state['active_broker'].upper()}")
+    return {"status": "success", "active_broker": state["active_broker"]}
+
 @app.get("/api/market-index")
 async def get_market_index(device_id: str = "DEFAULT_DEVICE"):
     """Fixes HTTP 404 for top 100 coins feed"""
@@ -989,10 +1002,10 @@ def get_trades(device_id: str = "DEFAULT_DEVICE"):
         "currency_symbol": get_curr_symbol(state),
         "today_pnl": display_today_pnl,
         "is_running": bool(state.get("is_running")),
-        "max_trades": state.get("max_trades", 1),
+        "max_trades": state.get("max_trades", 5),
         "target_percent": state.get("target_percent", 2.5),
         "sl_percent": state.get("sl_percent", 1.5),
-        "active_broker": state.get("active_broker", "coindcx"),
+        "active_broker": state.get("active_broker", "paper"),
         "market_data_exchange": get_market_data_exchange(state)
     }
 
@@ -1003,7 +1016,7 @@ def get_bot_logs(device_id: str = "DEFAULT_DEVICE"):
         "status": "success",
         "is_running": state["is_running"],
         "logs": state["logs"],
-        "max_trades": state.get("max_trades", 1),
+        "max_trades": state.get("max_trades", 5),
         "active_broker": state["active_broker"],
         "quote_currency": state["quote_currency"],
         "currency_symbol": get_curr_symbol(state),
