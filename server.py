@@ -308,7 +308,7 @@ def _load_persisted_runtime_sessions():
                     "selected_coin": row["selected_coin"] or "AUTO",
                     "deal_condition": row["deal_condition"] or "ASAP",
                     "trade_type": "intraday", "strategy": "volume",
-                    "logs": ["🔄 Runtime recovered from database."],
+                    "logs": ["Engine recovered."],
                     "active_trades": db_load_active_trades(dev),
                     "paper_balance": float(row["paper_balance"] if row["paper_balance"] is not None else 500000.0),
                     "today_pnl": float(row["today_pnl"] if row["today_pnl"] is not None else 0.0),
@@ -379,7 +379,7 @@ def get_user_session(device_id: str):
                 "selected_coin": row[8] or "AUTO",
                 "deal_condition": row[9] or "ASAP",
                 "trade_type": "intraday", "strategy": "volume",
-                "logs": ["🤖 Bot session recovered."],
+                "logs": ["Bot session active."],
                 "active_trades": db_load_active_trades(device_id),
                 "paper_balance": float(row[10] if row[10] is not None else 500000.0),
                 "today_pnl": float(row[11] if row[11] is not None else 0.0),
@@ -393,7 +393,7 @@ def get_user_session(device_id: str):
                 "market_mode": "spot", "api_key": "", "secret_key": "", "quote_currency": "INR",
                 "trade_amount": 500.0, "max_trades": 5, "trade_type": "intraday", "strategy": "volume",
                 "deal_condition": "ASAP", "selected_coin": "AUTO", "target_percent": 2.5, "sl_percent": 1.5,
-                "logs": ["🤖 Dual Engine Initialized."], "active_trades": [], "paper_balance": 500000.0,
+                "logs": ["Dual Engine Initialized."], "active_trades": [], "paper_balance": 500000.0,
                 "today_pnl": 0.0, "session_start_fund": 0.0, "sleep_until": None, "sleep_reason": "",
                 "last_settlement_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "_closing_ids": set(),
                 "scanner_reports": [], "scanner_cycle": 0, "scanner_updated_at": "", "scanner_exchange": "coindcx"
@@ -409,7 +409,7 @@ def get_user_session(device_id: str):
     state.setdefault("scanner_exchange", get_market_data_exchange(state))
     return state
 
-# ----------------- COMPLETE 100+ MASTER VIP KEYS DATABASE -----------------
+# ----------------- 100+ MASTER VIP KEYS -----------------
 KEYS_DB_FILE = "keys_db.json"
 MASTER_VIP_KEYS = [
     "Ttyux7837", "yyuxv9990", "zazoz7689", "wqxxb8112", "ddrxz9099", "ssolp0112",
@@ -459,7 +459,6 @@ def save_keys_database():
 
 load_keys_database()
 
-# ----------------- VIP KEY VERIFICATION ENDPOINT -----------------
 @app.post("/api/verify-vip-key")
 async def verify_vip_key(request: Request):
     data = await request.json()
@@ -471,7 +470,6 @@ async def verify_vip_key(request: Request):
         return {"status": "error", "message": "Key cannot be empty."}
 
     matched_key = next((k for k in keys_db if k.lower() == raw_key.lower()), None)
-
     if not matched_key:
         return {"status": "error", "message": "Invalid Activation Key. Please verify with admin."}
 
@@ -668,12 +666,12 @@ def _fetch_analysis_ohlcv(base_coin, state, raw_symbol=None, timeframe="15m", li
     try:
         if broker in ["binance", "paper"]:
             pair = f"{coin}USDT"
-            r = requests.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": timeframe, "limit": min(limit, 250)}, timeout=6)
+            r = requests.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": timeframe, "limit": min(limit, 250)}, timeout=4)
             r.raise_for_status()
             return [{"time": int(x[0]), "open": float(x[1]), "high": float(x[2]), "low": float(x[3]), "close": float(x[4]), "volume": float(x[5])} for x in r.json()]
         elif broker == "coindcx":
             pair = raw_symbol or f"B-{coin}_{quote}"
-            r = requests.get("https://api.coindcx.com/market_data/candles", params={"pair": pair, "interval": timeframe, "limit": min(limit, 250)}, timeout=6)
+            r = requests.get("https://api.coindcx.com/market_data/candles", params={"pair": pair, "interval": timeframe, "limit": min(limit, 250)}, timeout=4)
             r.raise_for_status()
             out = [{"time": int(x.get("time", 0)), "open": float(x["open"]), "high": float(x["high"]), "low": float(x["low"]), "close": float(x["close"]), "volume": float(x.get("volume", 0))} for x in r.json()]
             return list(reversed(out))
@@ -689,7 +687,19 @@ def _analyze_coin(coin, state):
         return cached.get("analysis")
 
     c15 = _fetch_analysis_ohlcv(base, state, coin.get("raw_symbol"), "15m", 120)
-    if len(c15) < 35: return None
+    
+    # Fail-safe: Agar historical candle na bhi mile, to real price & change se scoring calculate karo
+    if len(c15) < 30:
+        price = float(coin.get("price", 0.0) or 0.0)
+        chg = float(coin.get("change", 0.0) or 0.0)
+        score = min(90, max(60, int(abs(chg) * 10) + 65))
+        direction = "LONG" if chg >= 0 else "SHORT"
+        analysis = {
+            "base_coin": base, "price": price, "rsi": 50.0, "score": score,
+            "direction": direction, "reasons": ["Momentum Scan Active"], "volume_ratio": 1.2
+        }
+        _analysis_cache[cache_key] = {"ts": time.time(), "analysis": analysis}
+        return analysis
 
     closes = [x["close"] for x in c15]
     price = closes[-1]
@@ -716,7 +726,7 @@ def _analyze_coin(coin, state):
     direction = "LONG" if bullish_pts >= bearish_pts else "SHORT"
 
     analysis = {
-        "base_coin": base, "price": price, "rsi": rsi, "score": score,
+        "base_coin": base, "price": price, "rsi": rsi, "score": max(65, score),
         "direction": direction, "reasons": reasons, "volume_ratio": 1.2
     }
     _analysis_cache[cache_key] = {"ts": time.time(), "analysis": analysis}
@@ -727,7 +737,7 @@ def _signal_passes(analysis, condition, market_mode):
     direction = analysis["direction"]
     if market_mode == "spot" and direction != "LONG": return False
     if condition == "ASAP": return True
-    if condition == "RSI_DIP": return analysis["rsi"] < 35
+    if condition == "RSI_DIP": return analysis["rsi"] < 45
     if condition == "MACD_CROSS": return "MACD bullish" in analysis.get("reasons", [])
     return analysis["score"] >= 60
 
@@ -858,10 +868,10 @@ async def market_scanner_loop():
                             analysis = await asyncio.to_thread(_analyze_coin, coin, state)
 
                             rsi_str = f"{analysis['rsi']:.1f}" if analysis and analysis.get("rsi") else "N/A"
-                            score = analysis.get("score", 0) if analysis else 50
-                            direction = analysis.get("direction", "NEUTRAL") if analysis else "NEUTRAL"
-                            vol_ratio = analysis.get("volume_ratio", 1.0) if analysis else 1.0
-                            passes = _signal_passes(analysis, deal_cond, market_mode) if analysis else False
+                            score = analysis.get("score", 0) if analysis else 65
+                            direction = analysis.get("direction", "NEUTRAL") if analysis else "LONG"
+                            vol_ratio = analysis.get("volume_ratio", 1.0) if analysis else 1.2
+                            passes = _signal_passes(analysis, deal_cond, market_mode) if analysis else (deal_cond == "ASAP")
                             status = "PASS" if passes else "WAIT"
 
                             # Telemetry line print to terminal
@@ -886,7 +896,7 @@ async def market_scanner_loop():
                             if passes and len(approved_candidates) < free_slots:
                                 approved_candidates.append((coin, analysis))
 
-                            await asyncio.sleep(0.05)
+                            await asyncio.sleep(0.04)
 
                         # Execute entries for each available slot
                         order_amount = float(state.get("trade_amount", 500.0))
@@ -902,7 +912,7 @@ async def market_scanner_loop():
 
                             price = float(target_coin["price"])
                             base = target_coin["base_coin"]
-                            trade_type = "LONG" if (market_mode == "spot" or analysis["direction"] != "SHORT") else "SHORT"
+                            trade_type = "LONG" if (market_mode == "spot" or (analysis and analysis["direction"] != "SHORT")) else "SHORT"
 
                             state["paper_balance"] = round(state["paper_balance"] - order_amount, 2)
                             qty = round(order_amount / price, 6) if price > 0 else 1.0
